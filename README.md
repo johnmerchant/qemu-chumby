@@ -29,13 +29,14 @@ trademark of its owner, used only to say what hardware this models. See
 | Crypto processor on UART3 | Hardware version 3.8 with a made-up identity: GUID `C40BB1E0-0000-4000-8000-0E4000000001`, serial number `0000000000000000`. It holds no keys and refuses key and challenge requests |
 | Clocks (CRM) and system control | Registers, PLLs locked at the boot loader's settings |
 | GPIO ports A-F | Complete for the drivers |
+| Keypad port | Used as GPIO: the data register reads the pins. The top button (`/dev/switch`) is row 0; no scan interrupts |
 | CSPI1-3 | Complete except DMA |
 | TSC2100 touchscreen on CSPI3 | Touch conversions and PINTDAV (GPIO PE19); the pen is QEMU's absolute pointer. Audio registers only, no sound |
 | LCD controller | Background plane and graphic window (alpha, colour key), 16 bpp, as a QEMU display |
 | NAND flash controller | 64 MiB small-page chip; reads, programs and erases, written back to the image |
 | PWM | Registers |
 | USB host | Control registers and an empty three-port root hub; no transfers |
-| DMA, SSI audio, keypad, watchdog, RTC, SDHC, I2C | Not modelled: registers read back as written |
+| DMA, SSI audio, watchdog, RTC, SDHC, I2C | Not modelled: registers read back as written |
 
 The patches:
 
@@ -52,6 +53,7 @@ The patches:
 | `0009` | `hw/char/chumby_cp.c` |
 | `0010` | `hw/arm/fsl-imx21.c`, the SoC |
 | `0011` | `hw/arm/chumby_classic.c`, the machine, and `docs/system/arm/chumby-classic.rst` |
+| `0012` | `hw/input/imx21_kpp.c`, the keypad port, and the machine's top button |
 
 ## Building
 
@@ -133,6 +135,9 @@ button), and `screendump` writes the screen (`"format": "png"` for PNG).
     ./chumby-ctl qmp.sock tap 278 22        # press and release at x=278, y=22
     ./chumby-ctl qmp.sock down 100 120      # press and hold
     ./chumby-ctl qmp.sock up
+    ./chumby-ctl qmp.sock button tap        # press the top button for 300 ms
+    ./chumby-ctl qmp.sock button down       # hold it
+    ./chumby-ctl qmp.sock button up
     ./chumby-ctl qmp.sock shot screen.png
     ./chumby-ctl qmp.sock qmp '{"execute":"query-status"}'
 
@@ -193,6 +198,17 @@ value `px * 32767 / 319` on X and `py * 32767 / 239` on Y. The pen is
 down while `left` is down; a move while down is a drag. A tap is a press,
 about 100-200 ms, then `{"type": "btn", "data": {"button": "left",
 "down": false}}`. The window's mouse and VNC send the same events.
+
+**Top button.** The Chumby's top button (the squeeze switch, which the
+guest reads from `/dev/switch`: one byte, 1 while pressed, 0 released) is
+the machine's `button` property, a boolean:
+
+    {"execute": "qom-set", "arguments": {"path": "/machine", "property": "button", "value": true}}
+    {"execute": "qom-set", "arguments": {"path": "/machine", "property": "button", "value": false}}
+
+`qom-get` reads it back. It drives keypad row 0 low while pressed, as the
+hardware does, and the stock kernel polls it, so a press must last a
+little while to be seen: `chumby-ctl ... button tap` holds it 300 ms.
 
 **Screen.** QMP `screendump` with an absolute `filename` and `"format":
 "png"` (8-bit RGB) or `"ppm"` (the default): the 320x240 frame as the

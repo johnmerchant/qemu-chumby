@@ -9,12 +9,15 @@
 #                  after MS milliseconds (default 150)
 #   down X Y       press and hold at X,Y
 #   up             release
+#   button down|up|tap [MS]
+#                  press, release, or press and release the top button
+#                  (/dev/switch); tap holds it MS milliseconds (default 300)
 #   shot FILE      write the screen to FILE as PNG
 #   qmp JSON       send one QMP command and print the replies
 set -eu
 
 usage() {
-    sed -n '4,15s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,18s/^# \{0,1\}//p' "$0" >&2
     exit 2
 }
 
@@ -44,13 +47,34 @@ events() {
     qmp "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[$1]}}"
 }
 
+# The top button is the machine's "button" property.
+top_button() {
+    qmp "{\"execute\":\"qom-set\",\"arguments\":{\"path\":\"/machine\",\"property\":\"button\",\"value\":$1}}"
+}
+
+sleep_ms() {
+    sleep "$(( $1 / 1000 )).$(printf '%03d' $(( $1 % 1000 )))"
+}
+
 case $cmd in
 tap)
     [ $# -ge 2 ] || usage
     events "$(pos "$1" "$2")$(button true)"
-    ms=${3:-150}
-    sleep "$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))"
+    sleep_ms "${3:-150}"
     events "$(button false)"
+    ;;
+button)
+    [ $# -ge 1 ] || usage
+    case $1 in
+    down) top_button true ;;
+    up) top_button false ;;
+    tap)
+        top_button true
+        sleep_ms "${2:-300}"
+        top_button false
+        ;;
+    *) usage ;;
+    esac
     ;;
 down)
     [ $# -eq 2 ] || usage
