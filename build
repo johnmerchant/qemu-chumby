@@ -7,7 +7,8 @@
 # result is DIR/obj/qemu-system-arm.
 #
 # Needs a C compiler, ninja, python3, pkg-config, glib, pixman, libpng and
-# zlib (see README.md), plus curl or wget, patch, xz and tar.
+# zlib (see README.md), plus curl or wget, patch, and xz or a tar that
+# reads .tar.xz (as on macOS).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -49,7 +50,11 @@ src=qemu-$version
 if [ "$(cat "$src/.chumby-patches" 2>/dev/null || true)" != "$stamp" ]; then
     rm -rf "$src" obj
     echo "extracting $tarball"
-    xz -dc "$tarball" | tar xf -
+    if command -v xz >/dev/null 2>&1; then
+        xz -dc "$tarball" | tar xf -
+    else
+        tar xJf "$tarball"
+    fi
     for p in "$here"/patches/*.patch; do
         echo "applying $(basename "$p")"
         patch -s -p1 -d "$src" < "$p"
