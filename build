@@ -1,0 +1,67 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# build [DIR]: fetches the pinned QEMU release, checks its SHA-256, applies
+# the patches and builds qemu-system-arm with the chumby-classic machine.
+# Everything happens in DIR (default: ./build beside this script); the
+# result is DIR/obj/qemu-system-arm.
+#
+# Needs a C compiler, ninja, python3, pkg-config, glib, pixman, libpng and
+# zlib (see README.md), plus curl or wget, patch, xz and tar.
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/qemu-release"
+
+out=${1:-$here/build}
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+cd "$out"
+
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+tarball=qemu-$version.tar.xz
+if [ ! -f "$tarball" ]; then
+    echo "fetching $url"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL -o "$tarball.part" "$url"
+    else
+        wget -O "$tarball.part" "$url"
+    fi
+    mv "$tarball.part" "$tarball"
+fi
+got=$(sha256 "$tarball")
+if [ "$got" != "$sha256" ]; then
+    echo "$tarball: SHA-256 is $got, expected $sha256" >&2
+    exit 1
+fi
+
+# The source tree is extracted and patched again only when the patches
+# change, so that rebuilds are incremental.
+stamp=$(cat "$here"/patches/*.patch "$here/qemu-release" | sha256 /dev/stdin)
+src=qemu-$version
+if [ "$(cat "$src/.chumby-patches" 2>/dev/null || true)" != "$stamp" ]; then
+    rm -rf "$src" obj
+    echo "extracting $tarball"
+    xz -dc "$tarball" | tar xf -
+    for p in "$here"/patches/*.patch; do
+        echo "applying $(basename "$p")"
+        patch -s -p1 -d "$src" < "$p"
+    done
+    echo "$stamp" > "$src/.chumby-patches"
+fi
+
+mkdir -p obj
+cd obj
+if [ ! -f build.ninja ]; then
+    ../"$src"/configure --target-list=arm-softmmu --disable-docs \
+        --disable-tools --disable-werror
+fi
+ninja qemu-system-arm
+echo "built $out/obj/qemu-system-arm"

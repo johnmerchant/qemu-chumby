@@ -1,0 +1,77 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# chumby-ctl SOCKET COMMAND: drives a running chumby-classic machine over
+# its QMP socket (-qmp unix:SOCKET,server=on,wait=off). Needs nc with -U
+# (BSD or OpenBSD netcat).
+#
+#   tap X Y [MS]   press the screen at pixel X,Y (0-319, 0-239), release
+#                  after MS milliseconds (default 150)
+#   down X Y       press and hold at X,Y
+#   up             release
+#   shot FILE      write the screen to FILE as PNG
+#   qmp JSON       send one QMP command and print the replies
+set -eu
+
+usage() {
+    sed -n '4,15s/^# \{0,1\}//p' "$0" >&2
+    exit 2
+}
+
+[ $# -ge 2 ] || usage
+sock=$1
+cmd=$2
+shift 2
+
+qmp() {
+    printf '%s\n' '{"execute":"qmp_capabilities"}' "$@" |
+        nc -U -w 1 "$sock" | sed 1,2d
+}
+
+# Screen pixels to the input layer's absolute range, 0-32767.
+pos() {
+    x=$(( $1 * 32767 / 319 ))
+    y=$(( $2 * 32767 / 239 ))
+    printf '{"type":"abs","data":{"axis":"x","value":%d}},' "$x"
+    printf '{"type":"abs","data":{"axis":"y","value":%d}},' "$y"
+}
+
+button() {
+    printf '{"type":"btn","data":{"button":"left","down":%s}}' "$1"
+}
+
+events() {
+    qmp "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[$1]}}"
+}
+
+case $cmd in
+tap)
+    [ $# -ge 2 ] || usage
+    events "$(pos "$1" "$2")$(button true)"
+    ms=${3:-150}
+    sleep "$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))"
+    events "$(button false)"
+    ;;
+down)
+    [ $# -eq 2 ] || usage
+    events "$(pos "$1" "$2")$(button true)"
+    ;;
+up)
+    events "$(button false)"
+    ;;
+shot)
+    [ $# -eq 1 ] || usage
+    case $1 in
+    /*) file=$1 ;;
+    *) file=$(pwd)/$1 ;;
+    esac
+    qmp "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"$file\",\"format\":\"png\"}}"
+    ;;
+qmp)
+    [ $# -eq 1 ] || usage
+    qmp "$1"
+    ;;
+*)
+    usage
+    ;;
+esac
