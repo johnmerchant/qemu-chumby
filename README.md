@@ -141,7 +141,9 @@ can't do:
 - the Chumby's outputs: backlight level, speaker mute, LCD power
 - screenshots, pause, reset, saving and restoring the machine's state
 - the console, in your own terminal app (the desktop's default: Konsole,
-  GNOME Terminal, Terminal.app, iTerm2...)
+  GNOME Terminal, Terminal.app, iTerm2...), or in any serial terminal
+  program: the panel serves it on a pseudo-terminal, `/dev/ttys012` or
+  `/dev/pts/3`, shown in its status bar (`tio /dev/ttys012`)
 
 The mouse in the window is the pen. The emulated Chumby has no network:
 QEMU always runs with `-nic none`.

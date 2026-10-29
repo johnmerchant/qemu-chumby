@@ -34,24 +34,29 @@ EVENT_PREFIX = "CHUMBY_"
 
 class Console(QtCore.QObject):
     """The Chumby's console (UART1) on QEMU's unix socket, which takes one
-    client: the panel. It shares the console with terminals (chumby-term)
-    through a socket of its own, term_path: what the Chumby prints goes to
-    the panel's view and every terminal, and what any of them types goes
-    to the Chumby, in order and paced for its UART."""
+    client: the panel. The panel passes it on through a pseudo-terminal of
+    its own, tty_path (/dev/ttys012 on macOS, /dev/pts/3 on Linux), which
+    any terminal program opens like a serial port: what the Chumby prints
+    goes there, and what is typed there goes to the Chumby, paced for its
+    UART. The panel also watches the output (received)."""
     received = QtCore.Signal(str) if hasattr(QtCore, "Signal") else QtCore.pyqtSignal(str)
 
     def __init__(self, path):
         super().__init__()
+        import fcntl
+        import tty
         self.s = socket.socket(socket.AF_UNIX)
         self.s.connect(path)
         self.outq = queue.Queue()
-        self.terms = []
-        self.lock = threading.Lock()
-        self.term_path = path + ".term"
-        self.server = socket.socket(socket.AF_UNIX)
-        self.server.bind(self.term_path)
-        self.server.listen(4)
-        for fn in (self._read, self._write, self._accept):
+        # The pty's slave end stays open here, raw, so that the device
+        # exists while no terminal has it open; output nobody reads is
+        # dropped rather than blocking the console.
+        self.master, self.slave = os.openpty()
+        tty.setraw(self.slave)
+        self.tty_path = os.ttyname(self.slave)
+        fl = fcntl.fcntl(self.master, fcntl.F_GETFL)
+        fcntl.fcntl(self.master, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        for fn in (self._read, self._write, self._from_tty):
             threading.Thread(target=fn, daemon=True).start()
 
     def _read(self):
@@ -64,12 +69,10 @@ class Console(QtCore.QObject):
                 return
             if not d:
                 return
-            with self.lock:
-                for t in list(self.terms):
-                    try:
-                        t.sendall(d)
-                    except OSError:
-                        self.terms.remove(t)
+            try:
+                os.write(self.master, d)
+            except (BlockingIOError, OSError):
+                pass
             self.received.emit(dec.decode(d).replace("\r", ""))
 
     def _write(self):
@@ -84,28 +87,18 @@ class Console(QtCore.QObject):
                     return
                 threading.Event().wait(0.005)
 
-    def _accept(self):
+    def _from_tty(self):
+        import select
         while True:
+            select.select([self.master], [], [])
             try:
-                t, _ = self.server.accept()
+                d = os.read(self.master, 1024)
+            except BlockingIOError:
+                continue
             except OSError:
                 return
-            with self.lock:
-                self.terms.append(t)
-            threading.Thread(target=self._from_term, args=(t,), daemon=True).start()
-
-    def _from_term(self, t):
-        while True:
-            try:
-                d = t.recv(1024)
-            except OSError:
-                d = b""
-            if not d:
-                with self.lock:
-                    if t in self.terms:
-                        self.terms.remove(t)
-                return
-            self.outq.put(d)
+            if d:
+                self.outq.put(d)
 
     def send(self, line):
         self.outq.put((line + "\r").encode())
@@ -203,6 +196,7 @@ class Panel(QtWidgets.QMainWindow):
         try:
             self.console = Console(con_path)
             self.console.received.connect(self.on_console)
+            print("chumby-emu: the console is", self.console.tty_path, flush=True)
         except OSError:
             pass
 
@@ -223,6 +217,12 @@ class Panel(QtWidgets.QMainWindow):
 
         self.status = self.statusBar()
         self.status.showMessage(f"Window: {display}; no network")
+        if self.console:
+            ttyl = QtWidgets.QLabel(f"Console {self.console.tty_path}")
+            ttyl.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+            ttyl.setToolTip("A serial port for any terminal program: "
+                            f"tio {self.console.tty_path}, screen {self.console.tty_path}...")
+            self.status.addPermanentWidget(ttyl)
         self.runstate = QtWidgets.QLabel()
         self.status.addPermanentWidget(self.runstate)
         st = self.try_cmd(self.qmp.cmd, "query-status") or {}
@@ -411,7 +411,7 @@ class Panel(QtWidgets.QMainWindow):
         if not self.console:
             return
         cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                            "chumby-term"), self.console.term_path]
+                                            "chumby-term"), self.console.tty_path]
         try:
             open_terminal(cmd)
         except OSError as e:
