@@ -134,6 +134,22 @@
             license = lib.licenses.gpl2Plus;
           };
         };
+
+      # chumby-image: the images the machine boots, from a flash backup.
+      # MIT, as image/LICENSE says.
+      chumby-image =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "chumby-image";
+          version = "0.1.0";
+          src = ./image;
+          cargoLock.lockFile = ./image/Cargo.lock;
+          meta = {
+            description = "Builds the NAND and settings images the chumby-classic machine boots";
+            mainProgram = "chumby-image";
+            license = lib.licenses.mit;
+          };
+        };
     in
     {
       packages = forAll (pkgs: rec {
@@ -141,6 +157,7 @@
         qemu = default;
         emu = chumby-emu pkgs default;
         machine = chumby-machine pkgs default;
+        image = chumby-image pkgs;
       });
 
       apps = forAll (pkgs: {
@@ -151,6 +168,10 @@
         machine = {
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.machine}/bin/chumby-machine";
+        };
+        image = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.image}/bin/chumby-image";
         };
       });
 

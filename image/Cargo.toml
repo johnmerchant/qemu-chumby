@@ -1,0 +1,22 @@
+[package]
+name = "chumby-image"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Builds the NAND and settings images the chumby-classic machine boots"
+
+# A host tool, a crate of its own: no dependencies.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug = "line-tables-only"
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
