@@ -61,9 +61,6 @@
             # and screendump need.
             buildInputs = old.buildInputs ++ [ pkgs.pixman ];
             doCheck = false;
-            postInstall = ''
-              install -m 755 ${./chumby-ctl} $out/bin/chumby-ctl
-            '';
             meta = old.meta // {
               description = "QEMU with the chumby-classic machine (Freescale i.MX21)";
               mainProgram = "qemu-system-arm";
@@ -83,13 +80,16 @@
             root = ./.;
             fileset = lib.fileset.unions [
               ./chumby-emu
+              ./chumby-ctl
               ./frontend
             ];
           };
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
             mkdir -p $out/share/chumby-emu $out/bin
-            cp -r chumby-emu frontend $out/share/chumby-emu/
+            cp -r chumby-emu chumby-ctl frontend $out/share/chumby-emu/
+            makeWrapper ${python}/bin/python3 $out/bin/chumby-ctl \
+              --add-flags $out/share/chumby-emu/chumby-ctl
             makeWrapper ${python}/bin/python3 $out/bin/chumby-emu \
               --add-flags $out/share/chumby-emu/chumby-emu \
               --add-flags "--qemu ${qemu}/bin/qemu-system-arm" \

@@ -61,7 +61,7 @@ The patches apply to QEMU 11.1.2 (`qemu-release` pins the tarball and its
 SHA-256).
 
 With Nix, the flake's package is `qemu-system-arm` with the machine
-(plus `chumby-ctl`) for `aarch64-darwin` (Apple silicon), `x86_64-darwin`,
+for `aarch64-darwin` (Apple silicon), `x86_64-darwin`,
 `aarch64-linux` and `x86_64-linux`. The same line builds and runs it on
 each:
 

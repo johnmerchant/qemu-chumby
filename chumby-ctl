@@ -1,101 +1,138 @@
-#!/bin/sh
+#!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-#
-# chumby-ctl SOCKET COMMAND: drives a running chumby-classic machine over
-# its QMP socket (-qmp unix:SOCKET,server=on,wait=off). Needs nc with -U
-# (BSD or OpenBSD netcat).
-#
-#   tap X Y [MS]   press the screen at pixel X,Y (0-319, 0-239), release
-#                  after MS milliseconds (default 150)
-#   down X Y       press and hold at X,Y
-#   up             release
-#   button down|up|tap [MS]
-#                  press, release, or press and release the top button
-#                  (/dev/switch); tap holds it MS milliseconds (default 300)
-#   shot FILE      write the screen to FILE as PNG
-#   qmp JSON       send one QMP command and print the replies
-set -eu
+"""chumby-ctl SOCKET COMMAND...: drives a running chumby-classic machine
+over its QMP socket (-qmp unix:SOCKET,server=on,wait=off). Python 3 only.
 
-usage() {
-    sed -n '4,18s/^# \{0,1\}//p' "$0" >&2
-    exit 2
-}
+  tap X Y [MS]        press the screen at pixel X,Y (0-319, 0-239), release
+                      after MS milliseconds (default 150)
+  down X Y            press and hold at X,Y
+  up                  release
+  button down|up|tap [MS]
+                      press, release, or press and release the top button
+                      (/dev/switch); tap holds it MS milliseconds (default 300)
+  headphones in|out   plug headphones in or take them out
+  accel X Y Z         set the accelerometer, in milli-g along each axis
+  state               the board's lines as JSON (query-chumby-state)
+  events [SECONDS]    print QMP events as JSON lines, until SECONDS have
+                      passed (default: until the machine quits). A QMP
+                      socket serves one client at a time: watch events on
+                      a second -qmp socket, or after other commands here
+  shot FILE           write the screen to FILE as PNG
+  qmp JSON            send one QMP command and print the reply
 
-[ $# -ge 2 ] || usage
-sock=$1
-cmd=$2
-shift 2
+Several commands can be given at once, separated by "--":
+  chumby-ctl qmp.sock headphones in -- button tap -- state
+"""
+import json
+import os
+import socket
+import sys
+import time
 
-qmp() {
-    printf '%s\n' '{"execute":"qmp_capabilities"}' "$@" |
-        nc -U -w 1 "$sock" | sed 1,2d
-}
 
-# Screen pixels to the input layer's absolute range, 0-32767.
-pos() {
-    x=$(( $1 * 32767 / 319 ))
-    y=$(( $2 * 32767 / 239 ))
-    printf '{"type":"abs","data":{"axis":"x","value":%d}},' "$x"
-    printf '{"type":"abs","data":{"axis":"y","value":%d}},' "$y"
-}
+class QMP:
+    def __init__(self, path):
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.connect(path)
+        self.f = self.s.makefile("rw")
+        self.f.readline()
+        self.cmd("qmp_capabilities")
 
-button() {
-    printf '{"type":"btn","data":{"button":"left","down":%s}}' "$1"
-}
+    def send(self, msg):
+        self.f.write(json.dumps(msg) + "\n")
+        self.f.flush()
+        while True:
+            line = self.f.readline()
+            if not line:
+                sys.exit("chumby-ctl: the machine closed the connection")
+            r = json.loads(line)
+            if "return" in r or "error" in r:
+                if "error" in r:
+                    sys.exit("chumby-ctl: " + r["error"].get("desc", str(r["error"])))
+                return r["return"]
 
-events() {
-    qmp "{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[$1]}}"
-}
+    def cmd(self, name, **args):
+        msg = {"execute": name}
+        if args:
+            msg["arguments"] = args
+        return self.send(msg)
 
-# The top button is the machine's "button" property.
-top_button() {
-    qmp "{\"execute\":\"qom-set\",\"arguments\":{\"path\":\"/machine\",\"property\":\"button\",\"value\":$1}}"
-}
+    def events(self, seconds):
+        end = None if seconds is None else time.monotonic() + seconds
+        while end is None or time.monotonic() < end:
+            if end is not None:
+                self.s.settimeout(max(0.01, end - time.monotonic()))
+            try:
+                line = self.f.readline()
+            except (socket.timeout, TimeoutError):
+                return
+            if not line:
+                return
+            print(line.strip(), flush=True)
 
-sleep_ms() {
-    sleep "$(( $1 / 1000 )).$(printf '%03d' $(( $1 % 1000 )))"
-}
 
-case $cmd in
-tap)
-    [ $# -ge 2 ] || usage
-    events "$(pos "$1" "$2")$(button true)"
-    sleep_ms "${3:-150}"
-    events "$(button false)"
-    ;;
-button)
-    [ $# -ge 1 ] || usage
-    case $1 in
-    down) top_button true ;;
-    up) top_button false ;;
-    tap)
-        top_button true
-        sleep_ms "${2:-300}"
-        top_button false
-        ;;
-    *) usage ;;
-    esac
-    ;;
-down)
-    [ $# -eq 2 ] || usage
-    events "$(pos "$1" "$2")$(button true)"
-    ;;
-up)
-    events "$(button false)"
-    ;;
-shot)
-    [ $# -eq 1 ] || usage
-    case $1 in
-    /*) file=$1 ;;
-    *) file=$(pwd)/$1 ;;
-    esac
-    qmp "{\"execute\":\"screendump\",\"arguments\":{\"filename\":\"$file\",\"format\":\"png\"}}"
-    ;;
-qmp)
-    [ $# -eq 1 ] || usage
-    qmp "$1"
-    ;;
-*)
-    usage
-    ;;
-esac
+def usage():
+    sys.stderr.write(__doc__.split("\n", 1)[1])
+    sys.exit(2)
+
+
+def sleep_ms(ms):
+    time.sleep(int(ms) / 1000)
+
+
+def pen(q, down, x=None, y=None):
+    ev = []
+    if x is not None:
+        # Screen pixels to the input layer's absolute range, 0-32767.
+        ev += [{"type": "abs", "data": {"axis": "x", "value": int(x) * 32767 // 319}},
+               {"type": "abs", "data": {"axis": "y", "value": int(y) * 32767 // 239}}]
+    ev.append({"type": "btn", "data": {"button": "left", "down": down}})
+    q.cmd("input-send-event", events=ev)
+
+
+def run(q, cmd, a):
+    if cmd == "tap" and len(a) in (2, 3):
+        pen(q, True, a[0], a[1])
+        sleep_ms(a[2] if len(a) > 2 else 150)
+        pen(q, False)
+    elif cmd == "down" and len(a) == 2:
+        pen(q, True, a[0], a[1])
+    elif cmd == "up" and not a:
+        pen(q, False)
+    elif cmd == "button" and a and a[0] in ("down", "up", "tap"):
+        if a[0] in ("down", "tap"):
+            q.cmd("qom-set", path="/machine", property="button", value=True)
+        if a[0] == "tap":
+            sleep_ms(a[1] if len(a) > 1 else 300)
+        if a[0] in ("up", "tap"):
+            q.cmd("qom-set", path="/machine", property="button", value=False)
+    elif cmd == "headphones" and a in (["in"], ["out"]):
+        q.cmd("qom-set", path="/machine", property="headphones", value=a[0] == "in")
+    elif cmd == "accel" and len(a) == 3:
+        for prop, v in zip(("accel-x", "accel-y", "accel-z"), a):
+            q.cmd("qom-set", path="/machine", property=prop, value=int(v))
+    elif cmd == "state" and not a:
+        print(json.dumps(q.cmd("query-chumby-state"), sort_keys=True))
+    elif cmd == "events" and len(a) <= 1:
+        q.events(float(a[0]) if a else None)
+    elif cmd == "shot" and len(a) == 1:
+        q.cmd("screendump", filename=os.path.abspath(a[0]), format="png")
+    elif cmd == "qmp" and len(a) == 1:
+        print(json.dumps(q.send(json.loads(a[0]))))
+    else:
+        usage()
+
+
+def main():
+    if len(sys.argv) < 3:
+        usage()
+    q = QMP(sys.argv[1])
+    words = sys.argv[2:]
+    while words:
+        n = words.index("--") if "--" in words else len(words)
+        run(q, words[0], words[1:n])
+        words = words[n + 1:]
+
+
+if __name__ == "__main__":
+    main()
