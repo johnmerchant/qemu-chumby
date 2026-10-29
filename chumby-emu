@@ -30,6 +30,10 @@ Options:
   --fast              -icount shift=auto,sleep=off: boot in seconds,
                       but emulated time runs ahead while idle, so sound
                       comes in bursts: for scripts and tests, not for use
+  --scale N           the window's size, in points (logical pixels) per
+                      Chumby pixel (default: the size of a real Chumby's
+                      screen, 71 x 53 mm, on your display); the window
+                      can be resized, keeping its shape
   --no-panel          no control panel (the window only)
   -- ARGS             passed to QEMU as they are
 """
@@ -130,6 +134,40 @@ def state_overlay(qemu, nand, state):
     return overlay, None
 
 
+# The Chumby Classic's screen: 3.5 inches across, 4:3, so 71.1 mm wide.
+CHUMBY_SCREEN_MM = 71.12
+CHUMBY_SCREEN_PX = 320
+
+
+def display_opts(display, scale, have_qt):
+    """The -display option: the cursor shown over the window, which can be
+    resized keeping its shape, at the given scale or a real Chumby's size."""
+    if display not in ("cocoa", "gtk", "sdl"):
+        return display
+    opts = [display, "show-cursor=on"]
+    if display in ("cocoa", "gtk"):
+        if scale is None:
+            scale = real_size_scale() if have_qt else 2.0
+        opts += ["zoom-to-fit=on", "scale=%g" % scale]
+    if display == "gtk":
+        opts.append("keep-aspect-ratio=on")
+    return ",".join(opts)
+
+
+def real_size_scale():
+    """Points per Chumby pixel that make the window a real Chumby's
+    screen size, from the desktop's idea of the primary screen; 2 when it
+    has none worth believing (a virtual display, a missing EDID)."""
+    try:
+        import panel_qt
+        ppmm = panel_qt.points_per_mm()
+    except Exception:
+        ppmm = None
+    if not ppmm:
+        return 2.0
+    return round(max(1.0, min(6.0, CHUMBY_SCREEN_MM * ppmm / CHUMBY_SCREEN_PX)), 2)
+
+
 class QMP:
     """A QMP connection: commands from any thread, events to a queue."""
 
@@ -201,6 +239,7 @@ def main():
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--state")
     ap.add_argument("--no-panel", action="store_true")
+    ap.add_argument("--scale", type=float)
     ap.add_argument("-h", "--help", action="store_true")
     argv = sys.argv[1:]
     extra = []
@@ -228,7 +267,8 @@ def main():
     args = [qemu, "-name", "Chumby", "-kernel", kernel,
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-serial", f"unix:{con_path},server=on,wait=off",
-            "-monitor", "none", "-nic", "none", "-display", display]
+            "-monitor", "none", "-nic", "none",
+            "-display", display_opts(display, a.scale, not a.no_panel)]
     if nand and a.state:
         overlay, saved_fast = state_overlay(qemu, nand, a.state)
         args += ["-drive", f"if=mtd,file={overlay},format=qcow2"]

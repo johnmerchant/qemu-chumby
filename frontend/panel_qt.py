@@ -17,6 +17,11 @@ try:
 except ImportError:  # pragma: no cover
     from PyQt6 import QtCore, QtGui, QtWidgets
 
+try:
+    import mac_motion
+except ImportError:  # pragma: no cover
+    mac_motion = None
+
 # The machine's control surface (docs/system/arm/chumby-classic.rst,
 # "Control surface"). Properties are on /machine.
 PROP_BUTTON = "button"
@@ -72,6 +77,17 @@ class Panel(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         grid = QtWidgets.QVBoxLayout(central)
 
+        # -- paused: a banner across the top while the machine is stopped --
+        self.banner = QtWidgets.QLabel(
+            "\u23f8  Paused: the Chumby is stopped. Resume (Ctrl+P) to carry on.")
+        self.banner.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.banner.setWordWrap(True)
+        self.banner.setStyleSheet(
+            "QLabel { background: #f2b233; color: #1d1d1d; font-weight: bold;"
+            " padding: 8px; border-radius: 4px; }")
+        self.banner.hide()
+        grid.addWidget(self.banner)
+
         # -- the top button ------------------------------------------------
         box = QtWidgets.QGroupBox("Top button")
         lay = QtWidgets.QHBoxLayout(box)
@@ -102,6 +118,14 @@ class Panel(QtWidgets.QMainWindow):
         form.addRow(row)
         self.gread = QtWidgets.QLabel()
         form.addRow("Acceleration", self.gread)
+        self.follow = QtWidgets.QCheckBox("Follow this Mac's motion")
+        self.follow.setToolTip("Tilt or shake the Mac's base and the Chumby feels it; "
+                               "the Mac lying flat is the Chumby standing still")
+        self.motion = None
+        self.motion_g = None
+        if mac_motion and mac_motion.available():
+            form.addRow(self.follow)
+            self.follow.toggled.connect(self.set_follow)
         box.setEnabled(self.has(*PROP_ACCEL))
         self.pitch.valueChanged.connect(self.send_tilt)
         self.roll.valueChanged.connect(self.send_tilt)
@@ -133,10 +157,19 @@ class Panel(QtWidgets.QMainWindow):
         font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
         self.log.setFont(font)
         self.log.setMinimumHeight(160)
-        self.input = QtWidgets.QLineEdit(placeholderText="Type a command for the Chumby's shell, then Enter")
+        self.input = QtWidgets.QLineEdit(placeholderText="A command for the Chumby's shell (Enter sends, even empty)")
         self.input.setFont(font)
+        enter = QtWidgets.QPushButton("\u23ce Enter")
+        enter.setToolTip("Send the line to the console; with none, just Enter")
+        enter.clicked.connect(self.on_input)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.input, 1)
+        row.addWidget(enter)
         lay.addWidget(self.log)
-        lay.addWidget(self.input)
+        lay.addLayout(row)
+        # A click in the console's output types into its input line.
+        self.log.viewport().installEventFilter(self)
+        self.activated = False
         grid.addWidget(box, 1)
         self.console = None
         try:
@@ -152,6 +185,7 @@ class Panel(QtWidgets.QMainWindow):
         self.act(tb, "Screenshot", self.screenshot, "Ctrl+S")
         self.pause = self.act(tb, "Pause", self.toggle_pause, "Ctrl+P")
         self.pause.setCheckable(True)
+        tb.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.act(tb, "Reset", lambda: self.qmp.cmd("system_reset"), None)
         self.act(tb, "Save state", self.savevm, None)
         self.act(tb, "Restore state", self.loadvm, None)
@@ -159,11 +193,17 @@ class Panel(QtWidgets.QMainWindow):
 
         self.status = self.statusBar()
         self.status.showMessage(f"Window: {display}; no network")
+        self.runstate = QtWidgets.QLabel()
+        self.status.addPermanentWidget(self.runstate)
+        st = self.try_cmd(self.qmp.cmd, "query-status") or {}
+        self.show_running(st.get("running", True))
 
         self.timer = QtCore.QTimer(self, interval=50, timeout=self.poll)
         self.timer.start()
         self.refresh_outputs()
         self.read_tilt()
+        if mac_motion and self.has(*PROP_ACCEL) and self.follow.parent():
+            self.follow.setChecked(True)
 
     # -- helpers -------------------------------------------------------------
     def slider(self, lo, hi, v):
@@ -247,6 +287,30 @@ class Panel(QtWidgets.QMainWindow):
         for prop, v in zip(PROP_ACCEL, g):
             self.try_cmd(self.qmp.qom_set, "/machine", prop, v)
 
+    def set_follow(self, on):
+        for w in (self.pitch, self.roll):
+            w.setEnabled(not on)
+        if on and not self.motion:
+            self.motion = mac_motion.MotionSensor(self.on_motion)
+            if not self.motion.ok:
+                self.status.showMessage("This Mac's motion sensor didn't start", 5000)
+        elif not on and self.motion:
+            self.motion.stop()
+            self.motion = None
+            self.send_tilt()
+
+    def on_motion(self, x, y, z):
+        # From the sensor's thread, 100 times a second: keep the latest.
+        self.motion_g = (x, y, z)
+
+    def follow_motion(self):
+        """Sends the Mac's latest reading, at the panel's 20 Hz tick. The
+        Mac lying flat reads -1 g on Z; the Chumby still reads +1 g."""
+        if self.motion and self.motion_g:
+            g = [round(-v * 1000) for v in self.motion_g]
+            self.motion_g = None
+            self.write_accel(g)
+
     def shake(self):
         base = self.gravity()
         steps = [(1800, 0), (-1800, 0), (1500, 300), (-1500, -300), (900, 0), (-900, 0), (0, 0)]
@@ -281,6 +345,7 @@ class Panel(QtWidgets.QMainWindow):
             self.headphones.blockSignals(False)
 
     def poll(self):
+        self.follow_motion()
         changed = False
         while True:
             try:
@@ -294,14 +359,25 @@ class Panel(QtWidgets.QMainWindow):
             if name.startswith(EVENT_PREFIX):
                 changed = True
             elif name == "STOP":
-                self.pause.setChecked(True)
+                self.show_running(False)
             elif name == "RESUME":
-                self.pause.setChecked(False)
+                self.show_running(True)
         if changed:
             self.refresh_outputs()
 
     # -- the console -----------------------------------------------------------
+    def eventFilter(self, obj, ev):
+        if ev.type() == QtCore.QEvent.Type.MouseButtonRelease and \
+                not self.log.textCursor().hasSelection():
+            self.input.setFocus()
+        return False
+
     def on_console(self, text):
+        # The stock firmware's init waits for Enter before it starts the
+        # console's shell: give it one, once.
+        if not self.activated and "press Enter to activate" in text:
+            self.activated = True
+            self.console.send("")
         c = self.log.textCursor()
         c.movePosition(QtGui.QTextCursor.MoveOperation.End)
         c.insertText(text)
@@ -309,8 +385,10 @@ class Panel(QtWidgets.QMainWindow):
         self.log.ensureCursorVisible()
 
     def on_input(self):
-        self.console.send(self.input.text())
+        if self.console:
+            self.console.send(self.input.text())
         self.input.clear()
+        self.input.setFocus()
 
     # -- the machine -------------------------------------------------------------
     def screenshot(self):
@@ -321,6 +399,25 @@ class Panel(QtWidgets.QMainWindow):
 
     def toggle_pause(self, on):
         self.try_cmd(self.qmp.cmd, "stop" if on else "cont")
+        # The STOP or RESUME event confirms it; show it at once meanwhile.
+        self.show_running(not on)
+
+    def show_running(self, running):
+        """Shows whether the machine runs: the Pause/Resume button, the
+        banner, the title and the status bar."""
+        style = self.style()
+        sp = QtWidgets.QStyle.StandardPixmap
+        self.pause.setChecked(not running)
+        self.pause.setText("Pause" if running else "Resume")
+        self.pause.setIcon(style.standardIcon(sp.SP_MediaPause if running
+                                              else sp.SP_MediaPlay))
+        self.pause.setToolTip("Stop the Chumby (Ctrl+P)" if running
+                              else "Carry on (Ctrl+P)")
+        self.banner.setVisible(not running)
+        self.setWindowTitle("Chumby" if running else "Chumby (paused)")
+        self.runstate.setText("\u25b6 Running" if running else "\u23f8 Paused")
+        self.runstate.setStyleSheet("color: #2e8b57; font-weight: bold;" if running
+                                    else "color: #c47f00; font-weight: bold;")
 
     def hmp(self, line):
         r = self.try_cmd(self.qmp.cmd, "human-monitor-command", **{"command-line": line})
@@ -339,6 +436,8 @@ class Panel(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self.timer.stop()
+        if self.motion:
+            self.motion.stop()
         if self.proc.poll() is None and not self.qmp.closed:
             try:
                 self.qmp.cmd("quit")
@@ -347,11 +446,33 @@ class Panel(QtWidgets.QMainWindow):
         super().closeEvent(e)
 
 
+def app():
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication(["chumby-emu"])
+
+
+def points_per_mm():
+    """Logical pixels (points) per millimetre on the primary screen, or
+    None if its physical size is missing or implausible."""
+    screen = app().primaryScreen()
+    if screen is None:
+        return None
+    mm = screen.physicalSize().width()
+    pts = screen.geometry().width()
+    if mm < 50 or pts <= 0:
+        return None
+    ppmm = pts / mm
+    # 50 to 400 points per inch covers real displays; virtual ones often
+    # report a made-up size.
+    if not 50 / 25.4 <= ppmm <= 400 / 25.4:
+        return None
+    return ppmm
+
+
 def run(qmp, events, con_path, proc, display, audio, **kw):
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(["chumby-emu"])
-    app.setApplicationName("chumby-emu")
-    app.setDesktopFileName("chumby-emu")
+    a = app()
+    a.setApplicationName("chumby-emu")
+    a.setDesktopFileName("chumby-emu")
     w = Panel(qmp, events, con_path, proc, display, audio, **kw)
     w.resize(460, 720)
     w.show()
-    app.exec()
+    a.exec()
