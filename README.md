@@ -139,6 +139,14 @@ Python 3 with Qt 6 (PySide6 or PyQt6: `python3-pyside6.qtwidgets` on
 Debian, `pyside6` on Arch, `pip install PySide6` elsewhere).
 `chumby-emu --help` lists its options.
 
+With `--state DIR`, the Chumby keeps its flash writes in DIR (a qcow2
+overlay of the NAND image, which stays unchanged), and the panel's
+"Save state" saves the running machine there: the next start resumes
+from it in a fraction of a second instead of booting. `--fast` boots
+in seconds by letting emulated time run ahead, which also makes sound
+play fast and choppy; it is meant for scripts, and a saved state is
+the quick way to start an interactive session.
+
 ### Testing on Linux
 
 `tests/linux/run IMAGES` builds the machine on Debian 13 in a container

@@ -22,8 +22,14 @@ Options:
                       (default: the platform's, found at startup)
   --write             write the NAND image (default: snapshot=on, so the
                       image is never changed)
+  --state DIR         keep this Chumby's flash writes and saved state in
+                      DIR (a qcow2 overlay of the NAND image, which stays
+                      unchanged); "Save state" in the panel saves there,
+                      and the next start resumes from it in a second.
+                      Needs qemu-img.
   --fast              -icount shift=auto,sleep=off: boot in seconds,
-                      but emulated time runs ahead while idle
+                      but emulated time runs ahead while idle, so sound
+                      comes in bursts: for scripts and tests, not for use
   --no-panel          no control panel (the window only)
   -- ARGS             passed to QEMU as they are
 """
@@ -95,6 +101,35 @@ def pick_audio(qemu, asked):
     return "none"
 
 
+# The saved state's name says which clock it was saved with: a state saved
+# with -icount can't be loaded without it, nor the other way round.
+SNAPSHOT = {False: "chumby", True: "chumby-fast"}
+
+
+def find_qemu_img(qemu):
+    for p in (os.path.join(os.path.dirname(qemu), "qemu-img"), shutil.which("qemu-img")):
+        if p and os.access(p, os.X_OK):
+            return p
+    sys.exit("chumby-emu: --state needs qemu-img (from your QEMU, or a qemu-utils package)")
+
+
+def state_overlay(qemu, nand, state):
+    """The state directory's qcow2 overlay of NAND, made on first use, and
+    whether it holds a saved state to resume from."""
+    qimg = find_qemu_img(qemu)
+    os.makedirs(state, exist_ok=True)
+    overlay = os.path.join(state, "nand.qcow2")
+    if not os.path.exists(overlay):
+        subprocess.run([qimg, "create", "-q", "-f", "qcow2", "-b", os.path.abspath(nand),
+                        "-F", "raw", overlay], check=True)
+    snaps = subprocess.run([qimg, "snapshot", "-l", "-U", overlay],
+                           capture_output=True, text=True).stdout.split()
+    for fast, name in SNAPSHOT.items():
+        if name in snaps:
+            return overlay, fast
+    return overlay, None
+
+
 class QMP:
     """A QMP connection: commands from any thread, events to a queue."""
 
@@ -164,6 +199,7 @@ def main():
     ap.add_argument("--audio")
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--fast", action="store_true")
+    ap.add_argument("--state")
     ap.add_argument("--no-panel", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     argv = sys.argv[1:]
@@ -193,7 +229,17 @@ def main():
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-serial", f"unix:{con_path},server=on,wait=off",
             "-monitor", "none", "-nic", "none", "-display", display]
-    if nand:
+    if nand and a.state:
+        overlay, saved_fast = state_overlay(qemu, nand, a.state)
+        args += ["-drive", f"if=mtd,file={overlay},format=qcow2"]
+        if saved_fast is not None:
+            if saved_fast != a.fast:
+                print("chumby-emu: resuming the saved state " +
+                      ("with" if saved_fast else "without") +
+                      " --fast, as it was saved", file=sys.stderr)
+                a.fast = saved_fast
+            args += ["-loadvm", SNAPSHOT[a.fast]]
+    elif nand:
         args += ["-drive", f"if=mtd,file={nand},format=raw" + ("" if a.write else ",snapshot=on")]
     if audio != "none":
         if audio.startswith("wav:"):
@@ -222,7 +268,8 @@ def main():
             print("chumby-emu:", e, file=sys.stderr)
             return proc.wait() or 1
         import panel_qt  # frontend/, beside this script
-        panel_qt.run(qmp, events, con_path, proc, display=display, audio=audio)
+        panel_qt.run(qmp, events, con_path, proc, display=display, audio=audio,
+                     snapshot=SNAPSHOT[a.fast], other=SNAPSHOT[not a.fast])
         return proc.wait()
     finally:
         if proc.poll() is None:

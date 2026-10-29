@@ -92,7 +92,8 @@
             cp -r chumby-emu frontend $out/share/chumby-emu/
             makeWrapper ${python}/bin/python3 $out/bin/chumby-emu \
               --add-flags $out/share/chumby-emu/chumby-emu \
-              --add-flags "--qemu ${qemu}/bin/qemu-system-arm"
+              --add-flags "--qemu ${qemu}/bin/qemu-system-arm" \
+              --prefix PATH : ${pkgs.qemu-utils}/bin
           '';
           meta = {
             description = "The Chumby Classic as a desktop app (QEMU and a Qt control panel)";

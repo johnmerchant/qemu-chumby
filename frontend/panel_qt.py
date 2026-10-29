@@ -59,9 +59,11 @@ class Console(QtCore.QObject):
 
 
 class Panel(QtWidgets.QMainWindow):
-    def __init__(self, qmp, events, con_path, proc, display, audio):
+    def __init__(self, qmp, events, con_path, proc, display, audio,
+                 snapshot="chumby", other="chumby-fast"):
         super().__init__()
         self.qmp, self.events, self.proc = qmp, events, proc
+        self.snapshot, self.other = snapshot, other
         self.setWindowTitle("Chumby")
         props = {p["name"] for p in qmp.cmd("qom-list", path="/machine")}
         self.has = lambda *names: all(n in props for n in names)
@@ -326,10 +328,14 @@ class Panel(QtWidgets.QMainWindow):
             self.status.showMessage(r.strip(), 8000)
 
     def savevm(self):
-        self.hmp("savevm chumby")
+        self.hmp("savevm " + self.snapshot)
+        # One saved state: the other clock's is stale now.
+        self.try_cmd(self.qmp.cmd, "human-monitor-command",
+                     **{"command-line": "delvm " + self.other})
+        self.status.showMessage("Saved", 4000)
 
     def loadvm(self):
-        self.hmp("loadvm chumby")
+        self.hmp("loadvm " + self.snapshot)
 
     def closeEvent(self, e):
         self.timer.stop()
@@ -341,11 +347,11 @@ class Panel(QtWidgets.QMainWindow):
         super().closeEvent(e)
 
 
-def run(qmp, events, con_path, proc, display, audio):
+def run(qmp, events, con_path, proc, display, audio, **kw):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(["chumby-emu"])
     app.setApplicationName("chumby-emu")
     app.setDesktopFileName("chumby-emu")
-    w = Panel(qmp, events, con_path, proc, display, audio)
+    w = Panel(qmp, events, con_path, proc, display, audio, **kw)
     w.resize(460, 720)
     w.show()
     app.exec()
