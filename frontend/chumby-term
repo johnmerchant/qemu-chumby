@@ -23,9 +23,14 @@ def main():
         dev = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
     except OSError as e:
         sys.exit(f"chumby-term: {e}")
+    # Raw, and what queued up while nobody was reading is dropped: the
+    # console's early output, hours old perhaps.
     tty.setraw(dev)
-    os.write(1, b"\x1b]0;Chumby console\x07"
+    # A clear screen (the terminal app may have echoed how it started
+    # this), the window's title, and Enter, so the shell shows its prompt.
+    os.write(1, b"\x1b[H\x1b[2J\x1b]0;Chumby console\x07"
                 b"Chumby console: Ctrl-] closes this window.\r\n")
+    os.write(dev, b"\r")
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
