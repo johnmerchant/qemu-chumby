@@ -138,6 +138,8 @@ def stock_args(tag, display, env_audio=True):
             "-monitor", "none", "-nic", "none", "-no-reboot",
             "-icount", "shift=auto,sleep=off", "-display", display]
     if env_audio:
+        # The codec plays to the machine's audiodev.
+        args[2] = "chumby-classic,audiodev=snd0"
         args += ["-audiodev", "pa,id=snd0"]
     return args, q, c
 
