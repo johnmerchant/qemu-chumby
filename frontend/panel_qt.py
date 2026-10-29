@@ -10,6 +10,7 @@ import math
 import os
 import queue
 import re
+import sys
 import socket
 import threading
 
@@ -106,16 +107,30 @@ class Terminal:
 
 
 class Console(QtCore.QObject):
-    """The Chumby's console (UART1) on a unix socket."""
+    """The Chumby's console (UART1) on QEMU's unix socket, which takes one
+    client: the panel. It shares the console with terminals (chumby-term)
+    through a socket of its own, term_path: what the Chumby prints goes to
+    the panel's view and every terminal, and what any of them types goes
+    to the Chumby, in order and paced for its UART."""
     received = QtCore.Signal(str) if hasattr(QtCore, "Signal") else QtCore.pyqtSignal(str)
 
     def __init__(self, path):
         super().__init__()
         self.s = socket.socket(socket.AF_UNIX)
         self.s.connect(path)
-        threading.Thread(target=self._read, daemon=True).start()
+        self.outq = queue.Queue()
+        self.terms = []
+        self.lock = threading.Lock()
+        self.term_path = path + ".term"
+        self.server = socket.socket(socket.AF_UNIX)
+        self.server.bind(self.term_path)
+        self.server.listen(4)
+        for fn in (self._read, self._write, self._accept):
+            threading.Thread(target=fn, daemon=True).start()
 
     def _read(self):
+        import codecs
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
         while True:
             try:
                 d = self.s.recv(4096)
@@ -123,18 +138,51 @@ class Console(QtCore.QObject):
                 return
             if not d:
                 return
-            self.received.emit(d.decode("utf-8", "replace").replace("\r", ""))
+            with self.lock:
+                for t in list(self.terms):
+                    try:
+                        t.sendall(d)
+                    except OSError:
+                        self.terms.remove(t)
+            self.received.emit(dec.decode(d).replace("\r", ""))
 
-    def send(self, line):
+    def _write(self):
         # The UART's receive FIFO holds 32 characters: pieces of 16, a few
         # milliseconds apart (README.md, "Console").
-        data = (line + "\r").encode()
-
-        def go():
+        while True:
+            data = self.outq.get()
             for i in range(0, len(data), 16):
-                self.s.sendall(data[i:i + 16])
+                try:
+                    self.s.sendall(data[i:i + 16])
+                except OSError:
+                    return
                 threading.Event().wait(0.005)
-        threading.Thread(target=go, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                t, _ = self.server.accept()
+            except OSError:
+                return
+            with self.lock:
+                self.terms.append(t)
+            threading.Thread(target=self._from_term, args=(t,), daemon=True).start()
+
+    def _from_term(self, t):
+        while True:
+            try:
+                d = t.recv(1024)
+            except OSError:
+                d = b""
+            if not d:
+                with self.lock:
+                    if t in self.terms:
+                        self.terms.remove(t)
+                return
+            self.outq.put(d)
+
+    def send(self, line):
+        self.outq.put((line + "\r").encode())
 
 
 class Panel(QtWidgets.QMainWindow):
@@ -237,9 +285,14 @@ class Panel(QtWidgets.QMainWindow):
         enter = QtWidgets.QPushButton("\u23ce Enter")
         enter.setToolTip("Send the line to the console; with none, just Enter")
         enter.clicked.connect(self.on_input)
+        self.open_term = QtWidgets.QPushButton("Open terminal")
+        self.open_term.setToolTip("The console in your own terminal app, for full-screen "
+                                  "programs (top, vi); Ctrl-] closes it")
+        self.open_term.clicked.connect(self.terminal)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.input, 1)
         row.addWidget(enter)
+        row.addWidget(self.open_term)
         lay.addWidget(self.log)
         lay.addLayout(row)
         # A click in the console's output types into its input line.
@@ -455,6 +508,17 @@ class Panel(QtWidgets.QMainWindow):
             self.console.send("")
         self.term.write(text)
 
+    def terminal(self):
+        """Opens the desktop's terminal on the console, through chumby-term."""
+        if not self.console:
+            return
+        cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "chumby-term"), self.console.term_path]
+        try:
+            open_terminal(cmd)
+        except OSError as e:
+            self.status.showMessage(f"No terminal to open: {e}", 8000)
+
     def on_input(self):
         if self.console:
             self.console.send(self.input.text())
@@ -515,6 +579,83 @@ class Panel(QtWidgets.QMainWindow):
             except Exception:
                 pass
         super().closeEvent(e)
+
+
+def _run(*args):
+    import subprocess
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _gsetting(schema, key):
+    v = _run("gsettings", "get", schema, key)
+    return v.strip("'\"") if v and not v.startswith("@") else ""
+
+
+def default_terminal():
+    """The desktop's default terminal, as the argument list that runs a
+    command in it (the command follows), or None. In order: $TERMINAL;
+    xdg-terminal-exec (freedesktop's, which KDE Plasma 6 and GNOME use);
+    the desktop's own setting (KDE's kdeglobals, GNOME's, Cinnamon's and
+    MATE's gsettings, Xfce's exo); then the usual terminals."""
+    import shutil
+    if os.environ.get("TERMINAL") and shutil.which(os.environ["TERMINAL"]):
+        return [os.environ["TERMINAL"], "-e"]
+    if shutil.which("xdg-terminal-exec"):
+        return ["xdg-terminal-exec"]
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":")
+    if "KDE" in desktop:
+        for tool in ("kreadconfig6", "kreadconfig5"):
+            app = _run(tool, "--group", "General", "--key", "TerminalApplication")
+            if shutil.which(tool):
+                app = app or "konsole"
+                if shutil.which(app.split()[0]):
+                    return app.split() + ["-e"]
+    for names, schema in ((("GNOME", "UNITY", "BUDGIE"), "org.gnome.desktop.default-applications.terminal"),
+                          (("X-CINNAMON", "CINNAMON"), "org.cinnamon.desktop.default-applications.terminal"),
+                          (("MATE",), "org.mate.applications-terminal")):
+        if set(names) & set(desktop):
+            app = _gsetting(schema, "exec")
+            if app and shutil.which(app):
+                arg = _gsetting(schema, "exec-arg") or "-e"
+                return [app, arg]
+    if "XFCE" in desktop and shutil.which("exo-open"):
+        return ["exo-open", "--launch", "TerminalEmulator"]
+    for c in (["konsole", "-e"], ["ptyxis", "--"], ["kgx", "--"], ["gnome-terminal", "--"],
+              ["xfce4-terminal", "-x"], ["x-terminal-emulator", "-e"], ["alacritty", "-e"],
+              ["kitty"], ["foot"], ["wezterm", "start", "--"], ["xterm", "-e"]):
+        if shutil.which(c[0]):
+            return c
+    return None
+
+
+def open_terminal(cmd):
+    """Runs cmd in a new window of the desktop's default terminal. On
+    macOS, a .command file opened with open(1) goes to whichever app the
+    user has made the default for shell scripts: Terminal, iTerm2...
+    """
+    import shlex
+    import subprocess
+    import tempfile
+    if sys.platform == "darwin":
+        fd, path = tempfile.mkstemp(prefix="chumby-console-", suffix=".command")
+        with os.fdopen(fd, "w") as f:
+            f.write("#!/bin/sh\nrm -f %s\nexec %s\n" % (
+                shlex.quote(path), " ".join(shlex.quote(c) for c in cmd)))
+        os.chmod(path, 0o700)
+        subprocess.Popen(["open", path])
+        return
+    term = default_terminal()
+    if not term:
+        raise OSError("no terminal found; set $TERMINAL")
+    if term[0] == "exo-open":
+        term = term + [" ".join(shlex.quote(c) for c in cmd)]
+        subprocess.Popen(term)
+    else:
+        subprocess.Popen(term + cmd)
 
 
 def app():

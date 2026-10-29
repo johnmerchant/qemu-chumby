@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""chumby-term SOCKET: the Chumby's console in this terminal.
+
+Connects the terminal it runs in, in raw mode, to SOCKET, a unix socket
+carrying the console: chumby-emu's panel serves one for its "Open
+terminal" button. Ctrl-] closes it.
+"""
+import os
+import select
+import socket
+import sys
+import termios
+import tty
+
+ESCAPE = b"\x1d"  # Ctrl-]
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit(__doc__.strip())
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(sys.argv[1])
+    except OSError as e:
+        sys.exit(f"chumby-term: {e}")
+    os.write(1, b"\x1b]0;Chumby console\x07"
+                b"Chumby console: Ctrl-] closes this window.\r\n")
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            r, _, _ = select.select([fd, s], [], [])
+            if s in r:
+                data = s.recv(4096)
+                if not data:
+                    os.write(1, b"\r\n[the Chumby has quit]\r\n")
+                    break
+                os.write(1, data)
+            if fd in r:
+                data = os.read(fd, 1024)
+                if not data or ESCAPE in data:
+                    break
+                s.sendall(data)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+if __name__ == "__main__":
+    main()
