@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""chumby-emu: run a Chumby Classic as a desktop app, on macOS and Linux.
+
+    chumby-emu IMAGES                     a directory with zImage and nand.img
+    chumby-emu --kernel zImage --nand nand.img
+
+Starts qemu-system-arm -M chumby-classic with a window (Cocoa on macOS,
+GTK or SDL on Linux) and sound (CoreAudio; PipeWire, PulseAudio or ALSA),
+and opens a control panel beside it for what the window can't do: the top
+button, tilting and shaking, headphones, the outputs the Chumby drives
+(backlight, speaker mute, LCD), screenshots, snapshots and the console.
+The mouse in the window is the pen.
+
+The emulated Chumby never has a network: QEMU runs with -nic none.
+
+Options:
+  --qemu PATH         qemu-system-arm with the machine (default: beside
+                      this script, then build/obj/, then $PATH)
+  --display NAME      cocoa, gtk, sdl or none (default: the platform's)
+  --audio NAME        coreaudio, pipewire, pa, alsa, wav:FILE or none
+                      (default: the platform's, found at startup)
+  --write             write the NAND image (default: snapshot=on, so the
+                      image is never changed)
+  --fast              -icount shift=auto,sleep=off: boot in seconds,
+                      but emulated time runs ahead while idle
+  --no-panel          no control panel (the window only)
+  -- ARGS             passed to QEMU as they are
+"""
+import argparse
+import json
+import os
+import platform
+import queue
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+IS_MAC = platform.system() == "Darwin"
+
+
+def find_qemu(given):
+    if given:
+        return given
+    for p in (os.path.join(HERE, "qemu-system-arm"),
+              os.path.join(HERE, "build", "obj", "qemu-system-arm")):
+        if os.access(p, os.X_OK):
+            return p
+    p = shutil.which("qemu-system-arm")
+    if p:
+        return p
+    sys.exit("chumby-emu: no qemu-system-arm with the chumby-classic machine (--qemu)")
+
+
+def backends(qemu, what):
+    """The display or audio backends QEMU was built with."""
+    r = subprocess.run([qemu, what, "help"], capture_output=True, text=True)
+    words = r.stdout.replace(",", " ").split()
+    return set(words)
+
+
+def pick_display(qemu, asked):
+    if asked:
+        return asked
+    have = backends(qemu, "-display")
+    for d in (["cocoa"] if IS_MAC else ["gtk", "sdl"]):
+        if d in have:
+            return d
+    sys.exit("chumby-emu: this QEMU has no window (" + " ".join(sorted(have)) +
+             "); build it with GTK or SDL, or use --display none")
+
+
+def pick_audio(qemu, asked):
+    if asked:
+        return asked
+    have = backends(qemu, "-audiodev")
+    if IS_MAC:
+        order = ["coreaudio"]
+    else:
+        run = os.environ.get("XDG_RUNTIME_DIR", "")
+        order = []
+        if run and os.path.exists(os.path.join(run, "pipewire-0")):
+            order.append("pipewire")
+        if os.environ.get("PULSE_SERVER") or (run and os.path.exists(os.path.join(run, "pulse", "native"))):
+            order.append("pa")
+        order += ["pipewire", "pa", "alsa", "sdl"]
+    for a in order:
+        if a in have:
+            return a
+    return "none"
+
+
+class QMP:
+    """A QMP connection: commands from any thread, events to a queue."""
+
+    def __init__(self, path, events):
+        self.s = socket.socket(socket.AF_UNIX)
+        for _ in range(200):
+            try:
+                self.s.connect(path)
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise RuntimeError("QEMU's QMP socket didn't open")
+        self.f = self.s.makefile("rw")
+        self.f.readline()
+        self.lock = threading.Lock()
+        self.replies = queue.Queue()
+        self.events = events
+        threading.Thread(target=self._read, daemon=True).start()
+        self.cmd("qmp_capabilities")
+
+    def _read(self):
+        for line in self.f:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if "event" in msg:
+                self.events.put(msg)
+            else:
+                self.replies.put(msg)
+        self.events.put({"event": "QMP_CLOSED"})
+
+    def cmd(self, name, **args):
+        with self.lock:
+            msg = {"execute": name}
+            if args:
+                msg["arguments"] = args
+            self.f.write(json.dumps(msg) + "\n")
+            self.f.flush()
+            r = self.replies.get(timeout=30)
+        if "error" in r:
+            raise RuntimeError(r["error"].get("desc", str(r["error"])))
+        return r.get("return")
+
+    def qom_get(self, path, prop):
+        return self.cmd("qom-get", path=path, property=prop)
+
+    def qom_set(self, path, prop, value):
+        return self.cmd("qom-set", path=path, property=prop, value=value)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("images", nargs="?")
+    ap.add_argument("--kernel")
+    ap.add_argument("--nand")
+    ap.add_argument("--qemu")
+    ap.add_argument("--display")
+    ap.add_argument("--audio")
+    ap.add_argument("--write", action="store_true")
+    ap.add_argument("--fast", action="store_true")
+    ap.add_argument("--no-panel", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    if a.help:
+        print(__doc__.strip())
+        return 0
+    kernel = a.kernel or (a.images and os.path.join(a.images, "zImage"))
+    nand = a.nand or (a.images and os.path.join(a.images, "nand.img"))
+    if not kernel:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+
+    qemu = find_qemu(a.qemu)
+    display = pick_display(qemu, a.display)
+    audio = pick_audio(qemu, a.audio)
+
+    tmp = tempfile.mkdtemp(prefix="chumby-")
+    qmp_path = os.path.join(tmp, "qmp")
+    con_path = os.path.join(tmp, "con")
+    machine = "chumby-classic"
+    args = [qemu, "-name", "Chumby", "-kernel", kernel,
+            "-qmp", f"unix:{qmp_path},server=on,wait=off",
+            "-serial", f"unix:{con_path},server=on,wait=off",
+            "-monitor", "none", "-nic", "none", "-display", display]
+    if nand:
+        args += ["-drive", f"if=mtd,file={nand},format=raw" + ("" if a.write else ",snapshot=on")]
+    if audio != "none":
+        if audio.startswith("wav:"):
+            args += ["-audiodev", f"wav,id=snd0,path={audio[4:]}"]
+        else:
+            args += ["-audiodev", f"{audio},id=snd0"]
+        if "audiodev" in subprocess.run([qemu, "-M", f"{machine},help"],
+                                        capture_output=True, text=True).stdout:
+            machine += ",audiodev=snd0"
+    if a.fast:
+        args += ["-icount", "shift=auto,sleep=off"]
+    args = args[:1] + ["-M", machine] + args[1:] + extra
+    for bad in ("-netdev", "-nic", "-net"):
+        if bad in extra:
+            sys.exit(f"chumby-emu: {bad} isn't allowed: the emulated Chumby has no network")
+
+    print("chumby-emu:", " ".join(args), flush=True)
+    proc = subprocess.Popen(args)
+    try:
+        if a.no_panel:
+            return proc.wait()
+        events = queue.Queue()
+        try:
+            qmp = QMP(qmp_path, events)
+        except RuntimeError as e:
+            print("chumby-emu:", e, file=sys.stderr)
+            return proc.wait() or 1
+        import panel_qt  # frontend/, beside this script
+        panel_qt.run(qmp, events, con_path, proc, display=display, audio=audio)
+        return proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.join(HERE, "frontend"))
+    sys.exit(main())

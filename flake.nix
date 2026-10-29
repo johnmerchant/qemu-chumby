@@ -38,7 +38,14 @@
         (pkgs.qemu.override {
           minimal = true;
           vncSupport = true;
+          # A desktop on Linux: GTK and SDL windows, and sound through
+          # PipeWire, PulseAudio or ALSA. (macOS gets Cocoa and CoreAudio
+          # without asking.)
           sdlSupport = pkgs.stdenv.hostPlatform.isLinux;
+          gtkSupport = pkgs.stdenv.hostPlatform.isLinux;
+          pipewireSupport = pkgs.stdenv.hostPlatform.isLinux;
+          pulseSupport = pkgs.stdenv.hostPlatform.isLinux;
+          alsaSupport = pkgs.stdenv.hostPlatform.isLinux;
           openGLSupport = false;
           hostCpuTargets = [ "arm-softmmu" ];
         }).overrideAttrs
@@ -62,11 +69,50 @@
               mainProgram = "qemu-system-arm";
             };
           });
+
+      # chumby-emu: the machine as a desktop app, with its Qt control panel.
+      chumby-emu =
+        pkgs: qemu:
+        let
+          python = pkgs.python3.withPackages (ps: [ ps.pyside6 ]);
+        in
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "chumby-emu";
+          inherit (qemu) version;
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./chumby-emu
+              ./frontend
+            ];
+          };
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          installPhase = ''
+            mkdir -p $out/share/chumby-emu $out/bin
+            cp -r chumby-emu frontend $out/share/chumby-emu/
+            makeWrapper ${python}/bin/python3 $out/bin/chumby-emu \
+              --add-flags $out/share/chumby-emu/chumby-emu \
+              --add-flags "--qemu ${qemu}/bin/qemu-system-arm"
+          '';
+          meta = {
+            description = "The Chumby Classic as a desktop app (QEMU and a Qt control panel)";
+            mainProgram = "chumby-emu";
+            license = lib.licenses.gpl2Plus;
+          };
+        };
     in
     {
       packages = forAll (pkgs: rec {
         default = qemu-chumby pkgs;
         qemu = default;
+        emu = chumby-emu pkgs default;
+      });
+
+      apps = forAll (pkgs: {
+        emu = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.emu}/bin/chumby-emu";
+        };
       });
 
       # For ./build: nix develop, then ./build.

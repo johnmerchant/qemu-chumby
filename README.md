@@ -85,13 +85,18 @@ argument); the binary is `build/obj/qemu-system-arm`.
 
 | System | Packages |
 | --- | --- |
-| Debian, Ubuntu | `build-essential python3 python3-venv ninja-build pkg-config libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev curl xz-utils` |
-| Fedora | `gcc make python3 ninja-build pkgconf glib2-devel pixman-devel libpng-devel zlib-devel curl xz patch` |
-| Arch | `base-devel python ninja pkgconf glib2 pixman libpng zlib curl` |
+| Debian, Ubuntu | `build-essential python3 python3-venv ninja-build pkg-config libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev libfdt-dev curl xz-utils` |
+| Fedora | `gcc make python3 ninja-build pkgconf glib2-devel pixman-devel libpng-devel zlib-devel libfdt-devel curl xz patch` |
+| Arch | `base-devel python ninja pkgconf glib2 pixman libpng zlib dtc curl` |
 | macOS (Homebrew) | `python ninja pkg-config glib pixman libpng` |
 
-For a window on Linux, add the SDL or GTK development packages; on
-macOS the Cocoa display is built in. VNC always is.
+For a window and sound on Linux, add the GTK or SDL development
+packages and those of your sound server (on Debian and Ubuntu:
+`libgtk-3-dev libsdl2-dev libpipewire-0.3-dev libpulse-dev
+libasound2-dev`); any desktop will do, KDE included, on X11 or Wayland.
+On macOS the Cocoa window and CoreAudio are built in. VNC always is.
+`tests/linux/run` builds and checks all this on Debian with KDE Plasma
+6, in a container (see [Testing on Linux](#testing-on-linux)).
 
 ## Images
 
@@ -105,6 +110,43 @@ The machine needs two files from your own Chumby's flash backup:
 Programs and erases are written back to the NAND image, as the Chumby
 writes its flash. Keep a copy, or use `snapshot=on` or `readonly=on` on
 the drive to leave the image unchanged.
+
+## The desktop app: chumby-emu
+
+`chumby-emu` runs the Chumby as a desktop app on macOS and Linux: QEMU's
+window (Cocoa on macOS; GTK or SDL on Linux, on X11 or Wayland, KDE
+and GNOME alike) with sound (CoreAudio; PipeWire, PulseAudio or ALSA,
+whichever is running), and a control panel beside it for what the window
+can't do:
+
+- the top button (hold the panel's button or Space; F12 in QEMU's window)
+- tilt and shake, for the accelerometer
+- headphones in and out
+- the Chumby's outputs: backlight level, speaker mute, LCD power
+- screenshots, pause, reset, saving and restoring the machine's state
+- the console, with a line to type shell commands into
+
+The mouse in the window is the pen. The emulated Chumby has no network:
+QEMU always runs with `-nic none`.
+
+    nix run github:johnmerchant/qemu-chumby#emu -- IMAGES
+
+where IMAGES is a directory holding `zImage` and `nand.img` (see
+[Images](#images)). The NAND image is attached with `snapshot=on`, so it
+is never changed; `--write` keeps the Chumby's writes. From a checkout,
+`./chumby-emu IMAGES` uses `build/obj/qemu-system-arm`; the panel needs
+Python 3 with Qt 6 (PySide6 or PyQt6: `python3-pyside6.qtwidgets` on
+Debian, `pyside6` on Arch, `pip install PySide6` elsewhere).
+`chumby-emu --help` lists its options.
+
+### Testing on Linux
+
+`tests/linux/run IMAGES` builds the machine on Debian 13 in a container
+(Apple's `container`, Docker or Podman, on a Mac or on Linux) and checks
+a KDE Plasma 6 desktop there, with KWin on X11 and as a Wayland
+compositor: QEMU's GTK and SDL windows come up under KWin and show the
+Chumby's screen, sound reaches PulseAudio, and chumby-emu's Qt panel
+drives the machine. The checks run with no network.
 
 ## Running
 

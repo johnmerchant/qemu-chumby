@@ -1,0 +1,65 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# tests/linux/run IMAGES: builds the machine on Linux (Debian 13 with KDE Plasma 6, in a
+# container) and checks a desktop session there: QEMU's GTK and SDL
+# windows show the Chumby's screen, sound reaches PulseAudio, and
+# chumby-emu's control panel drives the machine. Runs on a Mac or on
+# Linux.
+#
+# IMAGES is a directory holding your Chumby's zImage and nand.img (see
+# README.md, Images). It is mounted read-only and the NAND is attached
+# with snapshot=on, so neither is changed.
+#
+# The build step downloads the QEMU release; the test step runs with no
+# network at all (--network none, or a host-only network with Apple's
+# container), and the guest has no network card either.
+#
+# Container runtime: container (Apple's), docker or podman, the first
+# found, or QEMU_CHUMBY_RUNTIME. The build lives in the volume
+# qemu-chumby-linux; remove it with `<runtime> volume rm qemu-chumby-linux`.
+set -eu
+
+images=${1:?usage: tests/linux/run IMAGES}
+images=$(cd "$images" && pwd)
+here=$(cd "$(dirname "$0")/../.." && pwd)
+
+runtime=${QEMU_CHUMBY_RUNTIME:-}
+if [ -z "$runtime" ]; then
+    for r in container docker podman; do
+        if command -v "$r" >/dev/null 2>&1; then
+            runtime=$r
+            break
+        fi
+    done
+fi
+[ -n "$runtime" ] || { echo "tests/linux/run: needs container, docker or podman" >&2; exit 1; }
+
+image=qemu-chumby-linux
+volume=qemu-chumby-linux
+
+dns=
+offline="--network none"
+if [ "$runtime" = container ]; then
+    # Apple's container: its default DNS may not resolve; and no network
+    # is spelled as an internal (host-only) network.
+    dns="--dns ${QEMU_CHUMBY_DNS:-1.1.1.1}"
+    "$runtime" network inspect qemu-chumby-offline >/dev/null 2>&1 ||
+        "$runtime" network create --internal qemu-chumby-offline >/dev/null
+    offline="--network qemu-chumby-offline"
+fi
+
+"$runtime" build $dns -t "$image" -f "$here/tests/linux/Containerfile" "$here/tests/linux"
+"$runtime" volume inspect "$volume" >/dev/null 2>&1 || "$runtime" volume create "$volume" >/dev/null
+
+src="type=bind,source=$here,target=/src,readonly"
+img="type=bind,source=$images,target=/images,readonly"
+
+echo "== build"
+"$runtime" run --rm -m 4G $dns --mount "$src" -v "$volume:/work" "$image" \
+    sh -c 'cd /src && ./build /work/build'
+
+echo "== desktop checks (offline)"
+"$runtime" run --rm -m 4G $offline --mount "$src" --mount "$img" -v "$volume:/work" \
+    -e QEMU=/work/build/obj/qemu-system-arm "$image" \
+    dbus-run-session -- python3 -I /src/tests/linux/check.py /work/out

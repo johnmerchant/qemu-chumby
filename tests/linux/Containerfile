@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# A KDE Plasma 6 desktop in a container, for tests/linux/run: the build
+# dependencies from README.md's Debian/Ubuntu row, the window and sound
+# libraries a desktop build uses (GTK, SDL, PipeWire, PulseAudio, ALSA),
+# KWin on X11 and as a headless Wayland compositor, Qt 6 (PySide6) for
+# chumby-emu's panel, and a virtual X server and sound server to run it
+# all headless.
+FROM docker.io/library/debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -q && apt-get install -yq --no-install-recommends \
+        build-essential python3 python3-venv ninja-build pkg-config \
+        libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev libfdt-dev curl xz-utils \
+        ca-certificates patch \
+        libgtk-3-dev libsdl2-dev libpulse-dev libpipewire-0.3-dev \
+        libasound2-dev \
+        xvfb xdotool x11-utils imagemagick \
+        pulseaudio pulseaudio-utils \
+        kwin-x11 kwin-wayland xwayland breeze dbus dbus-x11 qdbus-qt6 \
+        qt6-wayland python3-pyside6.qtcore python3-pyside6.qtgui \
+        python3-pyside6.qtwidgets \
+    && rm -rf /var/lib/apt/lists/*
+# kwin_wayland carries a file capability (cap_sys_nice) that a container
+# can't grant, so exec fails with EPERM; a copy without it, earlier on
+# PATH, runs.
+RUN cp /usr/bin/kwin_wayland /usr/local/bin/kwin_wayland
