@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 02:57:25 +1030
+Subject: [PATCH 16/42] hw/misc/imx21_pwm: Model the sample FIFO, the period
+ and the output
+
+The Chumby's stock kernel drives the LCD backlight with the PWM (TOUT2
+on PE5) in its sense1 driver: it resets the block through PWMC's SWR
+bit and waits for the bit to clear, sets the period to 0xfffc, then
+on every jiffy writes the level (700 to 0xffff) to PWMS, checking
+PWMC's FIFO-available bit first, and enables the block with
+PWMC = 0x10. A level of 0xffff, beyond the period, keeps the backlight
+fully on.
+
+So far the PWM only kept its registers. Model what it does: a period of
+PWMP + 2 counter cycles, clocked from PERCLK1 through the prescaler and
+CLKSEL or from the 32 kHz clock; samples queue in a FIFO (two deep, a
+guess: the manual's depth is not to hand) that FIFOAV reports, and each
+takes over at the end of a period for REPEAT periods; the counter
+register counts; SWR resets the block at once, so it never reads as
+set.
+
+The output is a GPIO output line whose level is the duty cycle, 0 to
+0xffff, so a board can show it. It changes only when the guest changes
+the duty cycle, not at reset, so the board decides what an unprogrammed
+PWM shows. The interrupt and the audio byte swaps are not modelled.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/misc/imx21_pwm.c         | 287 ++++++++++++++++++++++++++++++++----
+ hw/misc/trace-events        |   5 +
+ include/hw/misc/imx21_pwm.h |  50 +++++++
+ 3 files changed, 311 insertions(+), 31 deletions(-)
+ create mode 100644 include/hw/misc/imx21_pwm.h
+
+diff --git a/hw/misc/imx21_pwm.c b/hw/misc/imx21_pwm.c
+index d1d7ca9f5..ba7d97bf7 100644
+--- a/hw/misc/imx21_pwm.c
++++ b/hw/misc/imx21_pwm.c
+@@ -6,48 +6,233 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  *
+  * The i.MX1-style PWM: control, sample, period and counter registers.
+- * Samples are taken at once, so the FIFO always has room. No output is
+- * produced.
++ * A period is PWMP + 2 cycles of PERCLK1, divided by the prescaler and
++ * CLKSEL, or of the 32 kHz clock. Samples written to PWMS queue in a small
++ * FIFO; each takes over at the end of a period and lasts REPEAT periods,
++ * and the last one stays in use when the FIFO runs dry. The output is
++ * high for the sample's count of cycles each period, so a sample at or
++ * above the period keeps it high; it is low while the PWM is disabled.
++ *
++ * The output is the GPIO output line, whose level is the duty cycle from
++ * 0 (always low) to IMX21_PWM_DUTY_MAX (always high). It changes only when
++ * the guest changes the duty cycle, not at reset, so a board can decide
++ * what an unprogrammed PWM shows. The interrupt, and the byte and
++ * half-word swaps for audio samples, are not modelled.
+  */
+ 
+ #include "qemu/osdep.h"
+-#include "hw/core/sysbus.h"
++#include "hw/misc/imx21_pwm.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+-#include "qom/object.h"
+-
+-#define TYPE_IMX21_PWM "imx21.pwm"
+-OBJECT_DECLARE_SIMPLE_TYPE(IMX21PWMState, IMX21_PWM)
++#include "trace.h"
+ 
+ #define PWMC        0x00
+ #define PWMS        0x04
+ #define PWMP        0x08
+ #define PWMCNT      0x0c
+ 
+-#define PWMC_FIFOAV (1 << 5)
+-#define PWMC_SWR    (1 << 16)
++#define PWMC_CLKSEL     (3 << 0)
++#define PWMC_REPEAT_SHIFT 2
++#define PWMC_REPEAT     (3 << PWMC_REPEAT_SHIFT)
++#define PWMC_EN         (1 << 4)
++#define PWMC_FIFOAV     (1 << 5)
++#define PWMC_IRQEN      (1 << 6)
++#define PWMC_IRQ        (1 << 7)
++#define PWMC_PRESCALER_SHIFT 8
++#define PWMC_PRESCALER  (0x7f << PWMC_PRESCALER_SHIFT)
++#define PWMC_CLKSRC     (1 << 15)
++#define PWMC_SWR        (1 << 16)
++#define PWMC_BCTR       (1 << 17)
++#define PWMC_HCTR       (1 << 18)
++#define PWMC_WRITABLE   (PWMC_CLKSEL | PWMC_REPEAT | PWMC_EN | PWMC_IRQEN | \
++                         PWMC_PRESCALER | PWMC_CLKSRC | PWMC_BCTR | PWMC_HCTR)
+ 
+-struct IMX21PWMState {
+-    SysBusDevice parent_obj;
++#define CLK32_FREQ      32768
+ 
+-    MemoryRegion iomem;
+-    uint32_t regs[4];
+-};
++static bool imx21_pwm_enabled(IMX21PWMState *s)
++{
++    return s->pwmc & PWMC_EN;
++}
++
++/* Counter cycles in a period. */
++static uint32_t imx21_pwm_period(IMX21PWMState *s)
++{
++    return (s->pwmp & 0xffff) + 2;
++}
++
++/* Length of a counter cycle, in ns. */
++static uint64_t imx21_pwm_cycle_ns(IMX21PWMState *s)
++{
++    uint64_t div;
++
++    if (s->pwmc & PWMC_CLKSRC) {
++        return NANOSECONDS_PER_SECOND / CLK32_FREQ;
++    }
++    div = (2 << (s->pwmc & PWMC_CLKSEL)) *
++          (extract32(s->pwmc, PWMC_PRESCALER_SHIFT, 7) + 1);
++    return MAX(muldiv64(div, NANOSECONDS_PER_SECOND,
++                        MAX(s->perclk_freq, 1)), 1);
++}
++
++static uint64_t imx21_pwm_period_ns(IMX21PWMState *s)
++{
++    return imx21_pwm_cycle_ns(s) * imx21_pwm_period(s);
++}
++
++/* Periods each sample lasts. */
++static uint32_t imx21_pwm_repeats(IMX21PWMState *s)
++{
++    return 1 << extract32(s->pwmc, PWMC_REPEAT_SHIFT, 2);
++}
++
++static void imx21_pwm_update_output(IMX21PWMState *s)
++{
++    uint32_t period = imx21_pwm_period(s);
++    int32_t duty = 0;
++
++    if (imx21_pwm_enabled(s)) {
++        duty = muldiv64(MIN(s->sample, period), IMX21_PWM_DUTY_MAX, period);
++    }
++    if (duty != s->duty) {
++        trace_imx21_pwm_output(s->sample, period, duty);
++        s->duty = duty;
++        qemu_set_irq(s->out, duty);
++    }
++}
++
++/* Moves the next queued sample into use. */
++static void imx21_pwm_load_sample(IMX21PWMState *s)
++{
++    s->sample = s->fifo[0];
++    s->fifo_count--;
++    memmove(s->fifo, s->fifo + 1, s->fifo_count * sizeof(s->fifo[0]));
++    s->repeat = imx21_pwm_repeats(s) - 1;
++}
++
++/*
++ * Brings period_start up to the start of the period now running, with
++ * the repeat count spent by the periods gone by.
++ */
++static void imx21_pwm_catch_up(IMX21PWMState *s, int64_t now)
++{
++    uint64_t period_ns = imx21_pwm_period_ns(s);
++    uint64_t periods;
++
++    if (now <= s->period_start) {
++        return;
++    }
++    periods = (now - s->period_start) / period_ns;
++    s->period_start += periods * period_ns;
++    s->repeat -= MIN(s->repeat, periods);
++}
++
++/* Wakes at the end of the period when a queued sample is due. */
++static void imx21_pwm_schedule(IMX21PWMState *s)
++{
++    if (!imx21_pwm_enabled(s) || !s->fifo_count) {
++        timer_del(&s->timer);
++        return;
++    }
++    timer_mod(&s->timer, s->period_start +
++              (s->repeat + 1) * imx21_pwm_period_ns(s));
++}
++
++static void imx21_pwm_timeout(void *opaque)
++{
++    IMX21PWMState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    imx21_pwm_catch_up(s, now);
++    if (s->fifo_count && !s->repeat) {
++        imx21_pwm_load_sample(s);
++    }
++    imx21_pwm_update_output(s);
++    imx21_pwm_schedule(s);
++}
++
++static void imx21_pwm_do_reset(IMX21PWMState *s)
++{
++    timer_del(&s->timer);
++    s->pwmc = 0;
++    s->pwmp = 0;
++    s->sample = 0;
++    s->fifo_count = 0;
++    s->repeat = 0;
++    s->period_start = 0;
++}
++
++static uint32_t imx21_pwm_counter(IMX21PWMState *s)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (!imx21_pwm_enabled(s) || now <= s->period_start) {
++        return 0;
++    }
++    return ((now - s->period_start) / imx21_pwm_cycle_ns(s)) %
++           imx21_pwm_period(s);
++}
+ 
+ static uint64_t imx21_pwm_read(void *opaque, hwaddr offset, unsigned size)
+ {
+     IMX21PWMState *s = opaque;
+ 
+-    if (offset >= sizeof(s->regs)) {
++    switch (offset) {
++    case PWMC:
++        return s->pwmc |
++               (s->fifo_count < IMX21_PWM_FIFO_DEPTH ? PWMC_FIFOAV : 0);
++    case PWMS:
++        return s->sample;
++    case PWMP:
++        return s->pwmp;
++    case PWMCNT:
++        return imx21_pwm_counter(s);
++    default:
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%"
+                       HWADDR_PRIx "\n", __func__, offset);
+         return 0;
+     }
+-    if (offset == PWMC) {
+-        return s->regs[0] | PWMC_FIFOAV;
++}
++
++static void imx21_pwm_write_control(IMX21PWMState *s, uint32_t val)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    bool was_enabled = imx21_pwm_enabled(s);
++
++    if (val & PWMC_SWR) {
++        /* The reset is over at once: the bit never reads as set. */
++        imx21_pwm_do_reset(s);
++        imx21_pwm_update_output(s);
++        return;
++    }
++    if (was_enabled) {
++        imx21_pwm_catch_up(s, now);
++    }
++    s->pwmc = val & PWMC_WRITABLE;
++    if (!was_enabled && imx21_pwm_enabled(s)) {
++        /* A new period starts, with the first queued sample. */
++        s->period_start = now;
++        if (s->fifo_count) {
++            imx21_pwm_load_sample(s);
++        }
++    }
++    imx21_pwm_update_output(s);
++    imx21_pwm_schedule(s);
++}
++
++static void imx21_pwm_write_sample(IMX21PWMState *s, uint32_t val)
++{
++    if (s->fifo_count == IMX21_PWM_FIFO_DEPTH) {
++        trace_imx21_pwm_fifo_full(val);
++        return;
++    }
++    s->fifo[s->fifo_count++] = val & 0xffff;
++    if (imx21_pwm_enabled(s) && !timer_pending(&s->timer)) {
++        imx21_pwm_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        imx21_pwm_schedule(s);
+     }
+-    return s->regs[offset / 4];
+ }
+ 
+ static void imx21_pwm_write(void *opaque, hwaddr offset, uint64_t val,
+@@ -55,17 +240,28 @@ static void imx21_pwm_write(void *opaque, hwaddr offset, uint64_t val,
+ {
+     IMX21PWMState *s = opaque;
+ 
+-    if (offset >= sizeof(s->regs)) {
++    trace_imx21_pwm_write(offset, val);
++    switch (offset) {
++    case PWMC:
++        imx21_pwm_write_control(s, val);
++        break;
++    case PWMS:
++        imx21_pwm_write_sample(s, val);
++        break;
++    case PWMP:
++        if (imx21_pwm_enabled(s)) {
++            imx21_pwm_catch_up(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        }
++        s->pwmp = val & 0xffff;
++        imx21_pwm_update_output(s);
++        imx21_pwm_schedule(s);
++        break;
++    case PWMCNT:
++        break;
++    default:
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%"
+                       HWADDR_PRIx "\n", __func__, offset);
+-        return;
+-    }
+-    if (offset == PWMC && (val & PWMC_SWR)) {
+-        memset(s->regs, 0, sizeof(s->regs));
+-        return;
+-    }
+-    if (offset != PWMCNT) {
+-        s->regs[offset / 4] = val;
++        break;
+     }
+ }
+ 
+@@ -83,7 +279,9 @@ static void imx21_pwm_reset(DeviceState *dev)
+ {
+     IMX21PWMState *s = IMX21_PWM(dev);
+ 
+-    memset(s->regs, 0, sizeof(s->regs));
++    imx21_pwm_do_reset(s);
++    /* Nothing has been driven yet: the next level is always sent. */
++    s->duty = -1;
+ }
+ 
+ static void imx21_pwm_init(Object *obj)
+@@ -93,14 +291,40 @@ static void imx21_pwm_init(Object *obj)
+     memory_region_init_io(&s->iomem, obj, &imx21_pwm_ops, s,
+                           TYPE_IMX21_PWM, 0x1000);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    qdev_init_gpio_out(DEVICE(obj), &s->out, 1);
++    timer_init_ns(&s->timer, QEMU_CLOCK_VIRTUAL, imx21_pwm_timeout, s);
++}
++
++static const Property imx21_pwm_properties[] = {
++    /* PERCLK1: 266 MHz MPLL / 6, as the boot loader leaves it. */
++    DEFINE_PROP_UINT32("perclk-freq", IMX21PWMState, perclk_freq, 44333333),
++};
++
++static int imx21_pwm_post_load(void *opaque, int version_id)
++{
++    IMX21PWMState *s = opaque;
++
++    if (s->fifo_count > IMX21_PWM_FIFO_DEPTH) {
++        return -EINVAL;
++    }
++    return 0;
+ }
+ 
+ static const VMStateDescription vmstate_imx21_pwm = {
+     .name = TYPE_IMX21_PWM,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
++    .version_id = 2,
++    .minimum_version_id = 2,
++    .post_load = imx21_pwm_post_load,
+     .fields = (const VMStateField[]) {
+-        VMSTATE_UINT32_ARRAY(regs, IMX21PWMState, 4),
++        VMSTATE_UINT32(pwmc, IMX21PWMState),
++        VMSTATE_UINT32(pwmp, IMX21PWMState),
++        VMSTATE_UINT32(sample, IMX21PWMState),
++        VMSTATE_UINT32_ARRAY(fifo, IMX21PWMState, IMX21_PWM_FIFO_DEPTH),
++        VMSTATE_UINT32(fifo_count, IMX21PWMState),
++        VMSTATE_UINT32(repeat, IMX21PWMState),
++        VMSTATE_INT64(period_start, IMX21PWMState),
++        VMSTATE_INT32(duty, IMX21PWMState),
++        VMSTATE_TIMER(timer, IMX21PWMState),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+@@ -111,6 +335,7 @@ static void imx21_pwm_class_init(ObjectClass *klass, const void *data)
+ 
+     dc->vmsd = &vmstate_imx21_pwm;
+     device_class_set_legacy_reset(dc, imx21_pwm_reset);
++    device_class_set_props(dc, imx21_pwm_properties);
+     dc->desc = "i.MX21 PWM";
+ }
+ 
+diff --git a/hw/misc/trace-events b/hw/misc/trace-events
+index c9a868b3e..24d02ebfe 100644
+--- a/hw/misc/trace-events
++++ b/hw/misc/trace-events
+@@ -442,3 +442,8 @@ iommu_testdev_dma_read(uint64_t gva, uint32_t len) "gva=0x%" PRIx64 " len=%u"
+ iommu_testdev_dma_verify(uint32_t expected, uint32_t actual) "expected=0x%x actual=0x%x"
+ iommu_testdev_dma_result(uint32_t result) "DMA completed result=0x%x"
+ iommu_testdev_dma_armed(bool armed) "armed=%d"
++
++# imx21_pwm.c
++imx21_pwm_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
++imx21_pwm_output(uint32_t sample, uint32_t period, int duty) "sample %u period %u duty %d"
++imx21_pwm_fifo_full(uint64_t value) "sample 0x%" PRIx64 " dropped"
+diff --git a/include/hw/misc/imx21_pwm.h b/include/hw/misc/imx21_pwm.h
+new file mode 100644
+index 000000000..75468c80f
+--- /dev/null
++++ b/include/hw/misc/imx21_pwm.h
+@@ -0,0 +1,50 @@
++/*
++ * i.MX21 PWM
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_PWM_H
++#define IMX21_PWM_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_PWM "imx21.pwm"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21PWMState, IMX21_PWM)
++
++/* Samples the FIFO holds besides the one in use. */
++#define IMX21_PWM_FIFO_DEPTH 2
++
++/*
++ * The output's duty cycle, the GPIO output's level: 0 (always low) to
++ * IMX21_PWM_DUTY_MAX (always high).
++ */
++#define IMX21_PWM_DUTY_MAX 0xffff
++
++struct IMX21PWMState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    QEMUTimer timer;
++    qemu_irq out;
++    uint32_t perclk_freq;
++
++    uint32_t pwmc;
++    uint32_t pwmp;
++    /* The sample in use, and those queued behind it. */
++    uint32_t sample;
++    uint32_t fifo[IMX21_PWM_FIFO_DEPTH];
++    uint32_t fifo_count;
++    /* Periods left before the next sample loads (PWMC REPEAT). */
++    uint32_t repeat;
++    /* When the current period started, in virtual-clock ns. */
++    int64_t period_start;
++    /* The level last driven on the output, -1 before the first. */
++    int32_t duty;
++};
++
++#endif /* IMX21_PWM_H */

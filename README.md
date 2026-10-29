@@ -26,17 +26,23 @@ trademark of its owner, used only to say what hardware this models. See
 | AITC interrupt controller | Complete |
 | GPT1-3 timers | Complete except input capture |
 | UART1-4 | QEMU's i.MX UART; UART1 is the console |
-| Crypto processor on UART3 | Hardware version 3.8 with a made-up identity: GUID `C40BB1E0-0000-4000-8000-0E4000000001`, serial number `0000000000000000`. It holds no keys and refuses key and challenge requests |
+| Crypto processor on UART3 | A made-up identity by default (GUID `C40BB1E0-0000-4000-8000-0E4000000001`, serial number `0000000000000000`, hardware version 3.8), settable. It holds no keys and refuses key and challenge requests |
 | Clocks (CRM) and system control | Registers, PLLs locked at the boot loader's settings |
 | GPIO ports A-F | Complete for the drivers |
-| Keypad port | Used as GPIO: the data register reads the pins. The top button (`/dev/switch`) is row 0; no scan interrupts |
+| Keypad port | Used as GPIO: the data register reads the pins. The top button (`/dev/switch`) is row 0, headphone detect row 3, LCD power column 2, speaker mute column 4; no scan interrupts |
 | CSPI1-3 | Complete except DMA |
-| TSC2100 touchscreen on CSPI3 | Touch conversions and PINTDAV (GPIO PE19); the pen is QEMU's absolute pointer. Audio registers only, no sound |
+| TSC2100 on CSPI3 | Touch conversions and PINTDAV (GPIO PE19); the pen is QEMU's absolute pointer. The audio codec too: playback and recording through `-audiodev`, at the rate its PLL makes |
+| Sensor card on CSPI1 | Kionix KXP74 accelerometer (`/dev/accel`), settable over QMP, and the Atmel AT25080A DC ID EEPROM (`/dev/dcid`), selected through the card's decoder on GPIO PD28/PD27 |
 | LCD controller | Background plane and graphic window (alpha, colour key), 16 bpp, as a QEMU display |
 | NAND flash controller | 64 MiB small-page chip; reads, programs and erases, written back to the image |
-| PWM | Registers |
-| USB host | Control registers and an empty three-port root hub; no transfers |
-| DMA, SSI audio, watchdog, RTC, SDHC, I2C | Not modelled: registers read back as written |
+| PWM | Sample FIFO, period and duty cycle; drives the backlight, which dims the screen |
+| DMA controller | 16 channels: linear, 2D and FIFO transfers, repeat (chaining), bus error status |
+| SSI1-2 and audio multiplexer | FIFOs, interrupts and DMA requests, as slaves of the codec |
+| USB host | Three-port full-speed root hub with control, bulk, interrupt and isochronous transfers: QEMU's USB devices attach |
+| Watchdog | Armed and serviced by the stock kernel; resets the machine, and reports why |
+| RTC | Counts from the host's clock, with alarm and periodic interrupts (the stock kernel has no driver) |
+| I2C controller | An empty bus (the stock kernel has no driver) |
+| SDHC | Not modelled: the Chumby Classic has no card slot |
 
 The patches:
 
@@ -54,6 +60,16 @@ The patches:
 | `0010` | `hw/arm/fsl-imx21.c`, the SoC |
 | `0011` | `hw/arm/chumby_classic.c`, the machine, and `docs/system/arm/chumby-classic.rst` |
 | `0012` | `hw/input/imx21_kpp.c`, the keypad port, and the machine's top button |
+| `0013`-`0015` | `hw/dma/imx21_dma.c`, `hw/audio/imx21_ssi.c` and `imx21_audmux.c`, and the TSC2100's sound |
+| `0016`-`0021` | The PWM's output, the keypad port's outputs, LCD dimming, `qapi/chumby.json` and `hw/misc/chumby_io.c`: backlight, LCD power, speaker mute, headphones, the button's key |
+| `0022` | The codec's clock from MCLK and its PLL |
+| `0023`-`0024` | `hw/usb/hcd-imx21.c`, the USB host's transfers (replacing `imx21_usbotg.c`) |
+| `0025`-`0031` | GPIO outputs, CSPI byte transfers, `hw/sensor/kxp74.c`, `hw/nvram/at25080a.c`, the settable identity and the sensor card on CSPI1 |
+| `0032` | Recording opened only when the guest records |
+| `0033` | A `scale` option for the Cocoa window |
+| `0034`-`0035` | USB host fixes for Linux 5.9's `imx21-hcd` |
+| `0036`-`0041` | The watchdog's reset source and grace period, `hw/rtc/imx21_rtc.c`, the I2C controller, and the interactive command line |
+| `0042` | The codec clocking steadily when its timer runs late |
 
 ## Building
 
@@ -259,6 +275,71 @@ the machine's `button` property, a boolean:
 `qom-get` reads it back. It drives keypad row 0 low while pressed, as the
 hardware does, and the stock kernel polls it, so a press must last a
 little while to be seen: `chumby-ctl ... button tap` holds it 300 ms.
+A key holds it too, from any display's keyboard or from QMP's `send-key`
+and `input-send-event`: F12, or the QKeyCode named by the machine's
+`button-key` option (`-M chumby-classic,button-key=pause`; `none` for
+no key). Other keys go on to the guest.
+
+**Headphones.** The machine's `headphones` property, a boolean: true
+plugs them in. The guest reads the jack's switch on keypad row 3
+(`/proc/sys/sense1/hpin`); the stock software then mutes the speaker.
+
+**Accelerometer.** The machine's `accel-x`, `accel-y` and `accel-z`
+properties, integers in milli-g (-16000 to 16000), set at startup
+(`-M chumby-classic,accel-x=0,...`) or with `qom-set` at any time. The
+default, +1000 on Z and 0 on the others, is the Chumby standing still;
+which way up the real sensor sits isn't known. They are the KXP74
+accelerometer's (`/machine/accel`, whose `x-mg`, `y-mg` and `z-mg` are
+the same values), read by the guest through `/dev/accel`.
+
+**The board's outputs.** `query-chumby-state` returns the lines the guest
+drives and the inputs above:
+
+    {"execute": "query-chumby-state"}
+    {"return": {"backlight": 65535, "lcd-on": true, "speaker-mute": false,
+                "headphones": false, "button": false}}
+
+`backlight` is the PWM's duty cycle, 0 to 65535, which also dims the
+displayed screen (0 is black); `lcd-on` false blanks it. Changes come as
+events: `CHUMBY_BACKLIGHT` `{"level"}` (at most one each 100 ms),
+`CHUMBY_LCD` `{"on"}`, `CHUMBY_SPEAKER_MUTE` `{"muted"}` and
+`CHUMBY_HEADPHONES` `{"inserted"}`. `chumby-ctl SOCKET events` prints
+them as JSON lines.
+
+**Sound.** `-audiodev DRIVER,id=ID -M chumby-classic,audiodev=ID`: the
+TSC2100 codec plays to it as 16-bit stereo at the rate the guest
+programs (44.1 kHz from the stock software), and records from it
+(silence from a backend that can't record, such as CoreAudio). With
+`-audiodev wav,id=a,path=out.wav` the sound goes to a file; QEMU leaves
+the WAV header's sizes at zero when it exits, so read the samples after
+the 44-byte header.
+
+**USB.** QEMU's USB devices attach to the host controller's root hub with
+`-device`: a stick (`-drive if=none,id=stick,file=stick.img,format=raw
+-device usb-storage,drive=stick`), which the stock software mounts on
+`/mnt/usb` from its first partition, `usb-kbd`, `usb-mouse`,
+`usb-tablet`, `usb-audio`, `usb-hub`. Don't attach a network device to
+anything that reaches the host's network unless you mean to.
+
+**Identity.** The machine's `guid` (XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX),
+`serial` (16 letters or digits) and `hwversion` (MAJOR.MINOR) properties
+set what the crypto processor reports and the DC ID EEPROM holds; the
+defaults are a made-up identity. Give each emulated Chumby its own GUID.
+
+**Watchdog and reset.** The stock kernel arms the watchdog for 2.5 s and
+services it every tick; a missed service performs QEMU's watchdog action
+(`-action watchdog=reset`, the default; `none` while debugging), and
+`reboot` in the guest resets the machine through it.
+`/proc/resetReason` tells power-on, software, watchdog and external
+(`system_reset`) resets apart.
+
+**Saving and restoring.** `savevm NAME` (in the human monitor, or QMP's
+`human-monitor-command`) saves the running machine into a qcow2 drive,
+and `-loadvm NAME` (or `loadvm`) restores it in a fraction of a second.
+Attach the NAND as a qcow2 overlay of your image for that:
+`qemu-img create -f qcow2 -b nand.img -F raw nand.qcow2`, then
+`-drive if=mtd,file=nand.qcow2,format=qcow2`. A state saved with
+`-icount` loads only with it, and one saved without, only without.
 
 **Screen.** QMP `screendump` with an absolute `filename` and `"format":
 "png"` (8-bit RGB) or `"ppm"` (the default): the 320x240 frame as the
@@ -267,8 +348,13 @@ file is written by the QEMU process.
 
     {"execute": "screendump", "arguments": {"filename": "/abs/screen.png", "format": "png"}}
 
-**Time.** By default the emulated clock follows the host's.
-`-icount shift=auto,sleep=off` lets it run ahead while the guest is idle.
+**Time.** By default the emulated clock follows the host's, as the real
+device's does: animations, timers and sound run at their real pace, and
+an idle Chumby costs the host little CPU (the vCPU sleeps in the
+kernel's idle loop). Use this for a person at the screen. `-icount
+shift=auto,sleep=off` lets the clock run ahead while the guest is idle,
+which boots to the control panel in seconds and suits scripted tests;
+sound then plays fast, and a host core stays busy.
 
 ## Legal
 

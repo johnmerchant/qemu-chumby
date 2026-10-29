@@ -1,0 +1,686 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 02:58:08 +1030
+Subject: [PATCH 21/42] hw/arm/chumby_classic: Add the backlight, LCD, speaker,
+ headphone and key lines
+
+The stock kernel's sense1 driver handles the Chumby's board-level lines:
+the LCD backlight through the PWM's duty cycle (/proc/sys/sense1/
+brightness), the LCD's power on keypad column 2, the speaker
+amplifier's mute on column 4 (spkmute, high to mute), the headphone
+jack's switch on row 3 (hpin, low while plugged in) and the top button
+on row 0. None but the button reached anything outside the SoC, and the
+button only through a QOM property.
+
+Add a chumby-io device that models these lines and wire it up:
+
+- the backlight level and the LCD's power set the LCD controller's
+  brightness, so the screen dims with the backlight and goes black
+  when either is off. Until the guest first programs the PWM the
+  backlight is full, so kernels without a backlight driver show their
+  screen.
+- headphones are plugged in and out with the "headphones" property.
+- the "button" property moves to the device; and a key, F12 unless
+  "button-key" names another QKeyCode or none, holds the button while
+  it is down, from any display's keyboard or QMP's send-key and
+  input-send-event. Other keys pass on to the guest's keyboard, if it
+  has one. F12 has no use in the stock firmware, which has no
+  keyboard, nor in QEMU's own displays, so the button works in a
+  window out of the box.
+- changes are reported with the CHUMBY_* QMP events, and
+  query-chumby-state returns the lot.
+
+The device's properties are the machine's too, so -M
+chumby-classic,button-key=pause and qom-set /machine headphones true
+work. Speaker mute and headphones are also GPIO outputs, for an audio
+model to use.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ MAINTAINERS                        |   4 +
+ docs/system/arm/chumby-classic.rst |  25 ++-
+ hw/arm/chumby_classic.c            |  77 ++++---
+ hw/misc/chumby_io.c                | 335 +++++++++++++++++++++++++++++
+ hw/misc/meson.build                |   1 +
+ hw/misc/trace-events               |   7 +
+ include/hw/misc/chumby_io.h        |  54 +++++
+ 7 files changed, 471 insertions(+), 32 deletions(-)
+ create mode 100644 hw/misc/chumby_io.c
+ create mode 100644 include/hw/misc/chumby_io.h
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index c307950e8..ea3c6c2a8 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -883,6 +883,7 @@ F: hw/input/imx21_kpp.c
+ F: hw/input/tsc2100.c
+ F: hw/intc/imx21_aitc.c
+ F: hw/misc/imx21_*.c
++F: hw/misc/chumby_io.c
+ F: hw/ssi/imx21_cspi.c
+ F: hw/timer/imx21_gpt.c
+ F: include/hw/arm/fsl-imx21.h
+@@ -890,6 +891,9 @@ F: include/hw/*/imx21_*.h
+ F: include/hw/char/chumby_cp.h
+ F: include/hw/input/imx21_kpp.h
+ F: include/hw/input/tsc2100.h
++F: include/hw/misc/chumby_io.h
++F: qapi/chumby.json
++F: stubs/qmp-chumby.c
+ F: docs/system/arm/chumby-classic.rst
+ 
+ i.MX31 (kzm)
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index d5e4e9ab5..017260afd 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -18,12 +18,14 @@ Emulated devices:
+   challenge requests
+ - Clock and reset module, PLLs locked at the boot loader's settings
+ - GPIO ports A-F
+-- Keypad port, used as GPIO: the top button is row 0
++- Keypad port, used as GPIO: the top button (row 0), headphone detect
++  (row 3), LCD power (column 2) and speaker mute (column 4)
+ - CSPI1-3, with a TI TSC2100 touchscreen controller and audio codec on
+   CSPI3
+ - LCD controller: background plane and graphic window, 16 bpp
+ - NAND flash controller with a 64 MiB small-page NAND chip
+-- PWM, and the USB host's root hub (no devices)
++- PWM, driving the LCD backlight: the screen is dimmed by its duty cycle
++- USB host's root hub (no devices)
+ - DMA controller: 16 channels, linear, 2D and FIFO transfers, repeat
+   (chaining) and the bus error status; the timeouts are not modelled
+ - SSI1 and SSI2 (as slaves of the codec, in normal, network and I2S
+@@ -67,7 +69,24 @@ button). ``screendump`` captures the screen.
+ 
+ The top button (the "squeeze switch", ``/dev/switch`` in the guest) is the
+ machine's ``button`` property: ``qom-set /machine button true`` presses
+-it and ``qom-set /machine button false`` releases it.
++it and ``qom-set /machine button false`` releases it. A key also holds it
++while the key is down, from any display's keyboard or from QMP's
++``send-key`` and ``input-send-event``: F12 unless the machine's
++``button-key`` option names another QKeyCode (``button-key=pause``), or
++``none``. Other keys go on to the guest's keyboard, if it has one.
++
++Headphones are plugged in and out with the machine's ``headphones``
++property (``qom-set /machine headphones true``); the guest reads the
++jack's switch in ``/proc/sys/sense1/hpin``.
++
++The guest's backlight level (the PWM's duty cycle, 0 to 65535) dims the
++displayed screen, and turning the LCD's power off blanks it. Until the
++guest first programs the PWM the backlight is full.
++
++The board's lines are reported over QMP: ``query-chumby-state`` returns
++the backlight level, LCD power, speaker mute, headphones and button, and
++the ``CHUMBY_BACKLIGHT`` (at most one each 100 ms), ``CHUMBY_LCD``,
++``CHUMBY_SPEAKER_MUTE`` and ``CHUMBY_HEADPHONES`` events report changes.
+ 
+ Sound goes to the audio backend given with ``-audiodev`` and the
+ machine's ``audiodev`` property, as 16-bit stereo at the rate the
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+index 40b23f588..62f778e1b 100644
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -19,8 +19,10 @@
+  * its DIN on port 2, its DOUT on port 1; the stock kernel routes SSI1 to
+  * both. The machine's "audiodev" property picks its audio backend.
+  *
+- * The machine's "button" property presses (true) and releases (false)
+- * the top button: qom-set /machine button true.
++ * The board's own lines (backlight, LCD power, speaker mute, headphone
++ * jack, top button) are the chumby-io device. Its "button", "headphones"
++ * and "button-key" properties are the machine's too: qom-set /machine
++ * button true presses the top button.
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -34,6 +36,7 @@
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/qdev-properties-system.h"
+ #include "hw/input/tsc2100.h"
++#include "hw/misc/chumby_io.h"
+ #include "hw/ssi/ssi.h"
+ #include "qemu/cutils.h"
+ #include "qemu/units.h"
+@@ -57,8 +60,11 @@
+ #define CHUMBY_CODEC_DIN_PORT   1
+ #define CHUMBY_CODEC_DOUT_PORT  0
+ 
+-/* The top button: keypad row 0 */
+-#define CHUMBY_BUTTON_KPP_PIN   0
++/* Keypad port pins: rows 0-7, then columns 0-7 */
++#define CHUMBY_BUTTON_KPP_PIN   0       /* top button, row 0 */
++#define CHUMBY_HPIN_KPP_PIN     3       /* headphone detect, row 3 */
++#define CHUMBY_LCD_ON_KPP_PIN   (8 + 2) /* LCD power, column 2 */
++#define CHUMBY_MUTE_KPP_PIN     (8 + 4) /* speaker mute, column 4 */
+ 
+ #define TYPE_CHUMBY_CLASSIC_MACHINE MACHINE_TYPE_NAME("chumby-classic")
+ OBJECT_DECLARE_SIMPLE_TYPE(ChumbyClassicState, CHUMBY_CLASSIC_MACHINE)
+@@ -67,31 +73,32 @@ struct ChumbyClassicState {
+     MachineState parent_obj;
+ 
+     FslIMX21State soc;
+-    bool button;
++    ChumbyIOState io;
+ };
+ 
+ static struct arm_boot_info chumby_binfo;
+ 
+-static void chumby_classic_set_button_pin(ChumbyClassicState *s)
++/* Wires the board's lines to the keypad port, PWM and LCD controller. */
++static void chumby_classic_connect_io(ChumbyClassicState *s)
+ {
+-    qemu_set_irq(qdev_get_gpio_in(DEVICE(&s->soc.kpp),
+-                                  CHUMBY_BUTTON_KPP_PIN), !s->button);
+-}
+-
+-static bool chumby_classic_get_button(Object *obj, Error **errp)
+-{
+-    return CHUMBY_CLASSIC_MACHINE(obj)->button;
+-}
+-
+-static void chumby_classic_set_button(Object *obj, bool value, Error **errp)
+-{
+-    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
+-
+-    s->button = value;
+-    /* Before the board is built, init sets the pin. */
+-    if (s->soc.parent_obj.realized) {
+-        chumby_classic_set_button_pin(s);
+-    }
++    DeviceState *io = DEVICE(&s->io);
++    DeviceState *kpp = DEVICE(&s->soc.kpp);
++
++    qdev_realize(io, NULL, &error_fatal);
++    qdev_connect_gpio_out(s->soc.pwm, 0,
++                          qdev_get_gpio_in_named(io, CHUMBY_IO_BACKLIGHT, 0));
++    qdev_connect_gpio_out(kpp, CHUMBY_LCD_ON_KPP_PIN,
++                          qdev_get_gpio_in_named(io, CHUMBY_IO_LCD_POWER, 0));
++    qdev_connect_gpio_out(kpp, CHUMBY_MUTE_KPP_PIN,
++                          qdev_get_gpio_in_named(io, CHUMBY_IO_AMP_MUTE, 0));
++    qdev_connect_gpio_out_named(io, CHUMBY_IO_LCD_BRIGHTNESS, 0,
++                                qdev_get_gpio_in_named(DEVICE(&s->soc.lcdc),
++                                                       IMX21_LCDC_BRIGHTNESS,
++                                                       0));
++    qdev_connect_gpio_out_named(io, CHUMBY_IO_BUTTON_N, 0,
++                                qdev_get_gpio_in(kpp, CHUMBY_BUTTON_KPP_PIN));
++    qdev_connect_gpio_out_named(io, CHUMBY_IO_HEADPHONES_N, 0,
++                                qdev_get_gpio_in(kpp, CHUMBY_HPIN_KPP_PIN));
+ }
+ 
+ static bool chumby_classic_codec_dac(void *opaque, int16_t *samples,
+@@ -155,7 +162,7 @@ static void chumby_classic_init(MachineState *machine)
+                                 qdev_get_gpio_in(DEVICE(&s->soc.gpio),
+                                                  CHUMBY_PINTDAV_GPIO));
+ 
+-    chumby_classic_set_button_pin(s);
++    chumby_classic_connect_io(s);
+ 
+     if (!machine->kernel_cmdline || !*machine->kernel_cmdline) {
+         g_free(machine->kernel_cmdline);
+@@ -171,6 +178,21 @@ static void chumby_classic_init(MachineState *machine)
+     }
+ }
+ 
++static void chumby_classic_instance_init(Object *obj)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    static const char *const io_props[] = {
++        "button", "headphones", "button-key",
++    };
++    int i;
++
++    object_initialize_child(obj, "io", &s->io, TYPE_CHUMBY_IO);
++    for (i = 0; i < ARRAY_SIZE(io_props); i++) {
++        object_property_add_alias(obj, io_props[i], OBJECT(&s->io),
++                                  io_props[i]);
++    }
++}
++
+ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+ {
+     MachineClass *mc = MACHINE_CLASS(oc);
+@@ -182,16 +204,13 @@ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+     mc->default_ram_id = "chumby.ram";
+ 
+     machine_add_audiodev_property(mc);
+-    object_class_property_add_bool(oc, "button", chumby_classic_get_button,
+-                                   chumby_classic_set_button);
+-    object_class_property_set_description(oc, "button",
+-        "The top button: true while pressed");
+ }
+ 
+ static const TypeInfo chumby_classic_info = {
+     .name = TYPE_CHUMBY_CLASSIC_MACHINE,
+     .parent = TYPE_MACHINE,
+     .instance_size = sizeof(ChumbyClassicState),
++    .instance_init = chumby_classic_instance_init,
+     .class_init = chumby_classic_class_init,
+     .interfaces = arm_machine_interfaces,
+ };
+diff --git a/hw/misc/chumby_io.c b/hw/misc/chumby_io.c
+new file mode 100644
+index 000000000..d656f2fcc
+--- /dev/null
++++ b/hw/misc/chumby_io.c
+@@ -0,0 +1,335 @@
++/*
++ * Chumby Classic board controls
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The board-level lines around the i.MX21 that a user sees or handles,
++ * as the stock kernel's sense1 driver uses them:
++ *
++ * - the LCD backlight, driven by the PWM's duty cycle (the driver writes
++ *   samples of 700 to 0xffff), and the panel's power, keypad column 2;
++ *   together they set how bright the LCD controller's output is drawn,
++ *   from black (off) to full. Until the PWM is first programmed the
++ *   backlight is full, so kernels without a backlight driver show their
++ *   screen.
++ * - the speaker amplifier's mute, keypad column 4, high to mute.
++ * - the headphone jack's detect switch, keypad row 3, low while
++ *   headphones are plugged in: the "headphones" property.
++ * - the top button, keypad row 0, low while pressed: the "button"
++ *   property, and a key ("button-key", a QKeyCode name) that holds the
++ *   button while it is down. Other keys pass on to the next keyboard.
++ *
++ * Changes are reported as QMP events and query-chumby-state returns the
++ * lot; see qapi/chumby.json.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/misc/chumby_io.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-chumby.h"
++#include "qapi/qapi-events-chumby.h"
++#include "qapi/qapi-types-ui.h"
++#include "qapi/util.h"
++#include "qemu/module.h"
++#include "system/reset.h"
++#include "trace.h"
++
++static void chumby_io_update_lcd(ChumbyIOState *s)
++{
++    qemu_set_irq(s->lcd_brightness, s->lcd_on ? s->backlight : 0);
++}
++
++static void chumby_io_set_backlight(void *opaque, int n, int level)
++{
++    ChumbyIOState *s = opaque;
++    uint32_t backlight = MIN(MAX(level, 0), CHUMBY_IO_BACKLIGHT_MAX);
++
++    if (backlight != s->backlight) {
++        trace_chumby_io_backlight(backlight);
++        s->backlight = backlight;
++        chumby_io_update_lcd(s);
++        qapi_event_send_chumby_backlight(backlight);
++    }
++}
++
++static void chumby_io_set_lcd_power(void *opaque, int n, int level)
++{
++    ChumbyIOState *s = opaque;
++
++    if (!!level != s->lcd_on) {
++        trace_chumby_io_lcd(!!level);
++        s->lcd_on = level;
++        chumby_io_update_lcd(s);
++        qapi_event_send_chumby_lcd(s->lcd_on);
++    }
++}
++
++static void chumby_io_set_amp_mute(void *opaque, int n, int level)
++{
++    ChumbyIOState *s = opaque;
++
++    if (!!level != s->speaker_mute) {
++        trace_chumby_io_speaker_mute(!!level);
++        s->speaker_mute = level;
++        qemu_set_irq(s->speaker_mute_out, s->speaker_mute);
++        qapi_event_send_chumby_speaker_mute(s->speaker_mute);
++    }
++}
++
++static void chumby_io_update_button(ChumbyIOState *s)
++{
++    qemu_set_irq(s->button_n, !s->button);
++}
++
++static void chumby_io_update_headphones(ChumbyIOState *s)
++{
++    qemu_set_irq(s->headphones_n, !s->headphones);
++    qemu_set_irq(s->headphones_out, s->headphones);
++}
++
++static void chumby_io_press_button(ChumbyIOState *s, bool pressed)
++{
++    if (pressed != s->button) {
++        trace_chumby_io_button(pressed);
++        s->button = pressed;
++        chumby_io_update_button(s);
++    }
++}
++
++static void chumby_io_key_event(DeviceState *dev, QemuConsole *src,
++                                QemuInputEvent *evt)
++{
++    ChumbyIOState *s = CHUMBY_IO(dev);
++
++    if (evt->type == INPUT_EVENT_KIND_KEY &&
++        qemu_input_linux_to_qcode(evt->key.key) == s->button_qcode) {
++        chumby_io_press_button(s, evt->key.down);
++        return;
++    }
++    qemu_input_event_pass_on(s->key_handler, src, evt);
++}
++
++static const QemuInputHandler chumby_io_key_handler = {
++    .name = "Chumby top button",
++    .mask = INPUT_EVENT_MASK_KEY,
++    .event = chumby_io_key_event,
++};
++
++/* A handler while a key is bound, ahead of any keyboard. */
++static void chumby_io_update_key_handler(ChumbyIOState *s)
++{
++    if (s->button_qcode >= 0 && !s->key_handler) {
++        s->key_handler = qemu_input_handler_register(DEVICE(s),
++                                                     &chumby_io_key_handler);
++        qemu_input_handler_activate(s->key_handler);
++    } else if (s->button_qcode < 0 && s->key_handler) {
++        qemu_input_handler_unregister(s->key_handler);
++        s->key_handler = NULL;
++    }
++}
++
++static bool chumby_io_get_button(Object *obj, Error **errp)
++{
++    return CHUMBY_IO(obj)->button;
++}
++
++static void chumby_io_set_button(Object *obj, bool value, Error **errp)
++{
++    chumby_io_press_button(CHUMBY_IO(obj), value);
++}
++
++static bool chumby_io_get_headphones(Object *obj, Error **errp)
++{
++    return CHUMBY_IO(obj)->headphones;
++}
++
++static void chumby_io_set_headphones(Object *obj, bool value, Error **errp)
++{
++    ChumbyIOState *s = CHUMBY_IO(obj);
++
++    if (value != s->headphones) {
++        trace_chumby_io_headphones(value);
++        s->headphones = value;
++        chumby_io_update_headphones(s);
++        qapi_event_send_chumby_headphones(value);
++    }
++}
++
++static char *chumby_io_get_button_key(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_IO(obj)->button_key);
++}
++
++static void chumby_io_set_button_key(Object *obj, const char *value,
++                                     Error **errp)
++{
++    ChumbyIOState *s = CHUMBY_IO(obj);
++    int qcode = -1;
++
++    if (*value && strcmp(value, "none")) {
++        qcode = qapi_enum_parse(&QKeyCode_lookup, value, -1, errp);
++        if (qcode < 0) {
++            return;
++        }
++    }
++    if (s->button && qcode != s->button_qcode) {
++        chumby_io_press_button(s, false);
++    }
++    g_free(s->button_key);
++    s->button_key = g_strdup(qcode < 0 ? "none" : value);
++    s->button_qcode = qcode;
++    if (DEVICE(s)->realized) {
++        chumby_io_update_key_handler(s);
++    }
++}
++
++ChumbyState *qmp_query_chumby_state(Error **errp)
++{
++    ChumbyIOState *s;
++    ChumbyState *info;
++
++    s = CHUMBY_IO(object_resolve_path_type("", TYPE_CHUMBY_IO, NULL));
++    if (!s) {
++        error_setg(errp, "This machine has no Chumby board");
++        return NULL;
++    }
++    info = g_new0(ChumbyState, 1);
++    info->backlight = s->backlight;
++    info->lcd_on = s->lcd_on;
++    info->speaker_mute = s->speaker_mute;
++    info->headphones = s->headphones;
++    info->button = s->button;
++    return info;
++}
++
++static void chumby_io_reset(DeviceState *dev)
++{
++    ChumbyIOState *s = CHUMBY_IO(dev);
++
++    /*
++     * The PWM is not programmed yet: the backlight is full. The panel's
++     * power and the amplifier's mute follow the keypad port's pins, which
++     * idle high.
++     */
++    chumby_io_set_backlight(s, 0, CHUMBY_IO_BACKLIGHT_MAX);
++    chumby_io_update_lcd(s);
++    qemu_set_irq(s->speaker_mute_out, s->speaker_mute);
++    chumby_io_update_button(s);
++    chumby_io_update_headphones(s);
++}
++
++static void chumby_io_realize(DeviceState *dev, Error **errp)
++{
++    ChumbyIOState *s = CHUMBY_IO(dev);
++
++    chumby_io_update_key_handler(s);
++    qemu_register_resettable(OBJECT(dev));
++}
++
++static void chumby_io_unrealize(DeviceState *dev)
++{
++    ChumbyIOState *s = CHUMBY_IO(dev);
++
++    qemu_unregister_resettable(OBJECT(dev));
++    if (s->key_handler) {
++        qemu_input_handler_unregister(s->key_handler);
++        s->key_handler = NULL;
++    }
++}
++
++static void chumby_io_init(Object *obj)
++{
++    ChumbyIOState *s = CHUMBY_IO(obj);
++    DeviceState *dev = DEVICE(obj);
++
++    qdev_init_gpio_in_named(dev, chumby_io_set_backlight,
++                            CHUMBY_IO_BACKLIGHT, 1);
++    qdev_init_gpio_in_named(dev, chumby_io_set_lcd_power,
++                            CHUMBY_IO_LCD_POWER, 1);
++    qdev_init_gpio_in_named(dev, chumby_io_set_amp_mute,
++                            CHUMBY_IO_AMP_MUTE, 1);
++    qdev_init_gpio_out_named(dev, &s->lcd_brightness,
++                             CHUMBY_IO_LCD_BRIGHTNESS, 1);
++    qdev_init_gpio_out_named(dev, &s->button_n, CHUMBY_IO_BUTTON_N, 1);
++    qdev_init_gpio_out_named(dev, &s->headphones_n,
++                             CHUMBY_IO_HEADPHONES_N, 1);
++    qdev_init_gpio_out_named(dev, &s->speaker_mute_out,
++                             CHUMBY_IO_SPEAKER_MUTE, 1);
++    qdev_init_gpio_out_named(dev, &s->headphones_out,
++                             CHUMBY_IO_HEADPHONES, 1);
++
++    /* The lines' levels at power on, as the pins idle */
++    s->backlight = CHUMBY_IO_BACKLIGHT_MAX;
++    s->lcd_on = true;
++    s->speaker_mute = true;
++    s->button_key = g_strdup("f12");
++    s->button_qcode = Q_KEY_CODE_F12;
++}
++
++static void chumby_io_finalize(Object *obj)
++{
++    g_free(CHUMBY_IO(obj)->button_key);
++}
++
++static const VMStateDescription vmstate_chumby_io = {
++    .name = TYPE_CHUMBY_IO,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(backlight, ChumbyIOState),
++        VMSTATE_BOOL(lcd_on, ChumbyIOState),
++        VMSTATE_BOOL(speaker_mute, ChumbyIOState),
++        VMSTATE_BOOL(button, ChumbyIOState),
++        VMSTATE_BOOL(headphones, ChumbyIOState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void chumby_io_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = chumby_io_realize;
++    dc->unrealize = chumby_io_unrealize;
++    dc->vmsd = &vmstate_chumby_io;
++    device_class_set_legacy_reset(dc, chumby_io_reset);
++    dc->desc = "Chumby Classic board controls";
++    /* Part of the chumby-classic machine */
++    dc->user_creatable = false;
++
++    object_class_property_add_bool(klass, "button", chumby_io_get_button,
++                                   chumby_io_set_button);
++    object_class_property_set_description(klass, "button",
++        "The top button: true while pressed");
++    object_class_property_add_bool(klass, "headphones",
++                                   chumby_io_get_headphones,
++                                   chumby_io_set_headphones);
++    object_class_property_set_description(klass, "headphones",
++        "Headphones: true while plugged in");
++    object_class_property_add_str(klass, "button-key",
++                                  chumby_io_get_button_key,
++                                  chumby_io_set_button_key);
++    object_class_property_set_description(klass, "button-key",
++        "The key (a QKeyCode name, or none) that holds the top button "
++        "while it is down; default f12");
++}
++
++static const TypeInfo chumby_io_info = {
++    .name = TYPE_CHUMBY_IO,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(ChumbyIOState),
++    .instance_init = chumby_io_init,
++    .instance_finalize = chumby_io_finalize,
++    .class_init = chumby_io_class_init,
++};
++
++static void chumby_io_register_types(void)
++{
++    type_register_static(&chumby_io_info);
++}
++
++type_init(chumby_io_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 3234d26df..0e74c8e61 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -169,3 +169,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_crm.c', 'imx21_pwm.c', 'imx21_usbotg.c'))
++system_ss.add(when: 'CONFIG_CHUMBY_CLASSIC', if_true: files('chumby_io.c'))
+diff --git a/hw/misc/trace-events b/hw/misc/trace-events
+index 24d02ebfe..f0313af43 100644
+--- a/hw/misc/trace-events
++++ b/hw/misc/trace-events
+@@ -447,3 +447,10 @@ iommu_testdev_dma_armed(bool armed) "armed=%d"
+ imx21_pwm_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
+ imx21_pwm_output(uint32_t sample, uint32_t period, int duty) "sample %u period %u duty %d"
+ imx21_pwm_fifo_full(uint64_t value) "sample 0x%" PRIx64 " dropped"
++
++# chumby_io.c
++chumby_io_backlight(uint32_t level) "level %u"
++chumby_io_lcd(bool on) "on %d"
++chumby_io_speaker_mute(bool muted) "muted %d"
++chumby_io_headphones(bool inserted) "inserted %d"
++chumby_io_button(bool pressed) "pressed %d"
+diff --git a/include/hw/misc/chumby_io.h b/include/hw/misc/chumby_io.h
+new file mode 100644
+index 000000000..898fd6424
+--- /dev/null
++++ b/include/hw/misc/chumby_io.h
+@@ -0,0 +1,54 @@
++/*
++ * Chumby Classic board controls
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef CHUMBY_IO_H
++#define CHUMBY_IO_H
++
++#include "hw/core/qdev.h"
++#include "ui/input.h"
++#include "qom/object.h"
++
++#define TYPE_CHUMBY_IO "chumby-io"
++OBJECT_DECLARE_SIMPLE_TYPE(ChumbyIOState, CHUMBY_IO)
++
++/* GPIO inputs, from the SoC */
++#define CHUMBY_IO_BACKLIGHT     "backlight"     /* PWM duty, 0 to 0xffff */
++#define CHUMBY_IO_LCD_POWER     "lcd-power"     /* high: panel on */
++#define CHUMBY_IO_AMP_MUTE      "amp-mute"      /* high: speaker muted */
++
++/* GPIO outputs */
++#define CHUMBY_IO_LCD_BRIGHTNESS "lcd-brightness" /* to the LCDC */
++#define CHUMBY_IO_BUTTON_N      "button-n"      /* low while held */
++#define CHUMBY_IO_HEADPHONES_N  "headphones-n"  /* low while plugged in */
++#define CHUMBY_IO_SPEAKER_MUTE  "speaker-mute"  /* high: speaker muted */
++#define CHUMBY_IO_HEADPHONES    "headphones"    /* high: plugged in */
++
++#define CHUMBY_IO_BACKLIGHT_MAX 0xffff
++
++struct ChumbyIOState {
++    DeviceState parent_obj;
++
++    qemu_irq lcd_brightness;
++    qemu_irq button_n;
++    qemu_irq headphones_n;
++    qemu_irq speaker_mute_out;
++    qemu_irq headphones_out;
++    QemuInputHandlerState *key_handler;
++    char *button_key;
++    int button_qcode;
++
++    /* Driven by the guest */
++    uint32_t backlight;
++    bool lcd_on;
++    bool speaker_mute;
++    /* Driven by the user */
++    bool button;
++    bool headphones;
++};
++
++#endif /* CHUMBY_IO_H */

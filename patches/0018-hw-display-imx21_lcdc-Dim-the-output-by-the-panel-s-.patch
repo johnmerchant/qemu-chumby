@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 02:57:40 +1030
+Subject: [PATCH 18/42] hw/display/imx21_lcdc: Dim the output by the panel's
+ brightness
+
+How bright an LCD looks is up to the board: its backlight, and whether
+the panel is powered at all. On the Chumby the PWM sets the backlight
+and a keypad-port line powers the panel.
+
+Add a "brightness" GPIO input, 0 (dark) to 0xffff (full, the level at
+power on), and scale the displayed frame by it, so that a dimmed
+backlight shows dimmed and an unlit one shows black.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/display/imx21_lcdc.c         | 40 +++++++++++++++++++++++++++++++--
+ include/hw/display/imx21_lcdc.h |  8 +++++++
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/imx21_lcdc.c b/hw/display/imx21_lcdc.c
+index da2fa57f8..bd9409392 100644
+--- a/hw/display/imx21_lcdc.c
++++ b/hw/display/imx21_lcdc.c
+@@ -9,6 +9,10 @@
+  * blending and a colour key, both read from system memory. Only 16 bpp
+  * (RGB565) frames are drawn. The registers are kept as written; every
+  * frame has always ended, so the interrupt status reads as such.
++ *
++ * The board sets how bright the panel is (its backlight, or whether it is
++ * powered at all) through the "brightness" GPIO input, and the displayed
++ * frame is dimmed in proportion: 0 is black.
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -180,6 +184,33 @@ static void imx21_lcdc_render(IMX21LCDCState *s, uint32_t *dest, int w, int h)
+     }
+ }
+ 
++/* Scales the frame by the panel's brightness. */
++static void imx21_lcdc_dim(IMX21LCDCState *s, uint32_t *frame, int n)
++{
++    uint32_t level = MIN(s->brightness, IMX21_LCDC_BRIGHTNESS_MAX);
++    int i, shift;
++
++    if (level == IMX21_LCDC_BRIGHTNESS_MAX) {
++        return;
++    }
++    for (i = 0; i < n; i++) {
++        uint32_t p = frame[i], out = 0;
++
++        for (shift = 0; shift < 24; shift += 8) {
++            out |= (((p >> shift) & 0xff) * level /
++                    IMX21_LCDC_BRIGHTNESS_MAX) << shift;
++        }
++        frame[i] = out;
++    }
++}
++
++static void imx21_lcdc_set_brightness(void *opaque, int n, int level)
++{
++    IMX21LCDCState *s = opaque;
++
++    s->brightness = MAX(level, 0);
++}
++
+ static bool imx21_lcdc_update_display(void *opaque)
+ {
+     IMX21LCDCState *s = opaque;
+@@ -199,6 +230,7 @@ static bool imx21_lcdc_update_display(void *opaque)
+     }
+     frame = g_new(uint32_t, w * h);
+     imx21_lcdc_render(s, frame, w, h);
++    imx21_lcdc_dim(s, frame, w * h);
+     /* Only changed frames go to the displays. */
+     if (memcmp(surface_data(surface), frame, w * h * 4)) {
+         memcpy(surface_data(surface), frame, w * h * 4);
+@@ -236,17 +268,21 @@ static void imx21_lcdc_realize(DeviceState *dev, Error **errp)
+                           TYPE_IMX21_LCDC, 0x1000);
+     sysbus_init_mmio(sbd, &s->iomem);
+     sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_in_named(dev, imx21_lcdc_set_brightness,
++                            IMX21_LCDC_BRIGHTNESS, 1);
++    s->brightness = IMX21_LCDC_BRIGHTNESS_MAX;
+     s->con = qemu_graphic_console_create(dev, 0, &imx21_lcdc_gfx_ops, s);
+     qemu_console_resize(s->con, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+ }
+ 
+ static const VMStateDescription vmstate_imx21_lcdc = {
+     .name = TYPE_IMX21_LCDC,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
++    .version_id = 2,
++    .minimum_version_id = 2,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT32_ARRAY(regs, IMX21LCDCState, IMX21_LCDC_NUM_REGS),
+         VMSTATE_UINT32_ARRAY(palette, IMX21LCDCState, 256),
++        VMSTATE_UINT32(brightness, IMX21LCDCState),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+diff --git a/include/hw/display/imx21_lcdc.h b/include/hw/display/imx21_lcdc.h
+index f01408804..0358649db 100644
+--- a/include/hw/display/imx21_lcdc.h
++++ b/include/hw/display/imx21_lcdc.h
+@@ -18,6 +18,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMX21LCDCState, IMX21_LCDC)
+ 
+ #define IMX21_LCDC_NUM_REGS (0x80 / 4)
+ 
++/*
++ * The "brightness" GPIO input: the panel's light, from 0 (dark) to
++ * IMX21_LCDC_BRIGHTNESS_MAX (full, the level at power on).
++ */
++#define IMX21_LCDC_BRIGHTNESS "brightness"
++#define IMX21_LCDC_BRIGHTNESS_MAX 0xffff
++
+ struct IMX21LCDCState {
+     SysBusDevice parent_obj;
+ 
+@@ -27,6 +34,7 @@ struct IMX21LCDCState {
+ 
+     uint32_t regs[IMX21_LCDC_NUM_REGS];
+     uint32_t palette[256];
++    uint32_t brightness;
+ };
+ 
+ #endif /* IMX21_LCDC_H */

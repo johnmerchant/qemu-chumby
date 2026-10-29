@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 04:15:37 +1030
+Subject: [PATCH 42/42] hw/input/tsc2100: Clock steadily when the audio timer
+ runs late
+
+When its timer ran late the codec caught up with as much as 100 ms of
+frames in one go, more than two of the stock driver's 8 KiB periods.
+The DMA then ran into the next period before the period interrupt was
+handled, and the handler, which busy-waits for the next period to have
+just started, timed out ("timed-out wating for DMA to start"). A real
+codec doesn't catch up: clock at most 4 ms at a time and let the rest
+slip, as an overloaded host loses sound rather than bursting it.
+
+Booting the stock firmware in real time on a busy host, the timeouts
+went from 2 to 1 (that one at a host stall the kernel reports as missed
+timer ticks).
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/input/tsc2100.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+index 1480d8dde..a7010db55 100644
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -334,10 +334,16 @@ static void tsc2100_audio_tick(void *opaque)
+     uint64_t due = muldiv64(now - s->clock_start, s->rate,
+                             NANOSECONDS_PER_SECOND) - s->clocked;
+ 
+-    /* After a long gap (the machine stopped), start afresh. */
+-    if (due > s->rate / 10) {
+-        s->clocked += due - s->rate / 10;
+-        due = s->rate / 10;
++    /*
++     * A real codec clocks steadily: when the timer runs late (a busy host,
++     * the machine stopped), clock at most a few milliseconds and let the
++     * rest slip. Catching up in one go would move several of the guest's
++     * DMA periods at once, while its interrupt handler, which the stock
++     * driver busy-waits in for the next period to start, can't run.
++     */
++    if (due > s->rate / 250) {
++        s->clocked += due - s->rate / 250;
++        due = s->rate / 250;
+     }
+     tsc2100_audio_clock(s, due);
+     s->clocked += due;

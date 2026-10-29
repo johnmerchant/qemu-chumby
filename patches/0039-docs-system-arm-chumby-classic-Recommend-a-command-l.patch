@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 04:02:28 +1030
+Subject: [PATCH 39/42] docs/system/arm/chumby-classic: Recommend a command
+ line for interactive use
+
+-icount shift=auto,sleep=off boots fast but is wrong for a person at the
+screen. Measured with the stock firmware on an otherwise busy host:
+
+- Clock: without -icount, /proc/uptime advanced 61.13 s over 61.13 s of
+  host time, and 31.08 s over 31.09 s. With -icount shift=auto,sleep=off
+  it advanced 153 s over 21 s of host time while the guest was idle.
+- Idle: without -icount, with the stock set-up screen up and the guest's
+  load average at 0.01, QEMU used 10% of a host core (6.1 s of CPU over
+  61 s), and 3% with the Flash player stopped; QMP samples found the
+  vCPU just past the kernel's WFI in 183 and 198 of 200 samples. With
+  -icount shift=auto,sleep=off it used 100% (20.1 s over 20.0 s).
+- Input: a tap sent with input-send-event reached a guest process
+  reading /dev/input/event0 72 to 83 ms later (as seen on the serial
+  console), and a tap on the set-up screen's SKIP button changed the
+  screen 108 ms later (polling screendump).
+
+So the timer, interrupt controller and idle paths need no change: run
+without -icount for interactive use. Say so in the docs.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index 4d8554a3b..7a2076337 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -147,6 +147,23 @@ The emulated clock follows the host's. ``-icount shift=auto,sleep=off``
+ lets it run ahead while the guest is idle, which boots several times
+ faster.
+ 
++Interactive use
++~~~~~~~~~~~~~~~
++
++For a person using the screen, run without ``-icount``:
++
++.. code-block:: bash
++
++  $ qemu-system-arm -M chumby-classic -kernel zImage \
++      -drive if=mtd,file=nand.img,format=raw -serial stdio
++
++Then the guest's clock keeps to wall-clock time, so its animations,
++timers and ``date`` run at their real pace, and the vCPU sleeps in the
++kernel's idle loop (``WFI``), so an idle Chumby costs the host little
++CPU time. With ``-icount shift=auto,sleep=off`` the guest's clock instead
++jumps ahead whenever it is idle, which suits scripted tests but makes
++timers fire early for a person watching, and it keeps a host core busy.
++
+ Device identity
+ ---------------
+ 

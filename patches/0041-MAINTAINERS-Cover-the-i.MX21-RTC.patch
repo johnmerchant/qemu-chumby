@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 04:03:03 +1030
+Subject: [PATCH 41/42] MAINTAINERS: Cover the i.MX21 RTC
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ MAINTAINERS | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 40c7956ba..a5409ad0b 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -886,6 +886,7 @@ F: hw/misc/imx21_*.c
+ F: hw/misc/chumby_io.c
+ F: hw/nvram/at25080a.c
+ F: hw/sensor/kxp74.c
++F: hw/rtc/imx21_rtc.c
+ F: hw/ssi/imx21_cspi.c
+ F: hw/timer/imx21_gpt.c
+ F: hw/usb/hcd-imx21.c

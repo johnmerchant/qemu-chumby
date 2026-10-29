@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 03:21:45 +1030
+Subject: [PATCH 22/42] hw/input/tsc2100: Clock the audio link from MCLK
+ through the PLL
+
+The codec's word clock was Fsref taken from CONTROL3's 44.1/48 kHz
+select, whatever the PLL said. On the TSC2100, Fsref comes from MCLK:
+through the PLL as MCLK * J.D / (2048 * P) when PLL1.PLLSEL is set, or
+as MCLK / (128 * Q) without it; and the codec drives the link only as
+master (CONTROL3.SLVMS). The stock driver (chumby-tsc2100.c) programs
+P, J and D for the 16 MHz oscillator of hardware 1.6 and later, and
+sets SLVMS.
+
+Model that, with the master clock as an "mclk" property defaulting to
+16 MHz, so a driver that misprograms the PLL or leaves the codec a slave
+hears it. The stock firmware's playback still runs at 44.1 kHz
+(hw_ptr advancing 176000 frames in 4 s).
+
+Derived from a frame-rate model written alongside the Linux 5.9 TSC2100
+driver.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/input/tsc2100.c         | 43 +++++++++++++++++++++++++++++++-------
+ include/hw/input/tsc2100.h |  1 +
+ 2 files changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+index f25129bb4..c54ceccf0 100644
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -14,10 +14,12 @@
+  * position maps onto the ADC's full range (X left to right, Y bottom to
+  * top) and the left button presses it.
+  *
+- * The audio codec is the master of its serial link (I2S, 16-bit words):
+- * while it is powered up (POWERCON.PWDNC clear) it clocks frames at the
+- * DAC's rate, Fsref (48 or 44.1 kHz, CONTROL3.REFFS) divided by
+- * CONTROL1.DACFS, through the link the board gives it, a millisecond's
++ * The audio codec can be the master of its serial link (I2S, 16-bit
++ * words): while it is powered up (POWERCON.PWDNC clear) and master
++ * (CONTROL3.SLVMS) it clocks frames at the DAC's rate, Fsref divided by
++ * CONTROL1.DACFS. Fsref comes from the "mclk" input (16 MHz on the
++ * Chumby from hardware 1.6 on) through the PLL, MCLK * J.D / (2048 * P),
++ * or with the PLL off MCLK / (128 * Q), through the link the board gives it, a millisecond's
+  * worth at a time. Those it plays go to the audio backend as 16-bit
+  * stereo at that rate, with the DAC's volume and mutes (AUDIODAC) and
+  * muted while the DAC is powered down; those it records come from the
+@@ -54,9 +56,12 @@
+ #define REG_AUDIODAC    REG(2, 2)
+ #define REG_POWERCON    REG(2, 5)
+ #define REG_AUDIO_CTRL3 REG(2, 6)
++#define REG_PLL1        REG(2, 0x1b)
++#define REG_PLL2        REG(2, 0x1c)
+ 
+ #define CTRL1_DACFS(v)  (((v) >> 3) & 7)
+-#define CTRL3_REFFS     (1 << 13)
++#define CTRL3_SLVMS     (1 << 11)
++#define PLL1_PLLSEL     (1 << 15)
+ #define AUDIODAC_LMUTE  (1 << 15)
+ #define AUDIODAC_RMUTE  (1 << 7)
+ #define POWERCON_PWDNC  (1 << 15)
+@@ -167,12 +172,32 @@ static uint16_t tsc2100_read_reg(TSC2100State *s, int reg)
+     }
+ }
+ 
++/* The word clock the codec drives as master, in Hz; 0 if it is a slave. */
+ static int tsc2100_dac_rate(TSC2100State *s)
+ {
+     /* Fsref divided by 1, 1.5, 2, 3, 4, 5, 5.5 or 6: twice these */
+     static const int div2[8] = { 2, 3, 4, 6, 8, 10, 11, 12 };
+-    int fsref = (s->regs[REG_AUDIO_CTRL3] & CTRL3_REFFS) ? 44100 : 48000;
++    /* PLL1.QVAL codes 0 and 1 mean 16 and 17 */
++    static const unsigned qval[16] = {
++        16, 17, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
++    };
++    uint16_t pll1 = s->regs[REG_PLL1];
++    uint64_t fsref;
++    unsigned p, k;
+ 
++    if (!(s->regs[REG_AUDIO_CTRL3] & CTRL3_SLVMS)) {
++        return 0;
++    }
++    if (pll1 & PLL1_PLLSEL) {
++        p = (pll1 >> 8) & 7;
++        p = p ? p : 8;
++        /* K = J.D, in 1/10000 */
++        k = ((pll1 >> 2) & 0x3f) * 10000 +
++            ((s->regs[REG_PLL2] >> 2) & 0x3fff);
++        fsref = (uint64_t)s->mclk * k / (2048ULL * p * 10000);
++    } else {
++        fsref = s->mclk / (128 * qval[(pll1 >> 11) & 0xf]);
++    }
+     return fsref * 2 / div2[CTRL1_DACFS(s->regs[REG_AUDIO_CTRL1])];
+ }
+ 
+@@ -308,7 +333,8 @@ static void tsc2100_audio_update(TSC2100State *s)
+     if (!s->audio_timer) {
+         return;
+     }
+-    if (s->regs[REG_POWERCON] & POWERCON_PWDNC) {
++    rate = tsc2100_dac_rate(s);
++    if ((s->regs[REG_POWERCON] & POWERCON_PWDNC) || rate < 1000) {
+         timer_del(s->audio_timer);
+         if (s->dac_voice) {
+             audio_be_set_active_out(s->audio_be, s->dac_voice, false);
+@@ -323,7 +349,6 @@ static void tsc2100_audio_update(TSC2100State *s)
+         return;
+     }
+ 
+-    rate = tsc2100_dac_rate(s);
+     if (rate != s->rate) {
+         as.freq = rate;
+         s->dac_voice = audio_be_open_out(s->audio_be, s->dac_voice,
+@@ -530,6 +555,8 @@ static const VMStateDescription vmstate_tsc2100 = {
+ 
+ static const Property tsc2100_properties[] = {
+     DEFINE_AUDIO_PROPERTIES(TSC2100State, audio_be),
++    /* The codec's master clock: the Chumby's 16 MHz oscillator */
++    DEFINE_PROP_UINT32("mclk", TSC2100State, mclk, 16000000),
+ };
+ 
+ static void tsc2100_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/input/tsc2100.h b/include/hw/input/tsc2100.h
+index f35938b4e..3d4ee7d0b 100644
+--- a/include/hw/input/tsc2100.h
++++ b/include/hw/input/tsc2100.h
+@@ -66,6 +66,7 @@ struct TSC2100State {
+     void *link_opaque;
+     /* Frame rate of the link and the frames clocked since @clock_start */
+     int rate;
++    uint32_t mclk;
+     int64_t clock_start;
+     uint64_t clocked;
+     bool dac_active;

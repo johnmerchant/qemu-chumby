@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 02:56:02 +1030
+Subject: [PATCH 15/42] hw/input/tsc2100: Play and record audio
+
+The TSC2100 is the Chumby Classic's audio codec as well as its
+touchscreen controller: the stock kernel's chumby-tsc2100 ALSA driver
+(also /dev/dsp through the OSS emulation) programs its sample rate as
+Fsref (48 or 44.1 kHz, Audio Control 3) divided by the DACFS field of
+Audio Control 1, its volume and mutes in the DAC volume register and
+its power in Power Control, and runs it as the master of the I2S link
+to SSI1. The control panel keeps a 44.1 kHz stream open from boot.
+
+Make the model the master of a serial audio link that the board
+provides: while powered up it clocks frames at the DAC's rate through
+the link a millisecond at a time, hands those it plays to the audio
+backend as 16-bit stereo at that rate, with the DAC's volume and mutes,
+and feeds the link the backend's recording at the same rate (silence
+when the backend has none). The backend voices are only active while
+something drives (takes) the link.
+
+On the Chumby Classic, connect the link to the AUDMUX's peripheral
+ports (the codec's DIN on port 2 and DOUT on port 1, as the stock
+driver routes them) and add the usual "audiodev" machine property.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst |  11 +-
+ hw/arm/chumby_classic.c            |  28 ++++
+ hw/input/tsc2100.c                 | 253 ++++++++++++++++++++++++++++-
+ include/hw/input/tsc2100.h         |  34 ++++
+ 4 files changed, 322 insertions(+), 4 deletions(-)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index cb715ecc4..d5e4e9ab5 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -19,7 +19,8 @@ Emulated devices:
+ - Clock and reset module, PLLs locked at the boot loader's settings
+ - GPIO ports A-F
+ - Keypad port, used as GPIO: the top button is row 0
+-- CSPI1-3, with a TI TSC2100 touchscreen controller on CSPI3
++- CSPI1-3, with a TI TSC2100 touchscreen controller and audio codec on
++  CSPI3
+ - LCD controller: background plane and graphic window, 16 bpp
+ - NAND flash controller with a 64 MiB small-page NAND chip
+ - PWM, and the USB host's root hub (no devices)
+@@ -68,6 +69,14 @@ The top button (the "squeeze switch", ``/dev/switch`` in the guest) is the
+ machine's ``button`` property: ``qom-set /machine button true`` presses
+ it and ``qom-set /machine button false`` releases it.
+ 
++Sound goes to the audio backend given with ``-audiodev`` and the
++machine's ``audiodev`` property, as 16-bit stereo at the rate the
++TSC2100 is programmed for, with the DAC's volume and mutes; recording
++takes its input from the same backend (silence if it has none). For
++example, to record what the guest plays to a file::
++
++  -audiodev wav,id=snd0,path=out.wav -M chumby-classic,audiodev=snd0
++
+ The emulated clock follows the host's. ``-icount shift=auto,sleep=off``
+ lets it run ahead while the guest is idle, which boots several times
+ faster.
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+index d06893132..40b23f588 100644
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -15,6 +15,10 @@
+  * is entered as on an MX21ADS (machine type 851), which is what the
+  * Chumby's own kernel is built for. The NAND image is "-drive if=mtd".
+  *
++ * The TSC2100 is also the audio codec, on the AUDMUX's peripheral ports:
++ * its DIN on port 2, its DOUT on port 1; the stock kernel routes SSI1 to
++ * both. The machine's "audiodev" property picks its audio backend.
++ *
+  * The machine's "button" property presses (true) and releases (false)
+  * the top button: qom-set /machine button true.
+  */
+@@ -49,6 +53,10 @@
+ /* PINTDAV: GPIO port E, pin 19 */
+ #define CHUMBY_PINTDAV_GPIO     (4 * IMX21_GPIO_PINS_PER_PORT + 19)
+ 
++/* The codec's serial data: DIN on AUDMUX peripheral port 2, DOUT on 1 */
++#define CHUMBY_CODEC_DIN_PORT   1
++#define CHUMBY_CODEC_DOUT_PORT  0
++
+ /* The top button: keypad row 0 */
+ #define CHUMBY_BUTTON_KPP_PIN   0
+ 
+@@ -86,6 +94,20 @@ static void chumby_classic_set_button(Object *obj, bool value, Error **errp)
+     }
+ }
+ 
++static bool chumby_classic_codec_dac(void *opaque, int16_t *samples,
++                                     int frames)
++{
++    return imx21_audmux_transmit(opaque, CHUMBY_CODEC_DIN_PORT, samples,
++                                 frames);
++}
++
++static bool chumby_classic_codec_adc(void *opaque, int16_t *samples,
++                                     int frames)
++{
++    return imx21_audmux_receive(opaque, CHUMBY_CODEC_DOUT_PORT, samples,
++                                frames);
++}
++
+ static void chumby_classic_init(MachineState *machine)
+ {
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(machine);
+@@ -121,7 +143,12 @@ static void chumby_classic_init(MachineState *machine)
+     /* The touchscreen controller on CSPI3's first chip select */
+     spi = (SSIBus *)qdev_get_child_bus(DEVICE(&s->soc.cspi[2]), "spi");
+     tsc = qdev_new(TYPE_TSC2100);
++    if (machine->audiodev) {
++        qdev_prop_set_string(tsc, "audiodev", machine->audiodev);
++    }
+     ssi_realize_and_unref(tsc, spi, &error_fatal);
++    tsc2100_set_audio_link(TSC2100(tsc), chumby_classic_codec_dac,
++                           chumby_classic_codec_adc, &s->soc.audmux);
+     sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc.cspi[2]), 1,
+                        qdev_get_gpio_in_named(tsc, SSI_GPIO_CS, 0));
+     qdev_connect_gpio_out_named(tsc, TSC2100_PINTDAV, 0,
+@@ -154,6 +181,7 @@ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+     mc->default_ram_size = FSL_IMX21_SDRAM0_SIZE;
+     mc->default_ram_id = "chumby.ram";
+ 
++    machine_add_audiodev_property(mc);
+     object_class_property_add_bool(oc, "button", chumby_classic_get_button,
+                                    chumby_classic_set_button);
+     object_class_property_set_description(oc, "button",
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+index 448f8619e..f25129bb4 100644
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -8,19 +8,30 @@
+  * A frame, one chip select, is a 16-bit command word (bit 15 read, bits
+  * 14:11 page, 10:5 register) followed by data words, the register
+  * advancing with each. Page 0 holds the conversion results, page 1 the
+- * touch controls and page 2 the audio controls, which are kept as
+- * written; no audio is produced.
++ * touch controls and page 2 the audio controls.
+  *
+  * Conversions finish at once. The pen is QEMU's absolute pointer: its
+  * position maps onto the ADC's full range (X left to right, Y bottom to
+  * top) and the left button presses it.
++ *
++ * The audio codec is the master of its serial link (I2S, 16-bit words):
++ * while it is powered up (POWERCON.PWDNC clear) it clocks frames at the
++ * DAC's rate, Fsref (48 or 44.1 kHz, CONTROL3.REFFS) divided by
++ * CONTROL1.DACFS, through the link the board gives it, a millisecond's
++ * worth at a time. Those it plays go to the audio backend as 16-bit
++ * stereo at that rate, with the DAC's volume and mutes (AUDIODAC) and
++ * muted while the DAC is powered down; those it records come from the
++ * backend at the same rate, or are silence. The ADC's own rate, the
++ * analog paths and the other word lengths and formats are not modelled.
+  */
+ 
+ #include "qemu/osdep.h"
+ #include "hw/input/tsc2100.h"
+ #include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "qemu/module.h"
++#include <math.h>
+ 
+ #define REG(page, n)    ((page) * 64 + (n))
+ 
+@@ -38,6 +49,24 @@
+ #define REG_REF         REG(1, 3)
+ #define REG_RESET       REG(1, 4)
+ 
++/* Page 2: audio controls */
++#define REG_AUDIO_CTRL1 REG(2, 0)
++#define REG_AUDIODAC    REG(2, 2)
++#define REG_POWERCON    REG(2, 5)
++#define REG_AUDIO_CTRL3 REG(2, 6)
++
++#define CTRL1_DACFS(v)  (((v) >> 3) & 7)
++#define CTRL3_REFFS     (1 << 13)
++#define AUDIODAC_LMUTE  (1 << 15)
++#define AUDIODAC_RMUTE  (1 << 7)
++#define POWERCON_PWDNC  (1 << 15)
++#define POWERCON_DAPWDN (1 << 10)
++
++/* The link runs a millisecond at a time, ten while nothing uses it. */
++#define AUDIO_TICK_NS       (NANOSECONDS_PER_SECOND / 1000)
++#define AUDIO_IDLE_TICK_NS  (NANOSECONDS_PER_SECOND / 100)
++#define AUDIO_CHUNK         256
++
+ #define ADC_PSTCM       (1 << 15)
+ #define ADC_ADST        (1 << 14)
+ #define STATUS_DAVAIL   (1 << 11)
+@@ -138,6 +167,197 @@ static uint16_t tsc2100_read_reg(TSC2100State *s, int reg)
+     }
+ }
+ 
++static int tsc2100_dac_rate(TSC2100State *s)
++{
++    /* Fsref divided by 1, 1.5, 2, 3, 4, 5, 5.5 or 6: twice these */
++    static const int div2[8] = { 2, 3, 4, 6, 8, 10, 11, 12 };
++    int fsref = (s->regs[REG_AUDIO_CTRL3] & CTRL3_REFFS) ? 44100 : 48000;
++
++    return fsref * 2 / div2[CTRL1_DACFS(s->regs[REG_AUDIO_CTRL1])];
++}
++
++/* A DAC volume control's attenuation, in 0.5 dB steps, as a gain. */
++static uint8_t tsc2100_dac_gain(uint16_t att, bool mute)
++{
++    return mute ? 0 : lround(255 * pow(10, -(att & 0x7f) / 40.0));
++}
++
++static void tsc2100_audio_volume(TSC2100State *s)
++{
++    uint16_t dac = s->regs[REG_AUDIODAC];
++
++    if (s->dac_voice) {
++        audio_be_set_volume_out_lr(s->audio_be, s->dac_voice,
++                                   s->regs[REG_POWERCON] & POWERCON_DAPWDN,
++                                   tsc2100_dac_gain(dac >> 8,
++                                                    dac & AUDIODAC_LMUTE),
++                                   tsc2100_dac_gain(dac,
++                                                    dac & AUDIODAC_RMUTE));
++    }
++}
++
++/* Hand the backend what it has room for. */
++static void tsc2100_audio_out_cb(void *opaque, int avail)
++{
++    TSC2100State *s = opaque;
++    uint32_t n, done;
++
++    while (s->out_count && avail >= 4) {
++        n = MIN(s->out_count, TSC2100_OUT_FRAMES - s->out_head);
++        n = MIN(n, avail / 4);
++        done = audio_be_write(s->audio_be, s->dac_voice,
++                              &s->out[s->out_head * 2], n * 4) / 4;
++        if (!done) {
++            break;
++        }
++        s->out_head = (s->out_head + done) % TSC2100_OUT_FRAMES;
++        s->out_count -= done;
++        avail -= done * 4;
++    }
++    if (!s->out_count && !s->dac_active) {
++        audio_be_set_active_out(s->audio_be, s->dac_voice, false);
++    }
++}
++
++static void tsc2100_audio_in_cb(void *opaque, int avail)
++{
++    /* Recorded audio is taken as the link clocks it. */
++}
++
++static void tsc2100_audio_push(TSC2100State *s, const int16_t *samples,
++                               uint32_t frames)
++{
++    uint32_t tail;
++
++    while (frames--) {
++        if (s->out_count == TSC2100_OUT_FRAMES) {
++            /* The backend is not keeping up: drop the oldest. */
++            s->out_head = (s->out_head + 1) % TSC2100_OUT_FRAMES;
++            s->out_count--;
++        }
++        tail = (s->out_head + s->out_count) % TSC2100_OUT_FRAMES;
++        s->out[tail * 2] = *samples++;
++        s->out[tail * 2 + 1] = *samples++;
++        s->out_count++;
++    }
++}
++
++/* Clock @frames frames through the serial link. */
++static void tsc2100_audio_clock(TSC2100State *s, uint32_t frames)
++{
++    int16_t buf[AUDIO_CHUNK * 2];
++    uint32_t n;
++    size_t got;
++    bool active;
++
++    while (frames) {
++        n = MIN(frames, AUDIO_CHUNK);
++
++        active = s->dac_fn && s->dac_fn(s->link_opaque, buf, n);
++        if (active) {
++            tsc2100_audio_push(s, buf, n);
++            if (!s->dac_active && s->dac_voice) {
++                audio_be_set_active_out(s->audio_be, s->dac_voice, true);
++            }
++        }
++        s->dac_active = active;
++
++        got = 0;
++        if (s->adc_active && s->adc_voice) {
++            got = audio_be_read(s->audio_be, s->adc_voice, buf, n * 4);
++        }
++        memset((uint8_t *)buf + got, 0, n * 4 - got);
++        active = s->adc_fn && s->adc_fn(s->link_opaque, buf, n);
++        if (active != s->adc_active && s->adc_voice) {
++            audio_be_set_active_in(s->audio_be, s->adc_voice, active);
++        }
++        s->adc_active = active;
++
++        frames -= n;
++    }
++}
++
++static void tsc2100_audio_tick(void *opaque)
++{
++    TSC2100State *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint64_t due = muldiv64(now - s->clock_start, s->rate,
++                            NANOSECONDS_PER_SECOND) - s->clocked;
++
++    /* After a long gap (the machine stopped), start afresh. */
++    if (due > s->rate / 10) {
++        s->clocked += due - s->rate / 10;
++        due = s->rate / 10;
++    }
++    tsc2100_audio_clock(s, due);
++    s->clocked += due;
++    timer_mod(s->audio_timer, now + (s->dac_active || s->adc_active ?
++                                     AUDIO_TICK_NS : AUDIO_IDLE_TICK_NS));
++}
++
++/* Follow the audio controls: power, rate and volume. */
++static void tsc2100_audio_update(TSC2100State *s)
++{
++    struct audsettings as = {
++        .nchannels = 2,
++        .fmt = AUDIO_FORMAT_S16,
++        .big_endian = false,
++    };
++    int rate;
++
++    if (!s->audio_timer) {
++        return;
++    }
++    if (s->regs[REG_POWERCON] & POWERCON_PWDNC) {
++        timer_del(s->audio_timer);
++        if (s->dac_voice) {
++            audio_be_set_active_out(s->audio_be, s->dac_voice, false);
++        }
++        if (s->adc_voice) {
++            audio_be_set_active_in(s->audio_be, s->adc_voice, false);
++        }
++        s->dac_active = false;
++        s->adc_active = false;
++        s->out_count = 0;
++        s->rate = 0;
++        return;
++    }
++
++    rate = tsc2100_dac_rate(s);
++    if (rate != s->rate) {
++        as.freq = rate;
++        s->dac_voice = audio_be_open_out(s->audio_be, s->dac_voice,
++                                         "tsc2100.dac", s,
++                                         tsc2100_audio_out_cb, &as);
++        s->adc_voice = audio_be_open_in(s->audio_be, s->adc_voice,
++                                        "tsc2100.adc", s,
++                                        tsc2100_audio_in_cb, &as);
++        if (s->dac_active && s->dac_voice) {
++            audio_be_set_active_out(s->audio_be, s->dac_voice, true);
++        }
++        if (s->adc_active && s->adc_voice) {
++            audio_be_set_active_in(s->audio_be, s->adc_voice, true);
++        }
++        s->out_count = 0;
++        s->rate = rate;
++        s->clock_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        s->clocked = 0;
++    }
++    tsc2100_audio_volume(s);
++    if (!timer_pending(s->audio_timer)) {
++        timer_mod(s->audio_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                                  AUDIO_TICK_NS);
++    }
++}
++
++void tsc2100_set_audio_link(TSC2100State *s, TSC2100AudioFn *dac,
++                            TSC2100AudioFn *adc, void *opaque)
++{
++    s->dac_fn = dac;
++    s->adc_fn = adc;
++    s->link_opaque = opaque;
++}
++
+ static void tsc2100_reset_regs(TSC2100State *s)
+ {
+     memset(s->regs, 0, sizeof(s->regs));
+@@ -146,6 +366,8 @@ static void tsc2100_reset_regs(TSC2100State *s)
+     /* ADC: host-controlled, no scan; REF: internal reference. */
+     s->regs[REG_ADC] = 0x4000;
+     s->regs[REG_REF] = 0x0002;
++    /* The codec starts powered down. */
++    s->regs[REG_POWERCON] = POWERCON_PWDNC;
+ }
+ 
+ static void tsc2100_write_reg(TSC2100State *s, int reg, uint16_t val)
+@@ -155,10 +377,14 @@ static void tsc2100_write_reg(TSC2100State *s, int reg, uint16_t val)
+     if (reg == REG_RESET) {
+         if (val == RESET_MAGIC) {
+             tsc2100_reset_regs(s);
++            tsc2100_audio_update(s);
+         }
+         return;
+     }
+     s->regs[reg] = val;
++    if (reg >= REG(2, 0) && reg < REG(3, 0)) {
++        tsc2100_audio_update(s);
++    }
+     if (reg == REG_ADC) {
+         /* A scan mode starts a conversion, which finishes at once. */
+         mask = tsc2100_scan_mask(val >> 10);
+@@ -252,9 +478,13 @@ static void tsc2100_realize(SSIPeripheral *dev, Error **errp)
+ {
+     TSC2100State *s = TSC2100(dev);
+ 
++    if (!audio_be_check(&s->audio_be, errp)) {
++        return;
++    }
+     qdev_init_gpio_out_named(DEVICE(dev), &s->pintdav, TSC2100_PINTDAV, 1);
+     s->input = qemu_input_handler_register(DEVICE(dev),
+                                            &tsc2100_input_handler);
++    s->audio_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tsc2100_audio_tick, s);
+ }
+ 
+ static void tsc2100_reset(DeviceState *dev)
+@@ -262,15 +492,27 @@ static void tsc2100_reset(DeviceState *dev)
+     TSC2100State *s = TSC2100(dev);
+ 
+     tsc2100_reset_regs(s);
++    tsc2100_audio_update(s);
+     s->word = 0;
+     s->down = false;
+     tsc2100_update_pintdav(s);
+ }
+ 
++static int tsc2100_post_load(void *opaque, int version_id)
++{
++    TSC2100State *s = opaque;
++
++    /* Reopen the audio voices and restart the link's clock. */
++    s->rate = 0;
++    tsc2100_audio_update(s);
++    return 0;
++}
++
+ static const VMStateDescription vmstate_tsc2100 = {
+     .name = TYPE_TSC2100,
+     .version_id = 1,
+     .minimum_version_id = 1,
++    .post_load = tsc2100_post_load,
+     .fields = (const VMStateField[]) {
+         VMSTATE_SSI_PERIPHERAL(parent_obj, TSC2100State),
+         VMSTATE_UINT16_ARRAY(regs, TSC2100State, TSC2100_NUM_REGS),
+@@ -286,6 +528,10 @@ static const VMStateDescription vmstate_tsc2100 = {
+     },
+ };
+ 
++static const Property tsc2100_properties[] = {
++    DEFINE_AUDIO_PROPERTIES(TSC2100State, audio_be),
++};
++
+ static void tsc2100_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -296,8 +542,9 @@ static void tsc2100_class_init(ObjectClass *klass, const void *data)
+     k->set_cs = tsc2100_set_cs;
+     k->cs_polarity = SSI_CS_LOW;
+     dc->vmsd = &vmstate_tsc2100;
++    device_class_set_props(dc, tsc2100_properties);
+     device_class_set_legacy_reset(dc, tsc2100_reset);
+-    dc->desc = "TI TSC2100 touchscreen controller";
++    dc->desc = "TI TSC2100 touchscreen controller and audio codec";
+ }
+ 
+ static const TypeInfo tsc2100_info = {
+diff --git a/include/hw/input/tsc2100.h b/include/hw/input/tsc2100.h
+index ea467d82f..f35938b4e 100644
+--- a/include/hw/input/tsc2100.h
++++ b/include/hw/input/tsc2100.h
+@@ -11,6 +11,8 @@
+ 
+ #include "hw/ssi/ssi.h"
+ #include "ui/input.h"
++#include "qemu/audio.h"
++#include "qemu/timer.h"
+ #include "qom/object.h"
+ 
+ #define TYPE_TSC2100 "tsc2100"
+@@ -21,6 +23,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(TSC2100State, TSC2100)
+ 
+ #define TSC2100_NUM_REGS (4 * 64)
+ 
++/* Audio frames the codec buffers for the audio backend */
++#define TSC2100_OUT_FRAMES 8192
++
++/*
++ * The codec's serial audio link: called with @frames frames of 16-bit
++ * stereo, filling them (DAC: the data to play) or taking them (ADC: the
++ * data recorded). Returns whether something is driving (taking) the
++ * data; when nothing is, the DAC side gives silence.
++ */
++typedef bool TSC2100AudioFn(void *opaque, int16_t *samples, int frames);
++
+ struct TSC2100State {
+     SSIPeripheral parent_obj;
+ 
+@@ -42,6 +55,27 @@ struct TSC2100State {
+     uint16_t x, y;
+     /* The pointer as the input layer last reported it. */
+     int abs_x, abs_y;
++
++    /* Audio: the codec is the clock master of its serial link. */
++    AudioBackend *audio_be;
++    SWVoiceOut *dac_voice;
++    SWVoiceIn *adc_voice;
++    QEMUTimer *audio_timer;
++    TSC2100AudioFn *dac_fn;
++    TSC2100AudioFn *adc_fn;
++    void *link_opaque;
++    /* Frame rate of the link and the frames clocked since @clock_start */
++    int rate;
++    int64_t clock_start;
++    uint64_t clocked;
++    bool dac_active;
++    bool adc_active;
++    int16_t out[TSC2100_OUT_FRAMES * 2];
++    uint32_t out_head;
++    uint32_t out_count;
+ };
+ 
++void tsc2100_set_audio_link(TSC2100State *s, TSC2100AudioFn *dac,
++                            TSC2100AudioFn *adc, void *opaque);
++
+ #endif /* HW_INPUT_TSC2100_H */

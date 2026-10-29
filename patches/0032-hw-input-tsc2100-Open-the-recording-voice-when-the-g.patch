@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 03:33:46 +1030
+Subject: [PATCH 32/42] hw/input/tsc2100: Open the recording voice when the
+ guest records
+
+The codec opened its recording voice with the playback voice, whenever
+its rate changed. With a backend that can't record (CoreAudio, which is
+the default on macOS) that printed "Can not open `tsc2100.adc'" on
+every rate change, while the guest was only playing.
+
+Open it the first time the guest records at a rate instead, and ask a
+backend that can't only once per rate. Recording then reads silence, as
+before.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/input/tsc2100.c         | 34 +++++++++++++++++++++++++++++++---
+ include/hw/input/tsc2100.h |  1 +
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+index c54ceccf0..1480d8dde 100644
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -267,6 +267,28 @@ static void tsc2100_audio_push(TSC2100State *s, const int16_t *samples,
+     }
+ }
+ 
++/*
++ * Opens the recording voice the first time the guest records at this
++ * rate, so that playing never needs a backend that can record (CoreAudio
++ * can't), and a backend that can't is asked once, not every frame.
++ */
++static void tsc2100_audio_open_in(TSC2100State *s)
++{
++    struct audsettings as = {
++        .freq = s->rate,
++        .nchannels = 2,
++        .fmt = AUDIO_FORMAT_S16,
++        .big_endian = false,
++    };
++
++    if (s->adc_voice || s->adc_tried) {
++        return;
++    }
++    s->adc_tried = true;
++    s->adc_voice = audio_be_open_in(s->audio_be, NULL, "tsc2100.adc", s,
++                                    tsc2100_audio_in_cb, &as);
++}
++
+ /* Clock @frames frames through the serial link. */
+ static void tsc2100_audio_clock(TSC2100State *s, uint32_t frames)
+ {
+@@ -293,6 +315,9 @@ static void tsc2100_audio_clock(TSC2100State *s, uint32_t frames)
+         }
+         memset((uint8_t *)buf + got, 0, n * 4 - got);
+         active = s->adc_fn && s->adc_fn(s->link_opaque, buf, n);
++        if (active && !s->adc_active) {
++            tsc2100_audio_open_in(s);
++        }
+         if (active != s->adc_active && s->adc_voice) {
+             audio_be_set_active_in(s->audio_be, s->adc_voice, active);
+         }
+@@ -354,9 +379,12 @@ static void tsc2100_audio_update(TSC2100State *s)
+         s->dac_voice = audio_be_open_out(s->audio_be, s->dac_voice,
+                                          "tsc2100.dac", s,
+                                          tsc2100_audio_out_cb, &as);
+-        s->adc_voice = audio_be_open_in(s->audio_be, s->adc_voice,
+-                                        "tsc2100.adc", s,
+-                                        tsc2100_audio_in_cb, &as);
++        if (s->adc_voice) {
++            s->adc_voice = audio_be_open_in(s->audio_be, s->adc_voice,
++                                            "tsc2100.adc", s,
++                                            tsc2100_audio_in_cb, &as);
++        }
++        s->adc_tried = false;
+         if (s->dac_active && s->dac_voice) {
+             audio_be_set_active_out(s->audio_be, s->dac_voice, true);
+         }
+diff --git a/include/hw/input/tsc2100.h b/include/hw/input/tsc2100.h
+index 3d4ee7d0b..e7058d333 100644
+--- a/include/hw/input/tsc2100.h
++++ b/include/hw/input/tsc2100.h
+@@ -71,6 +71,7 @@ struct TSC2100State {
+     uint64_t clocked;
+     bool dac_active;
+     bool adc_active;
++    bool adc_tried;
+     int16_t out[TSC2100_OUT_FRAMES * 2];
+     uint32_t out_head;
+     uint32_t out_count;

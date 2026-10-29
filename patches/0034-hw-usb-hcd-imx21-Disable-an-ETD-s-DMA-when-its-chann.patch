@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 03:57:03 +1030
+Subject: [PATCH 34/42] hw/usb/hcd-imx21: Disable an ETD's DMA when its channel
+ is cleared
+
+Writing an ETD's bit to ETDDMACHANLCLR now also clears its ETDDMAEN bit,
+as well as rewinding the DMA buffer pointer.
+
+Linux's imx21-hcd clears the channel when it retires an ETD and enables
+DMA for the ETD's next use with a read-modify-write of ETDDMAEN. With the
+stale enable still set, that write toggled the ETD's DMA off, so the data
+stage of a control IN went to DMEM instead of memory and enumeration
+failed with a garbage device descriptor. The stock 2.6.16 driver clears
+the channel just before it enables DMA, so it is unaffected.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+---
+ hw/usb/hcd-imx21.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hw/usb/hcd-imx21.c b/hw/usb/hcd-imx21.c
+index 64c260162..f05e7e1d2 100644
+--- a/hw/usb/hcd-imx21.c
++++ b/hw/usb/hcd-imx21.c
+@@ -770,6 +770,13 @@ static void imx21_usbotg_write(void *opaque, hwaddr offset, uint64_t val,
+         R(ETDENSET) &= ~val;
+         break;
+     case ETDDMACHANLCLR:
++        /*
++         * Clearing an ETD's DMA channel also disables its DMA. Linux's
++         * imx21-hcd relies on that: it clears the channel when it retires
++         * an ETD and later enables DMA with a read-modify-write of
++         * ETDDMAEN, which would otherwise toggle a stale enable off.
++         */
++        R(ETDDMAEN) &= ~val;
+         for (i = 0; i < NUM_ETD; i++) {
+             if (val & (1u << i)) {
+                 s->regs[(ETDDMABUFPTR0 / 4) + i] =

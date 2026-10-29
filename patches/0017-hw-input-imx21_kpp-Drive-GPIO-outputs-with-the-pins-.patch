@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 02:57:40 +1030
+Subject: [PATCH 17/42] hw/input/imx21_kpp: Drive GPIO outputs with the pins'
+ levels
+
+Boards use the keypad port as GPIO for outputs as well as inputs: the
+Chumby's stock sense1 driver makes column 2 an output to power the LCD
+and column 4 one to mute the speaker amplifier. Nothing outside the
+port saw those lines.
+
+Add a GPIO output per pin, numbered like the inputs, carrying the level
+on the pin: the output latch for pins configured as outputs, the level
+driven from outside (high when undriven) for inputs. They are sent when
+a level changes.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/input/imx21_kpp.c         | 35 ++++++++++++++++++++++++++++++++---
+ include/hw/input/imx21_kpp.h |  8 +++++++-
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/hw/input/imx21_kpp.c b/hw/input/imx21_kpp.c
+index dc31d91e1..c53b355ed 100644
+--- a/hw/input/imx21_kpp.c
++++ b/hw/input/imx21_kpp.c
+@@ -11,6 +11,10 @@
+  * inputs, and the output latch for the rest. Boards also use the port as
+  * plain GPIO, as the Chumby does for its top button. Key-press interrupts
+  * and the scan logic's status flags are not modelled.
++ *
++ * The GPIO outputs, numbered like the inputs, carry the pins' levels: the
++ * output latch for pins configured as outputs, and the level on the pin
++ * (high unless driven) for inputs. They change when the levels do.
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -25,6 +29,25 @@
+ #define KDDR    0x04
+ #define KPDR    0x06
+ 
++static uint16_t imx21_kpp_levels(IMX21KPPState *s)
++{
++    return (s->kpdr & s->kddr) | (s->pins & ~s->kddr);
++}
++
++static void imx21_kpp_update_outputs(IMX21KPPState *s)
++{
++    uint16_t levels = imx21_kpp_levels(s);
++    uint16_t changed = levels ^ s->out_levels;
++    int pin;
++
++    s->out_levels = levels;
++    for (pin = 0; pin < IMX21_KPP_NUM_PINS; pin++) {
++        if (changed & (1 << pin)) {
++            qemu_set_irq(s->out[pin], extract32(levels, pin, 1));
++        }
++    }
++}
++
+ static uint64_t imx21_kpp_read(void *opaque, hwaddr offset, unsigned size)
+ {
+     IMX21KPPState *s = opaque;
+@@ -37,7 +60,7 @@ static uint64_t imx21_kpp_read(void *opaque, hwaddr offset, unsigned size)
+     case KDDR:
+         return s->kddr;
+     case KPDR:
+-        return (s->kpdr & s->kddr) | (s->pins & ~s->kddr);
++        return imx21_kpp_levels(s);
+     default:
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
+                       "\n", __func__, offset);
+@@ -68,6 +91,7 @@ static void imx21_kpp_write(void *opaque, hwaddr offset, uint64_t val,
+                       "\n", __func__, offset);
+         break;
+     }
++    imx21_kpp_update_outputs(s);
+ }
+ 
+ static const MemoryRegionOps imx21_kpp_ops = {
+@@ -85,6 +109,7 @@ static void imx21_kpp_set_pin(void *opaque, int pin, int level)
+     IMX21KPPState *s = opaque;
+ 
+     s->pins = deposit32(s->pins, pin, 1, !!level);
++    imx21_kpp_update_outputs(s);
+ }
+ 
+ static void imx21_kpp_reset(DeviceState *dev)
+@@ -95,6 +120,7 @@ static void imx21_kpp_reset(DeviceState *dev)
+     s->kpsr = 0;
+     s->kddr = 0;
+     s->kpdr = 0;
++    imx21_kpp_update_outputs(s);
+ }
+ 
+ static void imx21_kpp_init(Object *obj)
+@@ -107,19 +133,22 @@ static void imx21_kpp_init(Object *obj)
+     sysbus_init_mmio(sbd, &s->iomem);
+     sysbus_init_irq(sbd, &s->irq);
+     qdev_init_gpio_in(DEVICE(obj), imx21_kpp_set_pin, IMX21_KPP_NUM_PINS);
++    qdev_init_gpio_out(DEVICE(obj), s->out, IMX21_KPP_NUM_PINS);
+     s->pins = 0xffff;
++    s->out_levels = 0xffff;
+ }
+ 
+ static const VMStateDescription vmstate_imx21_kpp = {
+     .name = TYPE_IMX21_KPP,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
++    .version_id = 2,
++    .minimum_version_id = 2,
+     .fields = (const VMStateField[]) {
+         VMSTATE_UINT16(kpcr, IMX21KPPState),
+         VMSTATE_UINT16(kpsr, IMX21KPPState),
+         VMSTATE_UINT16(kddr, IMX21KPPState),
+         VMSTATE_UINT16(kpdr, IMX21KPPState),
+         VMSTATE_UINT16(pins, IMX21KPPState),
++        VMSTATE_UINT16(out_levels, IMX21KPPState),
+         VMSTATE_END_OF_LIST()
+     },
+ };
+diff --git a/include/hw/input/imx21_kpp.h b/include/hw/input/imx21_kpp.h
+index d574b9c15..c4dd81051 100644
+--- a/include/hw/input/imx21_kpp.h
++++ b/include/hw/input/imx21_kpp.h
+@@ -15,7 +15,10 @@
+ #define TYPE_IMX21_KPP "imx21.kpp"
+ OBJECT_DECLARE_SIMPLE_TYPE(IMX21KPPState, IMX21_KPP)
+ 
+-/* GPIO inputs 0-7 are rows 0-7 and 8-15 columns 0-7, driven low or high. */
++/*
++ * GPIO inputs 0-7 are rows 0-7 and 8-15 columns 0-7, driven low or high.
++ * The GPIO outputs, numbered the same, carry the levels on the pins.
++ */
+ #define IMX21_KPP_NUM_PINS 16
+ 
+ struct IMX21KPPState {
+@@ -23,6 +26,7 @@ struct IMX21KPPState {
+ 
+     MemoryRegion iomem;
+     qemu_irq irq;
++    qemu_irq out[IMX21_KPP_NUM_PINS];
+ 
+     uint16_t kpcr;
+     uint16_t kpsr;
+@@ -30,6 +34,8 @@ struct IMX21KPPState {
+     uint16_t kpdr;
+     /* Levels on the pins; they idle high (pulled up). */
+     uint16_t pins;
++    /* Levels last sent on the outputs */
++    uint16_t out_levels;
+ };
+ 
+ #endif /* IMX21_KPP_H */

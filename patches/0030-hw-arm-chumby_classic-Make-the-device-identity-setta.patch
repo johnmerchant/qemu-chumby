@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 03:23:10 +1030
+Subject: [PATCH 30/42] hw/arm/chumby_classic: Make the device identity
+ settable
+
+Every emulated Chumby reported the same GUID, serial number and
+hardware version, so two of them talking to a server were one device.
+The stock software takes the device ID from the crypto processor's
+GUID ("cpi -p", via guidgen.sh, in download_cp's control panel
+request), and the serial number and hardware version from it too
+("chumby_version -n" and "-h").
+
+Add machine properties for them:
+
+- guid: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX, 32 hex digits
+- serial: 16 letters or digits
+- hwversion: MAJOR.MINOR, each 0 to 255
+
+and hand them to the crypto processor. The hardware version also goes
+on the default kernel command line, as chumby_hwversion=. The defaults
+are the old fixed values, so existing runs don't change. A malformed
+value is refused at startup with an error saying what was expected.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst |  27 ++++++-
+ hw/arm/chumby_classic.c            | 126 ++++++++++++++++++++++++++++-
+ 2 files changed, 146 insertions(+), 7 deletions(-)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index 1faab49c4..63f5547f6 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -12,10 +12,9 @@ Emulated devices:
+ - AITC interrupt controller
+ - GPT1-3 timers
+ - UART1-4 (UART1 is the console)
+-- The crypto processor on UART3, with a made-up identity (hardware
+-  version 3.8, GUID ``C40BB1E0-0000-4000-8000-0E4000000001``, serial
+-  number ``0000000000000000``); it holds no keys and refuses key and
+-  challenge requests
++- The crypto processor on UART3, with a settable identity (see
++  `Device identity`_); it holds no keys and refuses key and challenge
++  requests
+ - Clock and reset module, PLLs locked at the boot loader's settings
+ - GPIO ports A-F
+ - Keypad port, used as GPIO: the top button (row 0), headphone detect
+@@ -53,6 +52,8 @@ disk::
+ 
+   console=ttyS0,38400 root=/dev/mtdblock5 rootfstype=cramfs init=/linuxrc chumby_hwversion=3.8
+ 
++where ``3.8`` is the machine's ``hwversion``.
++
+ The NAND flash is a raw image given with ``-drive if=mtd``. Its layout is
+ that of ``nanddump``: 131072 records of 528 bytes, each a page's 512 data
+ bytes followed by its 16 spare bytes, 69206016 bytes in all. Programs and
+@@ -113,3 +114,21 @@ example, to record what the guest plays to a file::
+ The emulated clock follows the host's. ``-icount shift=auto,sleep=off``
+ lets it run ahead while the guest is idle, which boots several times
+ faster.
++
++Device identity
++---------------
++
++The machine properties ``guid``, ``serial`` and ``hwversion`` set the
++device's identity. The crypto processor reports all three (``cpi -p``
++prints the GUID, which the stock software uses as the device ID;
++``chumby_version -n`` and ``-h`` the others), and ``hwversion`` goes on
++the default kernel command line. The defaults are a made-up identity:
++
++.. code-block:: bash
++
++  $ qemu-system-arm -M chumby-classic,guid=C40BB1E0-0000-4000-8000-0E4000000001,serial=0000000000000000,hwversion=3.8 ...
++
++The GUID is 32 hex digits as ``XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX``,
++the serial number 16 letters or digits, and the hardware version
++``MAJOR.MINOR``; anything else is refused at startup. Give each emulated
++Chumby its own GUID so that it pairs with a server as a separate device.
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+index 62f778e1b..cd2d82564 100644
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -23,6 +23,11 @@
+  * jack, top button) are the chumby-io device. Its "button", "headphones"
+  * and "button-key" properties are the machine's too: qom-set /machine
+  * button true presses the top button.
++ *
++ * The device identity, which the crypto processor reports, is set with
++ * the machine properties "guid", "serial" (16 characters) and
++ * "hwversion" ("major.minor"), e.g.
++ * -M chumby-classic,guid=01234567-89AB-4CDE-8F01-23456789ABCD
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -39,6 +44,7 @@
+ #include "hw/misc/chumby_io.h"
+ #include "hw/ssi/ssi.h"
+ #include "qemu/cutils.h"
++#include "qemu/uuid.h"
+ #include "qemu/units.h"
+ #include "system/address-spaces.h"
+ #include "qemu/error-report.h"
+@@ -48,10 +54,13 @@
+ 
+ #define CHUMBY_MACH_TYPE        851     /* MACH_TYPE_MX21ADS */
+ 
+-/* The command line the stock boot loader gives the first root disk. */
++/*
++ * The command line the stock boot loader gives the first root disk; the
++ * hardware version is appended.
++ */
+ #define CHUMBY_DEFAULT_CMDLINE  "console=ttyS0,38400 root=/dev/mtdblock5 " \
+                                 "rootfstype=cramfs init=/linuxrc " \
+-                                "chumby_hwversion=3.8"
++                                "chumby_hwversion="
+ 
+ /* PINTDAV: GPIO port E, pin 19 */
+ #define CHUMBY_PINTDAV_GPIO     (4 * IMX21_GPIO_PINS_PER_PORT + 19)
+@@ -74,6 +83,12 @@ struct ChumbyClassicState {
+ 
+     FslIMX21State soc;
+     ChumbyIOState io;
++    /* The device identity */
++    char *guid;
++    char *serial;
++    char *hwversion;
++    QemuUUID guid_bytes;
++    uint8_t hw_major, hw_minor;
+ };
+ 
+ static struct arm_boot_info chumby_binfo;
+@@ -115,6 +130,73 @@ static bool chumby_classic_codec_adc(void *opaque, int16_t *samples,
+                                 frames);
+ }
+ 
++static char *chumby_classic_get_guid(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->guid);
++}
++
++static void chumby_classic_set_guid(Object *obj, const char *value,
++                                    Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++
++    if (qemu_uuid_parse(value, &s->guid_bytes) < 0) {
++        error_setg(errp, "invalid GUID '%s': expected 32 hex digits as "
++                   "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", value);
++        return;
++    }
++    g_free(s->guid);
++    s->guid = g_ascii_strup(value, -1);
++}
++
++static char *chumby_classic_get_serial(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->serial);
++}
++
++static void chumby_classic_set_serial(Object *obj, const char *value,
++                                      Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    const char *p;
++
++    for (p = value; *p && g_ascii_isalnum(*p); p++) {
++        /* letters and digits only */
++    }
++    if (*p || strlen(value) != CHUMBY_CP_SERIAL_LEN) {
++        error_setg(errp, "invalid serial number '%s': expected %d letters "
++                   "or digits", value, CHUMBY_CP_SERIAL_LEN);
++        return;
++    }
++    g_free(s->serial);
++    s->serial = g_strdup(value);
++}
++
++static char *chumby_classic_get_hwversion(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->hwversion);
++}
++
++static void chumby_classic_set_hwversion(Object *obj, const char *value,
++                                         Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    unsigned int major, minor;
++    char end;
++
++    if (!g_ascii_isdigit(value[0]) ||
++        sscanf(value, "%3u.%3u%c", &major, &minor, &end) != 2 ||
++        major > 255 || minor > 255) {
++        error_setg(errp, "invalid hardware version '%s': expected "
++                   "MAJOR.MINOR, each 0 to 255", value);
++        return;
++    }
++    s->hw_major = major;
++    s->hw_minor = minor;
++    g_free(s->hwversion);
++    s->hwversion = g_strdup_printf("%u.%u", major, minor);
++}
++
+ static void chumby_classic_init(MachineState *machine)
+ {
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(machine);
+@@ -140,6 +222,8 @@ static void chumby_classic_init(MachineState *machine)
+     /* The crypto processor answers on UART3. */
+     cp = qemu_chardev_new("chumby-cp", TYPE_CHARDEV_CHUMBY_CP, NULL, NULL,
+                           &error_fatal);
++    chumby_cp_set_identity(CHARDEV_CHUMBY_CP(cp), s->guid_bytes.data,
++                           s->serial, s->hw_major, s->hw_minor);
+     qdev_prop_set_chr(DEVICE(&s->soc.uart[2]), "chardev", cp);
+ 
+     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
+@@ -166,7 +250,8 @@ static void chumby_classic_init(MachineState *machine)
+ 
+     if (!machine->kernel_cmdline || !*machine->kernel_cmdline) {
+         g_free(machine->kernel_cmdline);
+-        machine->kernel_cmdline = g_strdup(CHUMBY_DEFAULT_CMDLINE);
++        machine->kernel_cmdline = g_strconcat(CHUMBY_DEFAULT_CMDLINE,
++                                              s->hwversion, NULL);
+     }
+ 
+     chumby_binfo.ram_size = machine->ram_size;
+@@ -191,6 +276,15 @@ static void chumby_classic_instance_init(Object *obj)
+         object_property_add_alias(obj, io_props[i], OBJECT(&s->io),
+                                   io_props[i]);
+     }
++
++    object_property_set_str(obj, "guid", CHUMBY_CP_DEFAULT_GUID,
++                            &error_abort);
++    object_property_set_str(obj, "serial", CHUMBY_CP_DEFAULT_SERIAL,
++                            &error_abort);
++    object_property_set_str(obj, "hwversion",
++                            stringify(CHUMBY_CP_DEFAULT_HW_MAJOR) "."
++                            stringify(CHUMBY_CP_DEFAULT_HW_MINOR),
++                            &error_abort);
+ }
+ 
+ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+@@ -204,6 +298,31 @@ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+     mc->default_ram_id = "chumby.ram";
+ 
+     machine_add_audiodev_property(mc);
++
++    object_class_property_add_str(oc, "guid", chumby_classic_get_guid,
++                                  chumby_classic_set_guid);
++    object_class_property_set_description(oc, "guid",
++        "The device GUID, XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (default "
++        CHUMBY_CP_DEFAULT_GUID ")");
++    object_class_property_add_str(oc, "serial", chumby_classic_get_serial,
++                                  chumby_classic_set_serial);
++    object_class_property_set_description(oc, "serial",
++        "The serial number, 16 letters or digits (default "
++        CHUMBY_CP_DEFAULT_SERIAL ")");
++    object_class_property_add_str(oc, "hwversion",
++                                  chumby_classic_get_hwversion,
++                                  chumby_classic_set_hwversion);
++    object_class_property_set_description(oc, "hwversion",
++        "The hardware version, MAJOR.MINOR (default 3.8)");
++}
++
++static void chumby_classic_instance_finalize(Object *obj)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++
++    g_free(s->guid);
++    g_free(s->serial);
++    g_free(s->hwversion);
+ }
+ 
+ static const TypeInfo chumby_classic_info = {
+@@ -211,6 +330,7 @@ static const TypeInfo chumby_classic_info = {
+     .parent = TYPE_MACHINE,
+     .instance_size = sizeof(ChumbyClassicState),
+     .instance_init = chumby_classic_instance_init,
++    .instance_finalize = chumby_classic_instance_finalize,
+     .class_init = chumby_classic_class_init,
+     .interfaces = arm_machine_interfaces,
+ };

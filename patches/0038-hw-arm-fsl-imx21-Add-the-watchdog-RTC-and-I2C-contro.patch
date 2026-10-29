@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 03:03:46 +1030
+Subject: [PATCH 38/42] hw/arm/fsl-imx21: Add the watchdog, RTC and I2C
+ controller
+
+The stock Chumby kernel uses the watchdog: chumby_sense1 arms it with a
+2.5 second timeout (WCR 0x0434) and services it from a timer every
+tick, arch_reset() reboots through it (WCR = WDE with SRS clear), and
+/proc/resetReason reports WRSR as read at start-up. The i.MX21 block is
+the i.MX2 watchdog (16-bit WCR, WSR, WRSR at 0x10002000, IRQ 27), so
+use imx2.wdt with its reset-source property set. A missed service now
+performs QEMU's watchdog action and "reboot" resets the machine instead
+of hanging.
+
+Add the RTC (0x10007000, IRQ 22) and the I2C controller (0x10012000,
+IRQ 12, the i.MX1-style block of imx.i2c) as well, for kernels that
+drive them. The stock kernel does not: it is built without CONFIG_RTC
+and CONFIG_I2C_IMX, and mx21ads.c keeps the OTG transceiver set-up,
+which used the USB OTG block's own I2C master, under "#if 0". The I2C
+bus is empty; devices can be added to it with -device.
+
+The SDHC stays unmodelled: the Chumby Classic has no card slot, its
+board file keeps imx_set_mmc_info() under "#if 0" and the kernel is
+built without CONFIG_MMC.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst | 18 ++++++++++++++++--
+ hw/arm/Kconfig                     |  2 ++
+ hw/arm/fsl-imx21.c                 | 24 ++++++++++++++++++++----
+ include/hw/arm/fsl-imx21.h         | 12 ++++++++++++
+ 4 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index 09a320c69..4d8554a3b 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -36,11 +36,25 @@ Emulated devices:
+ - SSI1 and SSI2 (as slaves of the codec, in normal, network and I2S
+   modes, with their FIFOs, interrupts and DMA requests) and the audio
+   multiplexer's data routing
++- Watchdog: the stock kernel's ``chumby_sense1`` driver arms it for 2.5
++  seconds and services it every tick, and ``reboot`` resets the machine
++  through it. A missed service performs QEMU's watchdog action
++  (``-action watchdog=...``, a reset by default). The reset status
++  register reports power-on, software, watchdog or (after
++  ``system_reset``) external reset, which the guest shows in
++  ``/proc/resetReason``
++- RTC, counting days, hours, minutes and seconds from ``-rtc base=`` (by
++  default the host's time) on the ``-rtc clock=`` clock, with its alarm,
++  stopwatch and periodic interrupts. The stock kernel has no driver for it
++- I2C controller, with nothing on its bus (the stock kernel has no driver
++  for it either). I2C devices can be added to ``i2c-bus.0`` with
++  ``-device``
+ 
+ Missing devices:
+ 
+-- Watchdog, RTC, SDHC and I2C: their registers read back what was
+-  last written
++- SDHC: the Chumby Classic has no SD card slot, and its kernel
++  registers no SDHC driver; its registers read back what was last
++  written
+ - The USB OTG block's function (device) side, HNP and its transceiver
+   I2C master
+ 
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index c8daf8206..a21f5a1b8 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -492,8 +492,10 @@ config NPCM8XX
+ config FSL_IMX21
+     bool
+     select IMX
++    select IMX_I2C
+     select SSI
+     select USB_IMX21
++    select WDT_IMX2
+ 
+ config CHUMBY_CLASSIC
+     bool
+diff --git a/hw/arm/fsl-imx21.c b/hw/arm/fsl-imx21.c
+index 3851403b6..72de0d118 100644
+--- a/hw/arm/fsl-imx21.c
++++ b/hw/arm/fsl-imx21.c
+@@ -6,10 +6,11 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  *
+  * An ARM926EJ-S with the i.MX21's interrupt controller, timers, UARTs,
+- * clocks, GPIO, keypad port, SPI, LCD and NAND flash controllers.
+- * Peripheral and memory controller registers that are not modelled (DMA,
+- * SSI audio, watchdog, SDRAM and WEIM controllers and others) read back
+- * what was last written.
++ * clocks, GPIO, keypad port, SPI, LCD and NAND flash controllers, DMA
++ * controller, SSIs and audio multiplexer, PWM, USB host, watchdog, RTC
++ * and I2C controller. Peripheral and memory controller registers that
++ * are not modelled (SDHC, SDRAM and WEIM controllers and others) read
++ * back what was last written.
+  */
+ 
+ #include "qemu/osdep.h"
+@@ -49,6 +50,9 @@ static void fsl_imx21_init(Object *obj)
+         object_initialize_child(obj, "ssi[*]", &s->ssi[i], TYPE_IMX21_SSI);
+     }
+     object_initialize_child(obj, "audmux", &s->audmux, TYPE_IMX21_AUDMUX);
++    object_initialize_child(obj, "wdt", &s->wdt, TYPE_IMX2_WDT);
++    object_initialize_child(obj, "rtc", &s->rtc, TYPE_IMX21_RTC);
++    object_initialize_child(obj, "i2c", &s->i2c, TYPE_IMX_I2C);
+ }
+ 
+ static bool fsl_imx21_map(DeviceState *dev, SysBusDevice *sbd, hwaddr addr,
+@@ -140,6 +144,18 @@ static void fsl_imx21_realize(DeviceState *dev, Error **errp)
+         return;
+     }
+ 
++    /* WRSR tells the Chumby's kernel why it was reset. */
++    if (!object_property_set_bool(OBJECT(&s->wdt), "reset-source", true,
++                                  errp) ||
++        !fsl_imx21_map(aitc, SYS_BUS_DEVICE(&s->wdt), FSL_IMX21_WDT_ADDR,
++                       FSL_IMX21_WDT_IRQ, errp) ||
++        !fsl_imx21_map(aitc, SYS_BUS_DEVICE(&s->rtc), FSL_IMX21_RTC_ADDR,
++                       FSL_IMX21_RTC_IRQ, errp) ||
++        !fsl_imx21_map(aitc, SYS_BUS_DEVICE(&s->i2c), FSL_IMX21_I2C_ADDR,
++                       FSL_IMX21_I2C_IRQ, errp)) {
++        return;
++    }
++
+     for (i = 0; i < FSL_IMX21_NUM_CSPIS; i++) {
+         if (!fsl_imx21_map(aitc, SYS_BUS_DEVICE(&s->cspi[i]), cspis[i].addr,
+                            cspis[i].irq, errp)) {
+diff --git a/include/hw/arm/fsl-imx21.h b/include/hw/arm/fsl-imx21.h
+index cc77ea379..0f3a8366d 100644
+--- a/include/hw/arm/fsl-imx21.h
++++ b/include/hw/arm/fsl-imx21.h
+@@ -20,6 +20,9 @@
+ #include "hw/input/imx21_kpp.h"
+ #include "hw/dma/imx21_dma.h"
+ #include "hw/audio/imx21_audmux.h"
++#include "hw/i2c/imx_i2c.h"
++#include "hw/rtc/imx21_rtc.h"
++#include "hw/watchdog/wdt_imx2.h"
+ #include "qemu/units.h"
+ #include "system/memory.h"
+ #include "target/arm/cpu.h"
+@@ -51,6 +54,9 @@ struct FslIMX21State {
+     IMX21DMAState dma;
+     IMX21SSIState ssi[FSL_IMX21_NUM_SSIS];
+     IMX21AudmuxState audmux;
++    IMX2WdtState wdt;
++    IMX21RTCState rtc;
++    IMXI2CState i2c;
+     DeviceState *pwm;
+     DeviceState *usbotg;
+     /* Peripheral and memory controller registers not modelled yet. */
+@@ -62,10 +68,12 @@ struct FslIMX21State {
+ #define FSL_IMX21_AIPI_ADDR     0x10000000
+ #define FSL_IMX21_AIPI_SIZE     0x41000
+ #define FSL_IMX21_DMA_ADDR      0x10001000
++#define FSL_IMX21_WDT_ADDR      0x10002000
+ #define FSL_IMX21_GPT1_ADDR     0x10003000
+ #define FSL_IMX21_GPT2_ADDR     0x10004000
+ #define FSL_IMX21_GPT3_ADDR     0x10005000
+ #define FSL_IMX21_PWM_ADDR      0x10006000
++#define FSL_IMX21_RTC_ADDR      0x10007000
+ #define FSL_IMX21_KPP_ADDR      0x10008000
+ #define FSL_IMX21_UART1_ADDR    0x1000a000
+ #define FSL_IMX21_UART2_ADDR    0x1000b000
+@@ -75,6 +83,7 @@ struct FslIMX21State {
+ #define FSL_IMX21_CSPI2_ADDR    0x1000f000
+ #define FSL_IMX21_SSI1_ADDR     0x10010000
+ #define FSL_IMX21_SSI2_ADDR     0x10011000
++#define FSL_IMX21_I2C_ADDR      0x10012000
+ #define FSL_IMX21_GPIO_ADDR     0x10015000
+ #define FSL_IMX21_AUDMUX_ADDR   0x10016000
+ #define FSL_IMX21_CSPI3_ADDR    0x10017000
+@@ -91,6 +100,7 @@ struct FslIMX21State {
+ /* Interrupts */
+ #define FSL_IMX21_CSPI3_IRQ     6
+ #define FSL_IMX21_GPIO_IRQ      8
++#define FSL_IMX21_I2C_IRQ       12
+ #define FSL_IMX21_SSI2_IRQ      13
+ #define FSL_IMX21_SSI1_IRQ      14
+ #define FSL_IMX21_CSPI2_IRQ     15
+@@ -99,9 +109,11 @@ struct FslIMX21State {
+ #define FSL_IMX21_UART3_IRQ     18
+ #define FSL_IMX21_UART2_IRQ     19
+ #define FSL_IMX21_UART1_IRQ     20
++#define FSL_IMX21_RTC_IRQ       22
+ #define FSL_IMX21_GPT3_IRQ      24
+ #define FSL_IMX21_GPT2_IRQ      25
+ #define FSL_IMX21_GPT1_IRQ      26
++#define FSL_IMX21_WDT_IRQ       27
+ #define FSL_IMX21_NFC_IRQ       29
+ #define FSL_IMX21_DMA_IRQ       32      /* channels 0-15: 32-47 */
+ /* DMA request lines: SSIn receive and transmit, FIFO 0 */

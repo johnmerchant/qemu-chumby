@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 03:54:52 +1030
+Subject: [PATCH 33/42] ui/cocoa: Add a scale option for the window's size
+
+The Cocoa window shows the guest at one device pixel per guest pixel:
+on a Retina screen a 320x240 guest is a 160x120 point window. GTK has a
+"scale" option for its window; give Cocoa the same, in points per guest
+pixel, applied whenever the guest's resolution changes. With zoom-to-fit
+the window can still be resized, and keeps the size it is given until
+the resolution changes again.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ qapi/ui.json |  8 +++++++-
+ ui/cocoa.m   | 23 +++++++++++++++++++----
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/qapi/ui.json b/qapi/ui.json
+index b2c42a7f5..1992001f9 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1448,6 +1448,11 @@
+ # @zoom-interpolation: Apply interpolation to smooth output when
+ #     zoom-to-fit is enabled.  Defaults to "off".  (Since 9.0)
+ #
++# @scale: Size the window at this many points per guest pixel, each
++#     time the guest's resolution changes, instead of one device pixel
++#     per guest pixel.  The window can still be resized when
++#     zoom-to-fit is on.  (Since 11.2)
++#
+ # Since: 7.0
+ ##
+ { 'struct': 'DisplayCocoa',
+@@ -1456,7 +1461,8 @@
+       '*full-grab': 'bool',
+       '*swap-opt-cmd': 'bool',
+       '*zoom-to-fit': 'bool',
+-      '*zoom-interpolation': 'bool'
++      '*zoom-interpolation': 'bool',
++      '*scale': 'number'
+   } }
+ 
+ ##
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 3751be379..4d3d4220b 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -101,6 +101,8 @@ static void cocoa_switch(DisplayChangeListener *dcl,
+ static bool swap_opt_cmd;
+ 
+ static CGInterpolationQuality zoom_interpolation = kCGInterpolationNone;
++/* Points per guest pixel for the window's size; 0 for one device pixel */
++static double window_scale;
+ static NSTextField *pauseLabel;
+ 
+ static bool allow_events;
+@@ -497,17 +499,26 @@ - (NSSize) screenSafeAreaSize
+ 
+ - (void) resizeWindow
+ {
++    static QEMUScreen scaled_for;
++    CGFloat factor = window_scale > 0 ? window_scale
++                                      : 1 / [[self window] backingScaleFactor];
++
+     [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
+ 
+     if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
+-        CGFloat width = screen.width / [[self window] backingScaleFactor];
+-        CGFloat height = screen.height / [[self window] backingScaleFactor];
+-
+-        [[self window] setContentSize:NSMakeSize(width, height)];
++        [[self window] setContentSize:NSMakeSize(screen.width * factor,
++                                                 screen.height * factor)];
+         [[self window] center];
+     } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
+         [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
+         [[self window] center];
++    } else if (window_scale > 0 && (screen.width != scaled_for.width ||
++                                    screen.height != scaled_for.height)) {
++        /* A new resolution: back to the scale; else keep the user's size */
++        [[self window] setContentSize:NSMakeSize(screen.width * factor,
++                                                 screen.height * factor)];
++        [[self window] center];
++        scaled_for = screen;
+     } else {
+         [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
+     }
+@@ -2005,6 +2016,10 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+         zoom_interpolation = kCGInterpolationLow;
+     }
+ 
++    if (opts->u.cocoa.has_scale && opts->u.cocoa.scale > 0) {
++        window_scale = opts->u.cocoa.scale;
++    }
++
+     create_initial_menus();
+     /*
+      * Create the menu entries which depend on QEMU state (for consoles
