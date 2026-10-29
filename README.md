@@ -140,7 +140,8 @@ can't do:
 - headphones in and out
 - the Chumby's outputs: backlight level, speaker mute, LCD power
 - screenshots, pause, reset, saving and restoring the machine's state
-- the console, with a line to type shell commands into
+- the console, in your own terminal app (the desktop's default: Konsole,
+  GNOME Terminal, Terminal.app, iTerm2...)
 
 The mouse in the window is the pen. The emulated Chumby has no network:
 QEMU always runs with `-nic none`.
