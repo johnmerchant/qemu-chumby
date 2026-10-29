@@ -11,7 +11,9 @@ screen, touchscreen, console and flash.
 
 It is a series of patches against a pinned QEMU release, written as QEMU
 code (QOM devices under `hw/`, with a docs page), plus scripts to build
-it.
+it, a desktop app (`chumby-emu`), a runner for scripts and tests
+(`chumby-machine`) and a tool that makes the images it boots
+(`chumby-image`).
 
 An independent project, not affiliated with or endorsed by Chumby
 Industries, Blue Octy or anyone holding rights in Chumby; "Chumby" is a
@@ -116,7 +118,7 @@ On macOS the Cocoa window and CoreAudio are built in. VNC always is.
 
 ## Images
 
-The machine needs two files from your own Chumby's flash backup:
+The stock firmware needs two files from your own Chumby's flash backup:
 
 - The kernel: the zImage at the start of the Kernel1 partition.
 - A NAND image of the whole 64 MiB chip in `nanddump`'s layout: 131072
@@ -126,6 +128,41 @@ The machine needs two files from your own Chumby's flash backup:
 Programs and erases are written back to the NAND image, as the Chumby
 writes its flash. Keep a copy, or use `snapshot=on` or `readonly=on` on
 the drive to leave the image unchanged.
+
+Other kernels boot too, with no NAND image or a blank one: a zImage with
+its initramfs built in, or `-initrd` beside it, and `-append` for its
+command line (the stock one names the NAND's root disk).
+
+### chumby-image
+
+`chumby-image` (in `image/`, a Rust crate with no dependencies) makes the
+NAND image from a backup, the `mtdN-*.nanddump` files that `nanddump`
+writes for each partition, and a settings directory:
+
+    cargo build --release --manifest-path image/Cargo.toml
+    image/target/release/chumby-image mkpsp PSPDIR psp.jffs2
+    image/target/release/chumby-image mknand BACKUPDIR psp.jffs2 nand.img
+
+or `nix run github:johnmerchant/qemu-chumby#image -- mkpsp ...`.
+`mknand` keeps every partition as dumped except the settings partition
+(PSP), which it replaces with `psp.jffs2`, and the update cache, which it
+erases. PSPDIR is a fresh, factory-like settings set:
+
+| File | Contents |
+| --- | --- |
+| `hostname` | `chumby` |
+| `timezone`, `localtime` | `UTC`, and the root disk's own UTC zone file |
+| `ts_settings` | `0,4095,4095,-4095,0`: the ADC's full range, which the emulated touchscreen reports against |
+| `firsttime` | `0`, so the boot keeps that calibration rather than asking for one |
+| `volume`, `mute`, `pan` | `50`, `0`, `0` |
+
+The kernel is the zImage at the start of the Kernel1 partition; its
+length is in its header (the word at offset 0x2c):
+
+    head -c $((0x15ad34)) BACKUPDIR/mtd4-Kernel1.bin > zImage
+
+Unlike the rest of this repository, `image/` is MIT-licensed (see
+`image/LICENSE`).
 
 ## The desktop app: chumby-emu
 
@@ -166,7 +203,55 @@ in seconds by letting emulated time run ahead, which also makes sound
 play fast and choppy; it is meant for scripts, and a saved state is
 the quick way to start an interactive session.
 
-### Testing on Linux
+## Scripts and tests: chumby-machine
+
+`chumby-machine` runs the machine headless and drives it, for test
+scenarios and scripts: Python 3's standard library only, as a command
+line and as a module (`chumby_machine.py`). Each machine lives in a
+directory of its own (`--dir DIR`, else `$CHUMBY_MACHINE_DIR`): QEMU's
+process ID, its QMP and console sockets, and the console's log,
+`console.log`. QEMU runs detached, so each command is a process of its
+own and any number of them can drive one machine.
+
+    chumby-machine --dir m start --kernel zImage --nand nand.img --stick stick.img
+    chumby-machine --dir m wait log 'Please press Enter' 120
+    chumby-machine --dir m wait screen 30
+    chumby-machine --dir m tap 160 120
+    chumby-machine --dir m shot screen.png
+    chumby-machine --dir m exec 'uname -a'
+    chumby-machine --dir m stop
+
+| Command | What it does |
+| --- | --- |
+| `start --kernel ZIMAGE [OPTIONS] [-- QEMU OPTIONS]` | Starts the machine headless and returns once QMP answers. `--nand NAND` attaches a NAND image with `snapshot=on` (`--nand-write` to write it); `--psp DIR` boots a copy of it, kept in the machine's directory, whose settings partition holds DIR's files; `--initrd`, `--append` as QEMU's; `--stick IMG` a disk image as a USB stick (`usb-storage`), written as the guest writes it; `--fast` for `-icount shift=auto,sleep=off`; `--set PROP=VALUE` a machine property; `--qemu PATH` (else `$QEMU`, `build/obj/`, `PATH`) |
+| `stop` | Quits QEMU (kills it if it doesn't answer) |
+| `status` | Whether it runs, and the board's lines, as JSON; exits 1 if not running |
+| `log [-f]` | The console's output |
+| `wait log REGEX [SECS]` | Until the console's output matches; prints the match. Fails on a timeout or if QEMU exits first |
+| `wait screen [SECS]` | Until the screen has stopped changing for half a second and isn't all black |
+| `tap X Y [--hold MS]`, `down X Y`, `up` | The pen, in screen pixels |
+| `button down\|up\|tap [MS]` | The top button |
+| `headphones in\|out`, `accel X Y Z` | The headphone jack, the accelerometer (milli-g) |
+| `shot OUT.png`, `pixel X Y` | The screen, or one pixel as `#rrggbb` |
+| `compare [--min F] [--wait SECS] [--want RE] [--mask X,Y,W,H]... PICTURE...` | Which picture (a PNG, or a raw 320x240 RGB565 dump) the screen is most like, and the share of its pixels that match; with `--wait`, until the best one matches `--min` of them and its name matches RE |
+| `type TEXT`, `exec [--timeout SECS] COMMAND` | Types on the console; runs a shell command there (a shell must be waiting on it) and exits with its status, printing its output |
+| `powercut OUT.img` | The power cut: the machine stopped where it is, the stick image copied to OUT as it stands, QEMU killed |
+| `mkfat DIR OUT.img [--size MB] [--label NAME]` | A stick image: an MBR and one FAT16 partition holding DIR's files (links followed), at least 64 MiB |
+
+The module has the same as a `Machine` class (`Machine(DIR).start(...)`,
+`.wait_log(...)`, `.tap(...)`, `.exec(...)`...), raising
+`chumby_machine.Error`, plus the images' helpers: `mkfat`, `fat_files`
+(a stick image's files, read back), `jffs2` (a directory as a JFFS2
+image, byte for byte what `chumby-image mkpsp` makes) and `nand_with` (a
+copy of a NAND image with partitions replaced). `chumby-ctl` shares its
+QMP client. With Nix, `nix run github:johnmerchant/qemu-chumby#machine`
+has QEMU built in.
+
+The machine never gets a network: `chumby-machine` always runs QEMU with
+`-nic none` and refuses `-netdev`, `-net` and `-nic` among the QEMU
+options it is given.
+
+## Testing on Linux
 
 `tests/linux/run IMAGES` builds the machine on Debian 13 in a container
 (Apple's `container`, Docker or Podman, on a Mac or on Linux) and checks
@@ -220,8 +305,8 @@ stock software maps it with the calibration in the settings partition
 
 ## Control surface
 
-What a harness driving the machine (a test runner, `dev/emulate` in
-neochumby) relies on. All of it is standard QEMU; nothing here is
+What a harness driving the machine (`chumby-machine`, or a test runner
+of your own) relies on. All of it is standard QEMU; nothing here is
 specific to a client.
 
 **Kernel.** `-kernel FILE`: a zImage, entered with ATAGs (memory 64 MiB
@@ -380,6 +465,7 @@ This is policy, not legal advice.
 
 ## Licence
 
-QEMU is GPL-2.0-or-later, and so is everything here: the patches (each
-new file carries an SPDX `GPL-2.0-or-later` header), the scripts and the
-documentation. See `COPYING`.
+QEMU is GPL-2.0-or-later, and so is everything here (the patches, each new
+file with an SPDX `GPL-2.0-or-later` header, the scripts and the
+documentation; see `COPYING`) except `chumby-image`, in `image/`, which is
+MIT (`image/LICENSE`).
