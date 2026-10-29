@@ -111,6 +111,7 @@ class QMP:
         self.f = self.s.makefile("rw")
         self.f.readline()
         self.lock = threading.Lock()
+        self.closed = False
         self.replies = queue.Queue()
         self.events = events
         threading.Thread(target=self._read, daemon=True).start()
@@ -126,16 +127,22 @@ class QMP:
                 self.events.put(msg)
             else:
                 self.replies.put(msg)
+        self.closed = True
+        self.replies.put(None)
         self.events.put({"event": "QMP_CLOSED"})
 
     def cmd(self, name, **args):
         with self.lock:
+            if self.closed:
+                raise RuntimeError("the machine has quit")
             msg = {"execute": name}
             if args:
                 msg["arguments"] = args
             self.f.write(json.dumps(msg) + "\n")
             self.f.flush()
             r = self.replies.get(timeout=30)
+        if r is None:
+            raise RuntimeError("the machine has quit")
         if "error" in r:
             raise RuntimeError(r["error"].get("desc", str(r["error"])))
         return r.get("return")

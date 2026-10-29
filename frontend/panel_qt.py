@@ -161,7 +161,7 @@ class Panel(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self, interval=50, timeout=self.poll)
         self.timer.start()
         self.refresh_outputs()
-        self.send_tilt()
+        self.read_tilt()
 
     # -- helpers -------------------------------------------------------------
     def slider(self, lo, hi, v):
@@ -211,14 +211,29 @@ class Panel(QtWidgets.QMainWindow):
         self.roll.setValue(roll)
 
     def gravity(self):
-        """Gravity in the Chumby's frame, in milli-g, from the sliders:
-        upright and still is (0, -1000, 0), the screen facing the user."""
+        """Gravity along the accelerometer's axes, in milli-g, from the
+        sliders: upright and still is the machine's default, +1 g on Z."""
         p = math.radians(self.pitch.value())
         r = math.radians(self.roll.value())
         x = 1000 * math.sin(r) * math.cos(p)
-        y = -1000 * math.cos(r) * math.cos(p)
-        z = 1000 * math.sin(p)
+        y = 1000 * math.sin(p)
+        z = 1000 * math.cos(r) * math.cos(p)
         return [round(x), round(y), round(z)]
+
+    def read_tilt(self):
+        """Starts the sliders from the machine's acceleration."""
+        if not self.has(*PROP_ACCEL):
+            self.gread.setText("no accelerometer")
+            return
+        g = [self.try_cmd(self.qmp.qom_get, "/machine", a) or 0 for a in PROP_ACCEL]
+        x, y, z = (max(-1.0, min(1.0, v / 1000)) for v in g)
+        pitch = math.degrees(math.asin(y))
+        roll = math.degrees(math.atan2(x, z)) if (x or z) else 0
+        for sl, v in ((self.pitch, pitch), (self.roll, roll)):
+            sl.blockSignals(True)
+            sl.setValue(round(v))
+            sl.blockSignals(False)
+        self.gread.setText("x %+5d  y %+5d  z %+5d mg" % tuple(g))
 
     def send_tilt(self, *_):
         self.write_accel(self.gravity())
@@ -318,7 +333,7 @@ class Panel(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self.timer.stop()
-        if self.proc.poll() is None:
+        if self.proc.poll() is None and not self.qmp.closed:
             try:
                 self.qmp.cmd("quit")
             except Exception:
