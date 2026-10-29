@@ -9,6 +9,7 @@ builds of the machine too.
 import math
 import os
 import queue
+import re
 import socket
 import threading
 
@@ -29,6 +30,79 @@ PROP_HEADPHONES = "headphones"
 PROP_ACCEL = ("accel-x", "accel-y", "accel-z")     # milli-g
 QUERY_OUTPUTS = "query-chumby-state"
 EVENT_PREFIX = "CHUMBY_"
+
+
+# Terminal output: escape sequences (CSI; OSC, such as a window title;
+# lone ESC + one character),
+# backspace and BEL; the rest is text.
+_TERM = re.compile(r"\x1b\[([0-?]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+                   r"|\x1b[@-Z\\-_]|[\x08\x07]")
+
+# The 16 ANSI colours, as xterm draws them
+_ANSI = ["#000000", "#cd0000", "#00a000", "#cdcd00", "#3b6fe0", "#cd00cd", "#00b0b0", "#bfbfbf",
+         "#7f7f7f", "#ff4040", "#00d000", "#e0e000", "#6f9fff", "#ff40ff", "#00e0e0", "#ffffff"]
+
+
+class Terminal:
+    """Writes a console's output into a QPlainTextEdit, as a terminal
+    would: colour and bold from SGR sequences, backspace, and every other
+    control sequence (cursor movement, title, ...) dropped."""
+
+    def __init__(self, view):
+        self.view = view
+        self.base = QtGui.QTextCharFormat()
+        self.fmt = QtGui.QTextCharFormat(self.base)
+        self.bold = False
+        self.fg = None
+        self.pending = ""
+
+    def sgr(self, params):
+        codes = [int(c) if c.isdigit() else 0 for c in (params or "0").split(";")]
+        for c in codes:
+            if c == 0:
+                self.bold, self.fg = False, None
+                self.fmt = QtGui.QTextCharFormat(self.base)
+            elif c == 1:
+                self.bold = True
+            elif c == 22:
+                self.bold = False
+            elif 30 <= c <= 37 or 90 <= c <= 97:
+                self.fg = (c - 30) if c < 90 else (c - 90 + 8)
+            elif c == 39:
+                self.fg = None
+            elif 40 <= c <= 47:
+                self.fmt.setBackground(QtGui.QColor(_ANSI[c - 40]))
+            elif c == 49:
+                self.fmt.clearBackground()
+        self.fmt.setFontWeight(QtGui.QFont.Weight.Bold if self.bold else QtGui.QFont.Weight.Normal)
+        if self.fg is None:
+            self.fmt.clearForeground()
+        else:
+            # Bold brightens the eight basic colours, as terminals do.
+            fg = self.fg + 8 if self.bold and self.fg < 8 else self.fg
+            self.fmt.setForeground(QtGui.QColor(_ANSI[fg]))
+
+    def write(self, text):
+        text = self.pending + text
+        self.pending = ""
+        # Keep an escape sequence cut off at the end for the next write.
+        cut = text.rfind("\x1b")
+        if cut >= 0 and not _TERM.match(text, cut) and len(text) - cut < 32:
+            text, self.pending = text[:cut], text[cut:]
+        c = self.view.textCursor()
+        c.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        pos = 0
+        for m in _TERM.finditer(text):
+            c.insertText(text[pos:m.start()], self.fmt)
+            pos = m.end()
+            s = m.group(0)
+            if s == "\x08":
+                c.deletePreviousChar()
+            elif m.group(2) == "m":
+                self.sgr(m.group(1))
+        c.insertText(text[pos:], self.fmt)
+        self.view.setTextCursor(c)
+        self.view.ensureCursorVisible()
 
 
 class Console(QtCore.QObject):
@@ -157,6 +231,7 @@ class Panel(QtWidgets.QMainWindow):
         font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
         self.log.setFont(font)
         self.log.setMinimumHeight(160)
+        self.term = Terminal(self.log)
         self.input = QtWidgets.QLineEdit(placeholderText="A command for the Chumby's shell (Enter sends, even empty)")
         self.input.setFont(font)
         enter = QtWidgets.QPushButton("\u23ce Enter")
@@ -378,11 +453,7 @@ class Panel(QtWidgets.QMainWindow):
         if not self.activated and "press Enter to activate" in text:
             self.activated = True
             self.console.send("")
-        c = self.log.textCursor()
-        c.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        c.insertText(text)
-        self.log.setTextCursor(c)
-        self.log.ensureCursorVisible()
+        self.term.write(text)
 
     def on_input(self):
         if self.console:
