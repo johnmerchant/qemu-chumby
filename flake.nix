@@ -81,13 +81,14 @@
             fileset = lib.fileset.unions [
               ./chumby-emu
               ./chumby-ctl
+              ./chumby_machine.py
               ./frontend
             ];
           };
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
             mkdir -p $out/share/chumby-emu $out/bin
-            cp -r chumby-emu chumby-ctl frontend $out/share/chumby-emu/
+            cp -r chumby-emu chumby-ctl chumby_machine.py frontend $out/share/chumby-emu/
             makeWrapper ${python}/bin/python3 $out/bin/chumby-ctl \
               --add-flags $out/share/chumby-emu/chumby-ctl
             makeWrapper ${python}/bin/python3 $out/bin/chumby-emu \
@@ -101,18 +102,55 @@
             license = lib.licenses.gpl2Plus;
           };
         };
+
+      # chumby-machine: the machine headless, for scripts and tests
+      # (Python's standard library only).
+      chumby-machine =
+        pkgs: qemu:
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "chumby-machine";
+          inherit (qemu) version;
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./chumby-machine
+              ./chumby-ctl
+              ./chumby_machine.py
+            ];
+          };
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          installPhase = ''
+            mkdir -p $out/share/chumby-machine $out/bin
+            cp chumby-machine chumby-ctl chumby_machine.py $out/share/chumby-machine/
+            for p in chumby-machine chumby-ctl; do
+              makeWrapper ${pkgs.python3}/bin/python3 $out/bin/$p \
+                --add-flags $out/share/chumby-machine/$p \
+                --set-default QEMU ${qemu}/bin/qemu-system-arm
+            done
+          '';
+          meta = {
+            description = "The Chumby Classic machine headless, for scripts and tests";
+            mainProgram = "chumby-machine";
+            license = lib.licenses.gpl2Plus;
+          };
+        };
     in
     {
       packages = forAll (pkgs: rec {
         default = qemu-chumby pkgs;
         qemu = default;
         emu = chumby-emu pkgs default;
+        machine = chumby-machine pkgs default;
       });
 
       apps = forAll (pkgs: {
         emu = {
           type = "app";
           program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.emu}/bin/chumby-emu";
+        };
+        machine = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.machine}/bin/chumby-machine";
         };
       });
 

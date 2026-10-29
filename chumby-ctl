@@ -29,46 +29,25 @@ import socket
 import sys
 import time
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from chumby_machine import QMP, Error  # noqa: E402
 
-class QMP:
-    def __init__(self, path):
-        self.s = socket.socket(socket.AF_UNIX)
-        self.s.connect(path)
-        self.f = self.s.makefile("rw")
-        self.f.readline()
-        self.cmd("qmp_capabilities")
 
-    def send(self, msg):
-        self.f.write(json.dumps(msg) + "\n")
-        self.f.flush()
-        while True:
-            line = self.f.readline()
-            if not line:
-                sys.exit("chumby-ctl: the machine closed the connection")
-            r = json.loads(line)
-            if "return" in r or "error" in r:
-                if "error" in r:
-                    sys.exit("chumby-ctl: " + r["error"].get("desc", str(r["error"])))
-                return r["return"]
-
-    def cmd(self, name, **args):
-        msg = {"execute": name}
-        if args:
-            msg["arguments"] = args
-        return self.send(msg)
-
-    def events(self, seconds):
-        end = None if seconds is None else time.monotonic() + seconds
-        while end is None or time.monotonic() < end:
-            if end is not None:
-                self.s.settimeout(max(0.01, end - time.monotonic()))
-            try:
-                line = self.f.readline()
-            except (socket.timeout, TimeoutError):
-                return
-            if not line:
-                return
-            print(line.strip(), flush=True)
+def events(q, seconds):
+    """Prints QMP events as JSON lines until SECONDS have passed, or the
+    machine quits."""
+    for e in q.events:
+        print(json.dumps(e), flush=True)
+    q.events.clear()
+    end = None if seconds is None else time.monotonic() + seconds
+    while end is None or time.monotonic() < end:
+        q.sock.settimeout(None if end is None else max(0.01, end - time.monotonic()))
+        try:
+            msg = q.message()
+        except (socket.timeout, TimeoutError, ConnectionError):
+            return
+        print(json.dumps(msg), flush=True)
 
 
 def usage():
@@ -114,7 +93,7 @@ def run(q, cmd, a):
     elif cmd == "state" and not a:
         print(json.dumps(q.cmd("query-chumby-state"), sort_keys=True))
     elif cmd == "events" and len(a) <= 1:
-        q.events(float(a[0]) if a else None)
+        events(q, float(a[0]) if a else None)
     elif cmd == "shot" and len(a) == 1:
         q.cmd("screendump", filename=os.path.abspath(a[0]), format="png")
     elif cmd == "qmp" and len(a) == 1:
@@ -126,12 +105,15 @@ def run(q, cmd, a):
 def main():
     if len(sys.argv) < 3:
         usage()
-    q = QMP(sys.argv[1])
-    words = sys.argv[2:]
-    while words:
-        n = words.index("--") if "--" in words else len(words)
-        run(q, words[0], words[1:n])
-        words = words[n + 1:]
+    try:
+        q = QMP(sys.argv[1], timeout=None)
+        words = sys.argv[2:]
+        while words:
+            n = words.index("--") if "--" in words else len(words)
+            run(q, words[0], words[1:n])
+            words = words[n + 1:]
+    except (Error, OSError) as e:
+        sys.exit(f"chumby-ctl: {e}")
 
 
 if __name__ == "__main__":

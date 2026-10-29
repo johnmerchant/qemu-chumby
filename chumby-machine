@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""chumby-machine [--dir DIR] COMMAND ...: runs the chumby-classic machine
+headless, for scripts and tests, and drives it. Python 3 only.
+
+  start --kernel ZIMAGE [OPTIONS] [-- QEMU OPTIONS]
+        --nand NAND       a NAND image, attached with snapshot=on (never
+                          changed), unless --nand-write
+        --psp DIR         boot a copy of NAND whose settings partition
+                          holds DIR's files (a JFFS2 image), kept in DIR
+        --initrd FILE, --append TEXT    as QEMU's
+        --stick IMG       a disk image as a USB stick (usb-storage),
+                          written as the guest writes it
+        --fast            -icount shift=auto,sleep=off: emulated time runs
+                          ahead while the guest is idle
+        --set PROP=VALUE  a machine property (accel-x, guid, ...)
+        --qemu PATH       else $QEMU, ./build's, or PATH's
+  stop                    quit QEMU
+  status                  running or not; the board's lines as JSON
+  log [-f]                the console's output so far (-f: and on)
+  wait log REGEX [SECS]   until the console matches; prints the match
+  wait screen [SECS]      until the screen settles (not all black)
+  tap X Y [--hold MS]     press the screen at pixel X,Y and release
+  down X Y, up            press and hold, release
+  button down|up|tap [MS] the top button
+  headphones in|out
+  accel X Y Z             milli-g along each axis
+  shot OUT.png            the screen
+  pixel X Y               one pixel, as #rrggbb
+  compare [--min F] [--wait SECS] [--want RE] [--mask X,Y,W,H]... PICTURE...
+                          which picture (PNG, or raw 320x240 RGB565) the
+                          screen is most like, and the share of its pixels
+                          that match; with --wait, until the best matches
+                          --min of them and its name matches RE
+  type TEXT               type on the console (\\n is Enter)
+  exec [--timeout SECS] COMMAND
+                          run a shell command on the console, which must
+                          have a shell waiting; prints its output and
+                          exits with its status
+  powercut OUT.img        the power cut: the machine stopped, the stick
+                          copied to OUT as it stands, QEMU killed
+  mkfat DIR OUT.img [--size MB] [--label NAME]
+                          a stick image: an MBR and a FAT16 partition
+                          holding DIR's files
+
+The machine's directory is --dir DIR, else $CHUMBY_MACHINE_DIR, else
+chumby-machine-UID in the temporary directory: QEMU's process ID, its QMP
+and console sockets, and the console's log (console.log). The machine
+never has a network (-nic none); network options are refused.
+"""
+import json
+import os
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import chumby_machine as cm  # noqa: E402
+
+
+def usage(msg=None):
+    sys.exit(f"chumby-machine: {msg}" if msg else __doc__.split("\n\n", 1)[1])
+
+
+def take(args, name, default=None):
+    """The value after NAME in ARGS, taken out of them."""
+    if name not in args:
+        return default
+    i = args.index(name)
+    if i + 1 >= len(args):
+        usage(f"{name} needs a value")
+    v = args[i + 1]
+    del args[i:i + 2]
+    return v
+
+
+def flag(args, name):
+    if name in args:
+        args.remove(name)
+        return True
+    return False
+
+
+def number(v, kind=int):
+    try:
+        return kind(v)
+    except (TypeError, ValueError):
+        usage(f"not a number: {v}")
+
+
+def run(m, cmd, args):
+    if cmd == "start":
+        extra = []
+        if "--" in args:
+            i = args.index("--")
+            args, extra = args[:i], args[i + 1:]
+        props = {}
+        while "--set" in args:
+            k, eq, v = take(args, "--set").partition("=")
+            if not eq:
+                usage("--set PROP=VALUE")
+            props[k] = v
+        opts = dict(kernel=take(args, "--kernel"), nand=take(args, "--nand"), psp=take(args, "--psp"),
+                    initrd=take(args, "--initrd"), append=take(args, "--append"), stick=take(args, "--stick"),
+                    qemu=take(args, "--qemu"), nand_write=flag(args, "--nand-write"), fast=flag(args, "--fast"))
+        if args or not opts["kernel"]:
+            usage("start --kernel ZIMAGE [OPTIONS] [-- QEMU OPTIONS]")
+        pid = m.start(props=props, extra=extra, **opts)
+        print(f"chumby-machine: running (QEMU {pid}); the console: {m.at(cm.LOG)}")
+    elif cmd == "stop":
+        m.stop()
+    elif cmd == "status":
+        s = m.status()
+        print(json.dumps(s, sort_keys=True))
+        if not s["running"]:
+            sys.exit(1)
+    elif cmd == "log":
+        follow = flag(args, "-f")
+        with open(m.at(cm.LOG), "rb") as f:
+            while True:
+                chunk = f.read()
+                if chunk:
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.flush()
+                elif not follow or not m.running():
+                    return
+                else:
+                    time.sleep(0.2)
+    elif cmd == "wait" and args[:1] == ["log"] and len(args) in (2, 3):
+        print(m.wait_log(args[1], number(args[2], float) if len(args) > 2 else 30).group(0))
+    elif cmd == "wait" and args[:1] == ["screen"] and len(args) in (1, 2):
+        m.wait_screen(number(args[1], float) if len(args) > 1 else 30)
+    elif cmd == "tap":
+        hold = number(take(args, "--hold", "150"))
+        if len(args) != 2:
+            usage("tap X Y [--hold MS]")
+        m.tap(number(args[0]), number(args[1]), hold)
+    elif cmd == "down" and len(args) == 2:
+        m.down(number(args[0]), number(args[1]))
+    elif cmd == "up" and not args:
+        m.up()
+    elif cmd == "button" and args[:1] in (["down"], ["up"], ["tap"]) and len(args) <= 2:
+        m.button(args[0], number(args[1]) if len(args) > 1 else 300)
+    elif cmd == "headphones" and args in (["in"], ["out"]):
+        m.headphones(args[0] == "in")
+    elif cmd == "accel" and len(args) == 3:
+        m.accel(*(number(v) for v in args))
+    elif cmd == "shot" and len(args) == 1:
+        m.shot(args[0])
+    elif cmd == "pixel" and len(args) == 2:
+        print(m.pixel(number(args[0]), number(args[1])))
+    elif cmd == "compare":
+        least, secs = number(take(args, "--min", "0"), float), number(take(args, "--wait", "0"), float)
+        want, masks = take(args, "--want"), []
+        while "--mask" in args:
+            try:
+                masks.append(tuple(int(v) for v in take(args, "--mask").split(",")))
+            except ValueError:
+                usage("--mask X,Y,W,H")
+            if len(masks[-1]) != 4:
+                usage("--mask X,Y,W,H")
+        try:
+            share, name = m.compare(args, least, secs, want, masks)
+        except cm.Error as e:
+            print(e)
+            sys.exit(1)
+        print(f"{share:.2f} {name}")
+    elif cmd == "type" and len(args) == 1:
+        m.type(args[0].replace("\\n", "\n"))
+    elif cmd == "exec" and args:
+        secs = number(take(args, "--timeout", "30"), float)
+        status, out = m.exec(" ".join(args), secs)
+        sys.stdout.buffer.write(out.encode("latin-1"))
+        sys.exit(status)
+    elif cmd == "powercut" and len(args) == 1:
+        m.powercut(args[0])
+        print(f"chumby-machine: the power was cut; the stick as it stood: {args[0]}")
+    elif cmd == "mkfat" and args:
+        size, label = take(args, "--size"), take(args, "--label", "CHUMBY")
+        if len(args) != 2:
+            usage("mkfat DIR OUT.img [--size MB] [--label NAME]")
+        cm.mkfat(args[0], args[1], number(size) if size else None, label)
+    else:
+        usage()
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    argv = list(argv)
+    path = take(argv, "--dir") or os.environ.get("CHUMBY_MACHINE_DIR") or os.path.join(
+        tempfile.gettempdir(), f"chumby-machine-{os.getuid()}")
+    if not argv:
+        usage()
+    try:
+        run(cm.Machine(path), argv[0], argv[1:])
+    except cm.Error as e:
+        sys.exit(f"chumby-machine: {e}")
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
