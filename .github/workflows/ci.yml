@@ -28,6 +28,14 @@
 # from main once `publish` has put the builds it links on the release
 # (`pages`).
 #
+# Daily (schedule), and when run by hand on main, `qemu-sync` keeps the
+# pinned QEMU release in step with upstream's (./qemu-sync): a newer point
+# release of the series, or a newer series, is proposed as a pull request
+# on qemu-bump/point or qemu-bump/series, whose CI says whether the
+# patches still apply and build. On schedule, only it runs. Pull requests
+# run its dry run (`qemu-sync-plan`), which checks the tarball signature
+# verification and prints what it would do.
+#
 # Run by hand (workflow_dispatch), it builds COMMIT (default: the branch's
 # head) with this workflow, and with `publish` set, publishes it, but only
 # if COMMIT is on main: a build for a commit that main had before this
@@ -38,6 +46,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
       commit:
@@ -64,6 +74,7 @@ env:
 jobs:
   build:
     name: Build (${{ matrix.platform }})
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -380,3 +391,46 @@ jobs:
           done < "$RUNNER_TEMP/urls"
       - uses: actions/deploy-pages@v5
         id: deploy
+
+  # ./qemu-sync --self-test: the pinned release's tarball verifies with
+  # QEMU's release key and a tampered copy doesn't; then the plan, from
+  # upstream's releases as they are today, with nothing pushed.
+  qemu-sync-plan:
+    name: QEMU sync (dry run)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Signature checks
+        run: python3 -I ./qemu-sync --self-test
+      - name: Plan
+        run: python3 -I ./qemu-sync --dry-run
+
+  # Opens or updates the bump pull requests (see ./qemu-sync), and runs
+  # CI on their branches, since what GITHUB_TOKEN pushes starts no
+  # workflow. Never merges or approves.
+  qemu-sync:
+    name: QEMU sync
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    concurrency:
+      group: qemu-sync
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Sync
+        run: python3 -I ./qemu-sync

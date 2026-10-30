@@ -86,7 +86,10 @@ The patches:
 ## Building
 
 The patches apply to QEMU 11.1.2 (`qemu-release` pins the tarball and its
-SHA-256).
+SHA-256). CI's daily `qemu-sync` job (`./qemu-sync`) proposes each newer
+QEMU release as a pull request, its tarball checked against QEMU's
+signature (`qemu-release-key.asc`), and that pull request's CI says
+whether the patches still apply.
 
 With Nix, the flake's package is `qemu-system-arm` with the machine
 for `aarch64-darwin` (Apple silicon), `x86_64-darwin`,
