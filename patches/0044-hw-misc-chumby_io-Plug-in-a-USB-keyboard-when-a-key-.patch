@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 04:53:11 +0000
+Subject: [PATCH 44/44] hw/misc/chumby_io: Plug in a USB keyboard when a key
+ goes unheard
+
+The window's keys go to the board's top-button handler, which passes on
+the rest to the guest's keyboard; without one they were dropped, and a
+user had to start the machine with -device usb-kbd to type.
+
+Plug a usb-kbd into the root hub instead when a key is pressed that no
+keyboard takes, as a user would plug one in to type ("usb-keyboard", on
+by default). The port's reset empties the keyboard's queue, so the keys
+are held until the guest has configured the keyboard and its driver has
+had half a second to open it, then typed one every 20 ms: the keyboard
+queues only 16 key changes.
+
+A keyboard, plugged in or given with -device, puts its handler first;
+put the button's back in front, so its key still holds the button.
+
+Linux 7.2.13 with usbhid built in: "echo hi", typed before the keyboard
+was there, runs on the screen's shell once it is.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst |   8 +-
+ hw/arm/chumby_classic.c            |   2 +-
+ hw/misc/chumby_io.c                | 166 ++++++++++++++++++++++++++++-
+ hw/misc/trace-events               |   2 +
+ include/hw/misc/chumby_io.h        |  19 ++++
+ 5 files changed, 191 insertions(+), 6 deletions(-)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index 0224bf034..b3b4cc30f 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -105,7 +105,13 @@ it and ``qom-set /machine button false`` releases it. A key also holds it
+ while the key is down, from any display's keyboard or from QMP's
+ ``send-key`` and ``input-send-event``: F12 unless the machine's
+ ``button-key`` option names another QKeyCode (``button-key=pause``), or
+-``none``. Other keys go on to the guest's keyboard, if it has one.
++``none``. Other keys go on to the guest's keyboard. Without one, the
++first key pressed plugs a USB keyboard (``usb-kbd``) into a free port of
++the root hub, as a user would plug one in to type: the keys are held
++until the guest has configured it (for up to 10 seconds), then typed
++into it. The machine's ``usb-keyboard=off`` option turns this off. The
++keyboard plugged in this way is not on the command line, so a snapshot
++taken with it loads only into a machine started with ``-device usb-kbd``.
+ 
+ Headphones are plugged in and out with the machine's ``headphones``
+ property (``qom-set /machine headphones true``); the guest reads the
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+index 87e78a81d..597be2424 100644
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -455,7 +455,7 @@ static void chumby_classic_instance_init(Object *obj)
+ {
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
+     static const char *const io_props[] = {
+-        "button", "headphones", "button-key",
++        "button", "headphones", "button-key", "usb-keyboard",
+     };
+     int i;
+ 
+diff --git a/hw/misc/chumby_io.c b/hw/misc/chumby_io.c
+index d656f2fcc..e4728a841 100644
+--- a/hw/misc/chumby_io.c
++++ b/hw/misc/chumby_io.c
+@@ -20,6 +20,10 @@
+  * - the top button, keypad row 0, low while pressed: the "button"
+  *   property, and a key ("button-key", a QKeyCode name) that holds the
+  *   button while it is down. Other keys pass on to the next keyboard.
++ * - a USB keyboard, plugged into the USB host's root hub when a key is
++ *   pressed that no keyboard takes ("usb-keyboard", on by default), as a
++ *   user would plug one in to type. The keys are held until the guest has
++ *   set the keyboard up, then typed into it.
+  *
+  * Changes are reported as QMP events and query-chumby-state returns the
+  * lot; see qapi/chumby.json.
+@@ -28,14 +32,19 @@
+ #include "qemu/osdep.h"
+ #include "hw/misc/chumby_io.h"
+ #include "hw/core/irq.h"
++#include "hw/usb/usb.h"
+ #include "migration/vmstate.h"
+ #include "qapi/error.h"
+ #include "qapi/qapi-commands-chumby.h"
+ #include "qapi/qapi-events-chumby.h"
+ #include "qapi/qapi-types-ui.h"
+ #include "qapi/util.h"
++#include "qemu/main-loop.h"
++#include "qemu/error-report.h"
+ #include "qemu/module.h"
++#include "qemu/timer.h"
+ #include "system/reset.h"
++#include "system/system.h"
+ #include "trace.h"
+ 
+ static void chumby_io_update_lcd(ChumbyIOState *s)
+@@ -100,6 +109,96 @@ static void chumby_io_press_button(ChumbyIOState *s, bool pressed)
+     }
+ }
+ 
++/*
++ * How often to look for the guest having configured a plugged-in
++ * keyboard, how long to wait before typing the held keys anyway, and how
++ * long its driver gets after the configuration to open the keyboard.
++ * The held keys are then typed one every poll: the keyboard queues only
++ * 16 key changes.
++ */
++#define CHUMBY_IO_KBD_POLL_MS    20
++#define CHUMBY_IO_KBD_TIMEOUT_MS 10000
++#define CHUMBY_IO_KBD_SETTLE_MS  500
++
++static void chumby_io_kbd_hold(ChumbyIOState *s, QemuInputEvent *evt)
++{
++    if (s->kbd_nkeys < CHUMBY_IO_KBD_KEYS) {
++        s->kbd_keys[s->kbd_nkeys].key = evt->key.key;
++        s->kbd_keys[s->kbd_nkeys].down = evt->key.down;
++        s->kbd_nkeys++;
++    }
++}
++
++static void chumby_io_kbd_plug(void *opaque)
++{
++    ChumbyIOState *s = opaque;
++    Object *bus = object_resolve_path_type("", TYPE_USB_BUS, NULL);
++    USBDevice *kbd;
++    Error *err = NULL;
++
++    if (s->kbd) {
++        return;
++    }
++    if (!bus || !object_class_by_name("usb-kbd")) {
++        warn_report("chumby-io: no USB bus or usb-kbd to plug a keyboard "
++                    "into");
++        goto fail;
++    }
++    kbd = USB_DEVICE(qdev_new("usb-kbd"));
++    if (!usb_realize_and_unref(kbd, USB_BUS(bus), &err)) {
++        warn_reportf_err(err, "chumby-io: plugging in a keyboard: ");
++        goto fail;
++    }
++    trace_chumby_io_keyboard_plug(kbd->port ? kbd->port->path : "?");
++    s->kbd = kbd;
++    /* The keyboard put its handler first: the button's key comes first */
++    qemu_input_handler_activate(s->key_handler);
++    s->kbd_deadline = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                      CHUMBY_IO_KBD_TIMEOUT_MS;
++    timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                            CHUMBY_IO_KBD_POLL_MS);
++    return;
++
++fail:
++    s->usb_keyboard = false;
++    s->kbd_nkeys = 0;
++}
++
++/*
++ * The port's reset empties the keyboard's queue: type the held keys once
++ * the guest has configured it and its driver has had time to open it.
++ * Keys pressed meanwhile are held behind them.
++ */
++static void chumby_io_kbd_poll(void *opaque)
++{
++    ChumbyIOState *s = opaque;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    QemuInputEvent evt = { .type = INPUT_EVENT_KIND_KEY };
++
++    if (!s->kbd_settled) {
++        if (!s->kbd->configuration && now < s->kbd_deadline) {
++            timer_mod(s->kbd_timer, now + CHUMBY_IO_KBD_POLL_MS);
++            return;
++        }
++        trace_chumby_io_keyboard_ready(s->kbd->configuration, s->kbd_nkeys);
++        s->kbd_settled = true;
++        timer_mod(s->kbd_timer, now + CHUMBY_IO_KBD_SETTLE_MS);
++        return;
++    }
++    if (s->kbd_next < s->kbd_nkeys) {
++        evt.key.key = s->kbd_keys[s->kbd_next].key;
++        evt.key.down = s->kbd_keys[s->kbd_next].down;
++        s->kbd_next++;
++        qemu_input_event_pass_on(s->key_handler, NULL, &evt);
++        qemu_input_event_sync();
++        timer_mod(s->kbd_timer, now + CHUMBY_IO_KBD_POLL_MS);
++        return;
++    }
++    s->kbd_ready = true;
++    s->kbd_nkeys = 0;
++    s->kbd_next = 0;
++}
++
+ static void chumby_io_key_event(DeviceState *dev, QemuConsole *src,
+                                 QemuInputEvent *evt)
+ {
+@@ -110,7 +209,19 @@ static void chumby_io_key_event(DeviceState *dev, QemuConsole *src,
+         chumby_io_press_button(s, evt->key.down);
+         return;
+     }
+-    qemu_input_event_pass_on(s->key_handler, src, evt);
++    if (evt->type == INPUT_EVENT_KIND_KEY && s->kbd && !s->kbd_ready) {
++        chumby_io_kbd_hold(s, evt);
++        return;
++    }
++    if (qemu_input_event_pass_on(s->key_handler, src, evt) ||
++        evt->type != INPUT_EVENT_KIND_KEY || !s->usb_keyboard || s->kbd) {
++        return;
++    }
++    /* No keyboard took the key: plug one in, once a key goes down */
++    if (evt->key.down || s->kbd_nkeys) {
++        chumby_io_kbd_hold(s, evt);
++        qemu_bh_schedule(s->kbd_bh);
++    }
+ }
+ 
+ static const QemuInputHandler chumby_io_key_handler = {
+@@ -119,14 +230,19 @@ static const QemuInputHandler chumby_io_key_handler = {
+     .event = chumby_io_key_event,
+ };
+ 
+-/* A handler while a key is bound, ahead of any keyboard. */
++/*
++ * A handler while a key is bound or a keyboard may be plugged in, ahead
++ * of any keyboard.
++ */
+ static void chumby_io_update_key_handler(ChumbyIOState *s)
+ {
+-    if (s->button_qcode >= 0 && !s->key_handler) {
++    bool want = s->button_qcode >= 0 || s->usb_keyboard;
++
++    if (want && !s->key_handler) {
+         s->key_handler = qemu_input_handler_register(DEVICE(s),
+                                                      &chumby_io_key_handler);
+         qemu_input_handler_activate(s->key_handler);
+-    } else if (s->button_qcode < 0 && s->key_handler) {
++    } else if (!want && s->key_handler) {
+         qemu_input_handler_unregister(s->key_handler);
+         s->key_handler = NULL;
+     }
+@@ -187,6 +303,21 @@ static void chumby_io_set_button_key(Object *obj, const char *value,
+     }
+ }
+ 
++static bool chumby_io_get_usb_keyboard(Object *obj, Error **errp)
++{
++    return CHUMBY_IO(obj)->usb_keyboard;
++}
++
++static void chumby_io_set_usb_keyboard(Object *obj, bool value, Error **errp)
++{
++    ChumbyIOState *s = CHUMBY_IO(obj);
++
++    s->usb_keyboard = value;
++    if (DEVICE(s)->realized) {
++        chumby_io_update_key_handler(s);
++    }
++}
++
+ ChumbyState *qmp_query_chumby_state(Error **errp)
+ {
+     ChumbyIOState *s;
+@@ -222,11 +353,28 @@ static void chumby_io_reset(DeviceState *dev)
+     chumby_io_update_headphones(s);
+ }
+ 
++/*
++ * A keyboard given with -device puts its handler first when it is
++ * created, after the machine: put the button's key back in front.
++ */
++static void chumby_io_machine_done(Notifier *notifier, void *data)
++{
++    ChumbyIOState *s = container_of(notifier, ChumbyIOState, machine_done);
++
++    if (s->key_handler) {
++        qemu_input_handler_activate(s->key_handler);
++    }
++}
++
+ static void chumby_io_realize(DeviceState *dev, Error **errp)
+ {
+     ChumbyIOState *s = CHUMBY_IO(dev);
+ 
++    s->kbd_bh = qemu_bh_new(chumby_io_kbd_plug, s);
++    s->kbd_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, chumby_io_kbd_poll, s);
+     chumby_io_update_key_handler(s);
++    s->machine_done.notify = chumby_io_machine_done;
++    qemu_add_machine_init_done_notifier(&s->machine_done);
+     qemu_register_resettable(OBJECT(dev));
+ }
+ 
+@@ -235,10 +383,13 @@ static void chumby_io_unrealize(DeviceState *dev)
+     ChumbyIOState *s = CHUMBY_IO(dev);
+ 
+     qemu_unregister_resettable(OBJECT(dev));
++    qemu_remove_machine_init_done_notifier(&s->machine_done);
+     if (s->key_handler) {
+         qemu_input_handler_unregister(s->key_handler);
+         s->key_handler = NULL;
+     }
++    timer_free(s->kbd_timer);
++    qemu_bh_delete(s->kbd_bh);
+ }
+ 
+ static void chumby_io_init(Object *obj)
+@@ -268,6 +419,7 @@ static void chumby_io_init(Object *obj)
+     s->speaker_mute = true;
+     s->button_key = g_strdup("f12");
+     s->button_qcode = Q_KEY_CODE_F12;
++    s->usb_keyboard = true;
+ }
+ 
+ static void chumby_io_finalize(Object *obj)
+@@ -316,6 +468,12 @@ static void chumby_io_class_init(ObjectClass *klass, const void *data)
+     object_class_property_set_description(klass, "button-key",
+         "The key (a QKeyCode name, or none) that holds the top button "
+         "while it is down; default f12");
++    object_class_property_add_bool(klass, "usb-keyboard",
++                                   chumby_io_get_usb_keyboard,
++                                   chumby_io_set_usb_keyboard);
++    object_class_property_set_description(klass, "usb-keyboard",
++        "Plug a USB keyboard in when a key is pressed that no keyboard "
++        "takes; default on");
+ }
+ 
+ static const TypeInfo chumby_io_info = {
+diff --git a/hw/misc/trace-events b/hw/misc/trace-events
+index f0313af43..663779b8f 100644
+--- a/hw/misc/trace-events
++++ b/hw/misc/trace-events
+@@ -454,3 +454,5 @@ chumby_io_lcd(bool on) "on %d"
+ chumby_io_speaker_mute(bool muted) "muted %d"
+ chumby_io_headphones(bool inserted) "inserted %d"
+ chumby_io_button(bool pressed) "pressed %d"
++chumby_io_keyboard_plug(const char *port) "port %s"
++chumby_io_keyboard_ready(int configuration, int keys) "configuration %d, typing %d held keys"
+diff --git a/include/hw/misc/chumby_io.h b/include/hw/misc/chumby_io.h
+index 898fd6424..7c70bd323 100644
+--- a/include/hw/misc/chumby_io.h
++++ b/include/hw/misc/chumby_io.h
+@@ -30,6 +30,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ChumbyIOState, CHUMBY_IO)
+ 
+ #define CHUMBY_IO_BACKLIGHT_MAX 0xffff
+ 
++/* Keys held while a plugged-in keyboard is being set up */
++#define CHUMBY_IO_KBD_KEYS      32
++
+ struct ChumbyIOState {
+     DeviceState parent_obj;
+ 
+@@ -41,6 +44,22 @@ struct ChumbyIOState {
+     QemuInputHandlerState *key_handler;
+     char *button_key;
+     int button_qcode;
++    Notifier machine_done;
++
++    /* The keyboard plugged in on demand ("usb-keyboard") */
++    bool usb_keyboard;
++    struct USBDevice *kbd;
++    bool kbd_settled;
++    bool kbd_ready;
++    QEMUBH *kbd_bh;
++    QEMUTimer *kbd_timer;
++    int64_t kbd_deadline;
++    struct {
++        unsigned int key;
++        bool down;
++    } kbd_keys[CHUMBY_IO_KBD_KEYS];
++    int kbd_nkeys;
++    int kbd_next;
+ 
+     /* Driven by the guest */
+     uint32_t backlight;
