@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""tests/smoke/run [QEMU]: boots the chumby-classic machine on a kernel of
+a few instructions, made here, and checks it through chumby-machine: the
+console shows what the kernel writes to UART1, QMP answers with the board's
+lines, the screen can be dumped as a PNG, the top button and the
+accelerometer can be set, and QEMU quits when asked.
+
+No firmware, no network (chumby-machine runs QEMU with -nic none), no
+display: it runs on any CI runner. QEMU is the argument, else $QEMU, else
+build/obj/qemu-system-arm.
+"""
+import os
+import struct
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(here, "..", ".."))
+import chumby_machine as cm  # noqa: E402
+
+MESSAGE = b"chumby-classic: smoke kernel up\r\n"
+
+# The kernel, ARM code loaded at 0xC0008000 and entered in SVC mode with the
+# MMU off: it enables UART1 (0x1000A000), writes MESSAGE to its transmit
+# register and waits for interrupts that never come. Assembled with
+# clang --target=armv5te-none-eabi from:
+CODE = [
+    0xE59F0028,  #     ldr   r0, =0x1000a000     @ UART1
+    0xE3A01001,  #     mov   r1, #1
+    0xE5801080,  #     str   r1, [r0, #0x80]     @ UCR1: UARTEN
+    0xE3A01007,  #     mov   r1, #7
+    0xE5801084,  #     str   r1, [r0, #0x84]     @ UCR2: SRST, RXEN, TXEN
+    0xE28F2018,  #     adr   r2, msg
+    0xE4D21001,  # 1:  ldrb  r1, [r2], #1
+    0xE3510000,  #     cmp   r1, #0
+    0x15801040,  #     strne r1, [r0, #0x40]     @ UTXD
+    0x1AFFFFFB,  #     bne   1b
+    0xEE070F90,  # 2:  mcr   p15, 0, r0, c7, c0, 4  @ wait for interrupt
+    0xEAFFFFFD,  #     b     2b
+    0x1000A000,  #     .ltorg
+]                # msg: .asciz MESSAGE
+
+
+def kernel():
+    return struct.pack(f"<{len(CODE)}I", *CODE) + MESSAGE + b"\0"
+
+
+def check(what, ok, detail=""):
+    print(f"{'ok' if ok else 'FAIL'}: {what}{': ' + str(detail) if detail else ''}", flush=True)
+    if not ok:
+        raise cm.Error(f"{what} failed")
+
+
+def main():
+    # Absolute: QEMU runs in the machine's directory.
+    qemu = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else None
+    with tempfile.TemporaryDirectory(prefix="chumby-smoke-") as tmp:
+        zimage = os.path.join(tmp, "smoke.bin")
+        with open(zimage, "wb") as f:
+            f.write(kernel())
+        m = cm.Machine(os.path.join(tmp, "m"))
+        try:
+            m.start(zimage, qemu=qemu)
+            argv = m.config()["argv"]
+            check("QEMU runs with -nic none", "-nic" in argv and argv[argv.index("-nic") + 1] == "none")
+            check("the console", m.wait_log(r"smoke kernel up", 30).group(0) == "smoke kernel up")
+
+            s = m.status()
+            check("QMP and the board's lines", s.get("running") and "backlight" in s, s)
+
+            png = os.path.join(tmp, "screen.png")
+            m.shot(png)
+            with open(png, "rb") as f:
+                head = f.read(24)
+            size = struct.unpack(">II", head[16:24]) if head[:8] == b"\x89PNG\r\n\x1a\n" else None
+            check("a PNG of the 320x240 screen", size == (cm.W, cm.H), size)
+
+            m.button("down")
+            check("the top button", m.chumby_state().get("button") is True)
+            m.button("up")
+            m.accel(10, -20, 980)
+            with m.qmp() as q:
+                got = [q.qom_get(f"accel-{a}") for a in "xyz"]
+            check("the accelerometer", got == [10, -20, 980], got)
+        finally:
+            m.stop()
+        check("QEMU quits", not m.running())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except cm.Error as e:
+        sys.exit(f"tests/smoke/run: {e}")
