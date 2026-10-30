@@ -126,6 +126,12 @@ jobs:
           . ./qemu-release
           mkdir -p "dist/$name"
           cp out/obj/qemu-system-arm COPYING "dist/$name/"
+          # On Linux, without its debugging symbols, which are most of it.
+          # (On macOS the build signs it, and stripping would undo that.)
+          if [ "$RUNNER_OS" = Linux ]; then
+            strip "dist/$name/qemu-system-arm"
+          fi
+          "dist/$name/qemu-system-arm" -machine help | grep '^chumby-classic '
           {
             echo "qemu-system-arm with the chumby-classic machine"
             echo
@@ -143,14 +149,14 @@ jobs:
               echo "  apt-get install libglib2.0-0t64 libpixman-1-0 libpng16-16t64 zlib1g"
               echo
               echo "Shared libraries (ldd):"
-              ldd out/obj/qemu-system-arm | sed 's/ (0x[0-9a-f]*)$//'
+              ldd "dist/$name/qemu-system-arm" | sed 's/ (0x[0-9a-f]*)$//'
             else
               echo "Needs macOS 15 or later on Apple silicon, and Homebrew's glib,"
               echo "pixman and libpng:"
               echo "  brew install glib pixman libpng"
               echo
               echo "Shared libraries (otool -L):"
-              otool -L out/obj/qemu-system-arm | tail -n +2
+              otool -L "dist/$name/qemu-system-arm" | tail -n +2
             fi
           } > "dist/$name/RUNTIME"
           cat "dist/$name/RUNTIME"
