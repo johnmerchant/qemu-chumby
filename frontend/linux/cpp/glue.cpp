@@ -92,6 +92,12 @@ bool grab_window(rust::Str path)
     return w && w->grabWindow().save(qstr(path));
 }
 
+rust::String window_title()
+{
+    QQuickWindow *w = window();
+    return rust::String(w ? w->title().toStdString() : std::string());
+}
+
 void quit_app()
 {
     if (QQuickWindow *w = window())

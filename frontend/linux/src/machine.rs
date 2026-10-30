@@ -23,6 +23,7 @@ pub mod qobject {
         fn send_key(key: i32, modifiers: i32, scan_code: u32, text: &str, press: bool);
         fn send_mouse(x: f64, y: f64, kind: i32);
         fn grab_window(path: &str) -> bool;
+        fn window_title() -> String;
         fn quit_app();
     }
 
@@ -55,6 +56,8 @@ pub mod qobject {
         #[qproperty(i32, screen_height, cxx_name = "screenHeight")]
         #[qproperty(f64, scale)]
         #[qproperty(QString, exit_info, cxx_name = "exitInfo")]
+        // The window's title: what is running (launch::title).
+        #[qproperty(QString, title)]
         type Machine = super::MachineRust;
 
         /// A new frame is in rfb::FRAME.
@@ -222,6 +225,7 @@ pub struct MachineRust {
     screen_height: i32,
     scale: f64,
     exit_info: QString,
+    title: QString,
 
     qmp: Option<Arc<Qmp>>,
     session: Option<Arc<Session>>,
@@ -258,6 +262,7 @@ impl Default for MachineRust {
             screen_height: 240,
             scale: 0.0,
             exit_info: QString::default(),
+            title: QString::from("Chumby"),
             qmp: None,
             session: None,
             console: None,
@@ -338,6 +343,8 @@ impl qobject::Machine {
             }
         }
         o.state = path(state);
+        // --title named the command line's machine, not this one.
+        o.title = None;
         o.fast = fast;
         o.write = write;
         self.launch(o);
@@ -354,6 +361,7 @@ impl qobject::Machine {
         self.as_mut().set_state_dir(if o.nand.is_some() { opt(&o.state) } else { QString::default() });
         self.as_mut().set_fast(o.fast);
         self.as_mut().set_exit_info(QString::default());
+        self.as_mut().set_title(QString::from(crate::launch::title(&o, None).as_str()));
         self.as_mut().set_console_tty(QString::default());
         self.as_mut().set_paused(false);
         self.as_mut().set_phase(QString::from("starting"));
@@ -646,13 +654,35 @@ fn boot(o: Options, gen: u64, qt: Qt) {
         }
     };
 
-    // The console first, so that it sees the boot.
-    let console = Console::start(&sess.console, |data| {
+    // The console first, so that it sees the boot, and the kernel's
+    // version in its banner, for the title (in the first 64 KB, if at all).
+    let (vqt, vo) = (qt.clone(), o.clone());
+    // (what's left to look through, and the last few hundred bytes seen)
+    let banner = Mutex::new((65536usize, Vec::new()));
+    let console = Console::start(&sess.console, move |data| {
         let mut log = CONSOLE_LOG.lock().unwrap();
         log.extend_from_slice(data);
         if log.len() > 65536 {
             let cut = log.len() - 32768;
             log.drain(..cut);
+        }
+        let (left, tail) = &mut *banner.lock().unwrap();
+        if *left == 0 {
+            return;
+        }
+        *left = left.saturating_sub(data.len());
+        tail.extend_from_slice(data);
+        if tail.len() > 400 {
+            tail.drain(..tail.len() - 400);
+        }
+        if let Some(v) = crate::launch::linux_version(tail) {
+            *left = 0;
+            let t = crate::launch::title(&vo, Some(&v));
+            let _ = vqt.queue(move |m| {
+                if current(gen) {
+                    m.set_title(QString::from(t.as_str()));
+                }
+            });
         }
     });
     if let Err(e) = &console {

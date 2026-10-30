@@ -44,6 +44,9 @@ Options:
                       Chumby pixel (default: the size of a real Chumby's
                       screen, 71 x 53 mm, on your display); the window
                       can be resized, keeping its shape
+  --title TEXT        the window's title and QEMU's -name (default:
+                      "Chumby —" and the images folder's name, or the
+                      kernel's folder's)
   --no-panel          no control panel (the window only)
   --link SOCK         UART2 to the unix socket SOCK, which a program on
                       this machine listens on (no network)
@@ -84,7 +87,7 @@ def exec_mac_app(exe, a, qemu, extra):
     args = [exe]
     if a.images:
         args.append(a.images)
-    for opt in ("kernel", "nand", "audio", "state", "link"):
+    for opt in ("kernel", "nand", "audio", "state", "link", "title"):
         v = getattr(a, opt)
         if v:
             args += ["--" + opt, v]
@@ -301,6 +304,7 @@ def main():
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--state")
     ap.add_argument("--link")
+    ap.add_argument("--title")
     ap.add_argument("--no-panel", action="store_true")
     ap.add_argument("--scale", type=float)
     ap.add_argument("-h", "--help", action="store_true")
@@ -338,7 +342,9 @@ def main():
     qmp_path = os.path.join(tmp, "qmp")
     con_path = os.path.join(tmp, "con")
     machine = "chumby-classic"
-    args = [qemu, "-name", "Chumby", "-kernel", kernel,
+    import chumby_machine  # beside this script
+    title = a.title or chumby_machine.title(kernel, a.images, linked=bool(a.link))
+    args = [qemu, "-name", chumby_machine.qemu_name(title), "-kernel", kernel,
             "-qmp", f"unix:{qmp_path},server=on,wait=off",
             "-serial", f"unix:{con_path},server=on,wait=off",
             "-monitor", "none", "-nic", "none",
@@ -386,7 +392,7 @@ def main():
             return proc.wait() or 1
         import panel_qt  # frontend/, beside this script
         panel_qt.run(qmp, events, con_path, proc, display=display, audio=audio,
-                     snapshot=SNAPSHOT[a.fast], other=SNAPSHOT[not a.fast])
+                     snapshot=SNAPSHOT[a.fast], other=SNAPSHOT[not a.fast], title=title)
         return proc.wait()
     finally:
         if proc.poll() is None:

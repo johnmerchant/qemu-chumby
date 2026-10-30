@@ -210,6 +210,25 @@ final class Box<T>: @unchecked Sendable {
         #expect(throws: LaunchError.self) { try LaunchOptions.parse(["--bogus"]) }
     }
 
+    @Test func titles() throws {
+        #expect(try LaunchOptions.parse(["/x/dist-classic"]).windowTitle() == "Chumby — dist-classic")
+        let k = try LaunchOptions.parse(["--kernel", "/x/sideload-dist-stable/sideload-zImage"])
+        #expect(k.windowTitle() == "Chumby — sideload-dist-stable")
+        #expect(k.windowTitle(linux: "7.2.13-mx21-sideload") == "Chumby — sideload-dist-stable · Linux 7.2.13-mx21-sideload")
+        #expect(try LaunchOptions.parse(["/x/d", "--link", "/tmp/l.sock"]).windowTitle() == "Chumby — d · linked")
+        let t = try LaunchOptions.parse(["--kernel", "k", "--title", "Left, one"])
+        #expect(t.windowTitle(linux: "7.2") == "Left, one")
+        let a = try QemuCommand(qemu: "/q", options: t, features: QemuFeatures(), dir: "/tmp/x").arguments()
+        #expect(a[a.firstIndex(of: "-name")! + 1] == "guest=Left,, one")
+        let long = LaunchOptions.parse
+        #expect(try long(["/x/" + String(repeating: "a", count: 30) + String(repeating: "b", count: 30)])
+            .displayName == String(repeating: "a", count: 19) + "…" + String(repeating: "b", count: 20))
+        var w = LinuxVersionWatch()
+        #expect(w.feed(Array("Uncompressing... done.\r\nLinux vers".utf8)) == nil)
+        #expect(w.feed(Array("ion 2.6.16-chumby (b@h) #1\r\n".utf8)) == "2.6.16-chumby")
+        #expect(w.feed(Array("Linux version 9 \n".utf8)) == nil)
+    }
+
     @Test func alwaysNoNetwork() throws {
         var o = LaunchOptions()
         o.kernel = "/k"

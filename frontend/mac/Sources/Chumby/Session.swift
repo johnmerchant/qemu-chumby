@@ -32,6 +32,9 @@ final class Session: ObservableObject {
     @Published private(set) var screenSize = CGSize(width: 320, height: 240)
     /// Bumped when the console's terminal changes (at most 30 times a second).
     @Published private(set) var consoleVersion = 0
+    /// The kernel's version, once its banner is on the console.
+    @Published private(set) var linuxVersion: String?
+    private var versionWatch = LinuxVersionWatch()
 
     private(set) var props: Set<String> = []
     private(set) var features = QemuFeatures()
@@ -220,10 +223,11 @@ final class Session: ObservableObject {
         if let c = parts.console {
             let term = terminal
             let f = flags
-            c.onOutput = { bytes in
+            c.onOutput = { [weak self] bytes in
                 DispatchQueue.main.async {
                     term.feed(bytes)
                     f.consoleChanged()
+                    if let v = self?.versionWatch.feed(bytes) { self?.linuxVersion = v }
                 }
             }
             flags.onConsole = { [weak self] in self?.consoleVersion &+= 1 }

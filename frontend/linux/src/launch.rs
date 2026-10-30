@@ -35,6 +35,9 @@ Options:
                    (default: a real Chumby's screen, 71 x 53 mm)
   --link SOCK      UART2 to the unix socket SOCK, which a program here
                    listens on (no network)
+  --title TEXT     the window's title and QEMU's -name (default: \"Chumby —\"
+                   and the images folder's name, or the kernel's folder's,
+                   then the kernel's version once it prints it)
   --console TTY    join this terminal to the console on TTY (what the
                    Console button runs in your terminal app)
   -- ARGS          passed to QEMU as they are
@@ -67,6 +70,8 @@ pub struct Options {
     /// A unix socket on this machine for UART2, the link: QEMU connects to
     /// it.
     pub link: Option<PathBuf>,
+    /// The window's title and QEMU's -name; None: made from the kernel's path.
+    pub title: Option<String>,
     pub extra: Vec<String>,
     /// A test script (see test.rs), from $CHUMBY_DESKTOP_TEST.
     pub test_script: Option<PathBuf>,
@@ -112,6 +117,7 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
                 let v = val(&mut i)?;
                 o.scale = Some(v.parse().map_err(|_| format!("--scale {v}: not a number"))?)
             }
+            "--title" => o.title = Some(val(&mut i)?),
             "--console" => return Ok(Mode::Console(val(&mut i)?)),
             "--write" => o.write = true,
             "--fast" => o.fast = true,
@@ -139,6 +145,49 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
     }
     o.test_script = std::env::var_os("CHUMBY_DESKTOP_TEST").map(PathBuf::from);
     Ok(Mode::Run(o))
+}
+
+/// S, at most MAX characters: its middle elided.
+fn shortened(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_owned();
+    }
+    let head = (max - 1) / 2;
+    let tail: String = s.chars().skip(n - (max - 1 - head)).collect();
+    s.chars().take(head).collect::<String>() + "…" + &tail
+}
+
+/// The window's title, and QEMU's -name: --title, or "Chumby — " and the
+/// folder the kernel is in (an images folder, or
+/// sideload-dist-stable/sideload-zImage's), and the kernel's version once
+/// it is known.
+pub fn title(o: &Options, linux: Option<&str>) -> String {
+    if let Some(t) = &o.title {
+        return t.clone();
+    }
+    let Some(kernel) = &o.kernel else { return "Chumby".into() };
+    let kernel = std::path::absolute(kernel).unwrap_or_else(|_| kernel.clone());
+    let name = |p: Option<&Path>| p.and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned());
+    let name = name(kernel.parent()).or_else(|| name(Some(&kernel))).unwrap_or_default();
+    let mut t = format!("Chumby — {}", shortened(&name, 40));
+    if let Some(v) = linux {
+        t += &format!(" · Linux {}", shortened(v, 32));
+    }
+    if o.link.is_some() {
+        t += " · linked";
+    }
+    t
+}
+
+/// The kernel's version in its boot banner: the word after "Linux
+/// version ", once a space ends it.
+pub fn linux_version(console: &[u8]) -> Option<String> {
+    const KEY: &[u8] = b"Linux version ";
+    let at = console.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let rest = &console[at..];
+    let end = rest.iter().position(u8::is_ascii_whitespace)?;
+    (end > 0).then(|| String::from_utf8_lossy(&rest[..end]).into_owned())
 }
 
 fn executable(p: &Path) -> bool {
@@ -308,8 +357,9 @@ impl Session {
         let mut machine = "chumby-classic".to_owned();
         let s = |p: &Path| p.display().to_string();
         let mut args: Vec<String> = vec![
+            // guest= takes any text; a comma in it is doubled.
             "-name".into(),
-            "Chumby".into(),
+            format!("guest={}", title(o, None).replace(',', ",,")),
             "-kernel".into(),
             s(kernel),
             "-qmp".into(),
@@ -483,5 +533,26 @@ mod tests {
         assert_eq!(o.extra, args(&["-append", "x"]));
         assert!(parse(&args(&["--kernel", "k", "--", "-nic", "user"])).is_err());
         assert!(matches!(parse(&args(&["--console", "/dev/pts/3"])).unwrap(), Mode::Console(_)));
+    }
+
+    #[test]
+    fn titles() {
+        let run = |a: &[&str]| match parse(&args(a)).unwrap() {
+            Mode::Run(o) => o,
+            _ => panic!(),
+        };
+        assert_eq!(title(&run(&["/x/dist-classic"]), None), "Chumby — dist-classic");
+        let k = run(&["--kernel", "/x/sideload-dist-stable/sideload-zImage"]);
+        assert_eq!(title(&k, None), "Chumby — sideload-dist-stable");
+        assert_eq!(
+            title(&k, Some("7.2.13-mx21-sideload")),
+            "Chumby — sideload-dist-stable · Linux 7.2.13-mx21-sideload"
+        );
+        assert_eq!(title(&run(&["--kernel", "k", "--title=Left, one"]), Some("7")), "Left, one");
+        let long = format!("/x/{}{}/zImage", "a".repeat(30), "b".repeat(30));
+        assert_eq!(title(&run(&["--kernel", &long]), None), format!("Chumby — {}…{}", "a".repeat(19), "b".repeat(20)));
+        assert_eq!(title(&run(&["/x/d", "--link", "/tmp/l.sock"]), None), "Chumby — d · linked");
+        assert_eq!(linux_version(b"done.\r\nLinux vers"), None);
+        assert_eq!(linux_version(b"done.\r\nLinux version 2.6.16-chumby (b@h)"), Some("2.6.16-chumby".into()));
     }
 }

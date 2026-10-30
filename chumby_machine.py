@@ -95,6 +95,37 @@ class Error(Exception):
     """A failure to report to the person running the machine."""
 
 
+def shortened(s, most):
+    """S, at most MOST characters: its middle elided."""
+    if len(s) <= most:
+        return s
+    head = (most - 1) // 2
+    return s[:head] + "…" + s[len(s) - (most - 1 - head):]
+
+
+def title(kernel=None, images=None, linux=None, linked=False):
+    """What a machine is running, for a window's title and QEMU's -name:
+    "Chumby — " and the images folder's name, or the folder the kernel
+    is in (sideload-dist-stable/sideload-zImage: sideload-dist-stable),
+    the kernel's version (LINUX) once it is known, and "· linked" when
+    LINKED."""
+    path = images or (kernel and os.path.dirname(os.path.abspath(kernel)))
+    if not path:
+        return "Chumby"
+    name = os.path.basename(os.path.abspath(path)) or os.path.basename(kernel or "")
+    t = "Chumby — " + shortened(name, 40)
+    if linux:
+        t += " · Linux " + shortened(linux, 32)
+    if linked:
+        t += " · linked"
+    return t
+
+
+def qemu_name(text):
+    """-name's value for TEXT: guest= takes any text, a comma doubled."""
+    return "guest=" + text.replace(",", ",,")
+
+
 def find_qemu(given=None):
     """qemu-system-arm with the machine: GIVEN, $QEMU, this checkout's
     build/obj/, else the distro packages' qemu-chumby-system-arm or a
@@ -354,7 +385,7 @@ class Machine:
         return QMP(self.at(QMP_SOCK), timeout)
 
     def command_line(self, qemu, kernel, nand=None, nand_write=False, initrd=None, append=None,
-                     stick=None, fast=False, props=None, extra=(), link=None):
+                     stick=None, fast=False, props=None, extra=(), link=None, name=None):
         for a in extra:
             if a.split("=")[0] in NETWORK_OPTIONS and a != "-nic":
                 raise Error(f"{a} isn't allowed: the emulated Chumby has no network")
@@ -363,7 +394,8 @@ class Machine:
                 raise Error(f"{a} {extra[i + 1] if i + 1 < len(extra) else ''} isn't allowed: "
                             "the emulated Chumby has no network")
         m = MACHINE + "".join(f",{k}={v}" for k, v in (props or {}).items())
-        argv = [qemu, "-M", m, "-kernel", os.path.abspath(kernel), "-nic", "none",
+        argv = [qemu, "-M", m, "-name", qemu_name(name or title(kernel, linked=bool(link))),
+                "-kernel", os.path.abspath(kernel), "-nic", "none",
                 "-display", "none", "-monitor", "none",
                 "-qmp", f"unix:{QMP_SOCK},server=on,wait=off",
                 "-chardev", f"socket,id=con,path={CON_SOCK},server=on,wait=off,logfile={LOG},logappend=on",
@@ -385,7 +417,7 @@ class Machine:
         return argv + list(extra)
 
     def start(self, kernel, nand=None, nand_write=False, psp=None, initrd=None, append=None, stick=None,
-              fast=False, props=None, qemu=None, extra=(), timeout=30, link=None):
+              fast=False, props=None, qemu=None, extra=(), timeout=30, link=None, name=None):
         """Starts the machine, headless, and returns once its QMP socket
         answers. NAND is attached with snapshot=on (never changed) unless
         NAND_WRITE; with PSP, a directory, the machine boots a copy of
@@ -394,14 +426,14 @@ class Machine:
         guest writes it. LINK, a unix socket's path, is UART2's other end:
         QEMU connects to it, and again whenever it goes. PROPS are the
         machine's properties (accel-x=..., guid=...); EXTRA, more QEMU
-        options."""
+        options. NAME is QEMU's -name (default: title(KERNEL))."""
         if self.running():
             raise Error(f"the machine is already running ({self.path})")
         qemu = find_qemu(qemu)
         os.makedirs(self.path, exist_ok=True)
-        for name in (PID, QMP_SOCK, CON_SOCK, LOG, QEMU_LOG, "screen.ppm"):
+        for f in (PID, QMP_SOCK, CON_SOCK, LOG, QEMU_LOG, "screen.ppm"):
             try:
-                os.unlink(self.at(name))
+                os.unlink(self.at(f))
             except FileNotFoundError:
                 pass
         if not os.path.exists(kernel):
@@ -412,7 +444,8 @@ class Machine:
             copy = self.at("nand.img")
             nand_with(nand, copy, {"PSP": jffs2(psp, PARTITIONS["PSP"][1])})
             nand, nand_write = copy, True
-        argv = self.command_line(qemu, kernel, nand, nand_write, initrd, append, stick, fast, props, extra, link)
+        argv = self.command_line(qemu, kernel, nand, nand_write, initrd, append, stick, fast, props, extra,
+                                 link, name)
         with open(self.at(CONFIG), "w") as f:
             json.dump({"argv": argv, "stick": stick and os.path.abspath(stick), "started": time.time()}, f)
         open(self.at(LOG), "wb").close()
