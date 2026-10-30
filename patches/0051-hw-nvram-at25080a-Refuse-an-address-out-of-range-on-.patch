@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 12:43:37 +0000
+Subject: [PATCH 51/52] hw/nvram/at25080a: Refuse an address out of range on
+ load
+
+The address indexes the 1 KiB array and is kept in range as it
+advances, but one loaded from a migration stream was not checked.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/nvram/at25080a.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/hw/nvram/at25080a.c b/hw/nvram/at25080a.c
+index f53c22416..4c3d124f9 100644
+--- a/hw/nvram/at25080a.c
++++ b/hw/nvram/at25080a.c
+@@ -169,10 +169,18 @@ static void at25080a_init(Object *obj)
+     memset(s->mem, 0xff, sizeof(s->mem));
+ }
+ 
++static int at25080a_post_load(void *opaque, int version_id)
++{
++    AT25080AState *s = opaque;
++
++    return s->addr < AT25080A_SIZE ? 0 : -EINVAL;
++}
++
+ static const VMStateDescription vmstate_at25080a = {
+     .name = TYPE_AT25080A,
+     .version_id = 1,
+     .minimum_version_id = 1,
++    .post_load = at25080a_post_load,
+     .fields = (const VMStateField[]) {
+         VMSTATE_SSI_PERIPHERAL(parent_obj, AT25080AState),
+         VMSTATE_UINT8_ARRAY(mem, AT25080AState, AT25080A_SIZE),

@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 12:43:38 +0000
+Subject: [PATCH 52/52] hw/input/tsc2100: Refuse a register address out of
+ range on load
+
+A frame's register address picks one of the 64 registers in a page and
+is used before it is masked, so one loaded from a migration stream must
+be below 64.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/input/tsc2100.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+index a7010db55..58eb62a26 100644
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -561,6 +561,10 @@ static int tsc2100_post_load(void *opaque, int version_id)
+ {
+     TSC2100State *s = opaque;
+ 
++    /* The register a frame is at, within its page */
++    if (s->addr >= 64) {
++        return -EINVAL;
++    }
+     /* Reopen the audio voices and restart the link's clock. */
+     s->rate = 0;
+     tsc2100_audio_update(s);

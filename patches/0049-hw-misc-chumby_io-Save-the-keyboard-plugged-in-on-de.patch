@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 12:43:36 +0000
+Subject: [PATCH 49/52] hw/misc/chumby_io: Save the keyboard plugged in on
+ demand
+
+The board plugs in a USB keyboard when the first key goes unheard. The
+keyboard has migration state of its own, but a machine started afresh
+has no keyboard to load it into, so a snapshot taken after that failed
+to load: "Unknown section or instance '1/usb-kbd' 0".
+
+A subsection, sent while the keyboard is plugged in, saves the replay
+of held keys and its timer, and plugs the keyboard in on load, before
+the keyboard's own state, which comes later in the stream. A state
+without the keyboard has no subsection and loads as before.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst |  6 +--
+ hw/misc/chumby_io.c                | 81 +++++++++++++++++++++++++++---
+ include/hw/misc/chumby_io.h        | 14 +++---
+ 3 files changed, 85 insertions(+), 16 deletions(-)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index b3b4cc30f..f888b7a14 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -109,9 +109,9 @@ while the key is down, from any display's keyboard or from QMP's
+ first key pressed plugs a USB keyboard (``usb-kbd``) into a free port of
+ the root hub, as a user would plug one in to type: the keys are held
+ until the guest has configured it (for up to 10 seconds), then typed
+-into it. The machine's ``usb-keyboard=off`` option turns this off. The
+-keyboard plugged in this way is not on the command line, so a snapshot
+-taken with it loads only into a machine started with ``-device usb-kbd``.
++into it. The machine's ``usb-keyboard=off`` option turns this off. A
++snapshot taken with the keyboard plugged in plugs it in again as it
++loads, into a machine started with the same command line.
+ 
+ Headphones are plugged in and out with the machine's ``headphones``
+ property (``qom-set /machine headphones true``); the guest reads the
+diff --git a/hw/misc/chumby_io.c b/hw/misc/chumby_io.c
+index e4728a841..c99bc0819 100644
+--- a/hw/misc/chumby_io.c
++++ b/hw/misc/chumby_io.c
+@@ -129,30 +129,40 @@ static void chumby_io_kbd_hold(ChumbyIOState *s, QemuInputEvent *evt)
+     }
+ }
+ 
+-static void chumby_io_kbd_plug(void *opaque)
++/* Plugs in the keyboard, behind the button's key. */
++static bool chumby_io_kbd_attach(ChumbyIOState *s)
+ {
+-    ChumbyIOState *s = opaque;
+     Object *bus = object_resolve_path_type("", TYPE_USB_BUS, NULL);
+     USBDevice *kbd;
+     Error *err = NULL;
+ 
+-    if (s->kbd) {
+-        return;
+-    }
+     if (!bus || !object_class_by_name("usb-kbd")) {
+         warn_report("chumby-io: no USB bus or usb-kbd to plug a keyboard "
+                     "into");
+-        goto fail;
++        return false;
+     }
+     kbd = USB_DEVICE(qdev_new("usb-kbd"));
+     if (!usb_realize_and_unref(kbd, USB_BUS(bus), &err)) {
+         warn_reportf_err(err, "chumby-io: plugging in a keyboard: ");
+-        goto fail;
++        return false;
+     }
+     trace_chumby_io_keyboard_plug(kbd->port ? kbd->port->path : "?");
+     s->kbd = kbd;
+     /* The keyboard put its handler first: the button's key comes first */
+     qemu_input_handler_activate(s->key_handler);
++    return true;
++}
++
++static void chumby_io_kbd_plug(void *opaque)
++{
++    ChumbyIOState *s = opaque;
++
++    if (s->kbd) {
++        return;
++    }
++    if (!chumby_io_kbd_attach(s)) {
++        goto fail;
++    }
+     s->kbd_deadline = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                       CHUMBY_IO_KBD_TIMEOUT_MS;
+     timer_mod(s->kbd_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+@@ -427,6 +437,59 @@ static void chumby_io_finalize(Object *obj)
+     g_free(CHUMBY_IO(obj)->button_key);
+ }
+ 
++static bool chumby_io_kbd_needed(void *opaque)
++{
++    return CHUMBY_IO(opaque)->kbd;
++}
++
++/*
++ * The keyboard was plugged in when the state was saved: plug it in here
++ * too, before its own state, which comes later in the stream, is loaded.
++ */
++static int chumby_io_kbd_post_load(void *opaque, int version_id)
++{
++    ChumbyIOState *s = opaque;
++
++    if (s->kbd_nkeys < 0 || s->kbd_nkeys > CHUMBY_IO_KBD_KEYS ||
++        s->kbd_next < 0 || s->kbd_next > s->kbd_nkeys) {
++        return -EINVAL;
++    }
++    if (!s->kbd && !chumby_io_kbd_attach(s)) {
++        return -ENODEV;
++    }
++    return 0;
++}
++
++static const VMStateDescription vmstate_chumby_io_kbd_key = {
++    .name = TYPE_CHUMBY_IO "/keyboard/key",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(key, ChumbyIOKbdKey),
++        VMSTATE_BOOL(down, ChumbyIOKbdKey),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static const VMStateDescription vmstate_chumby_io_kbd = {
++    .name = TYPE_CHUMBY_IO "/keyboard",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = chumby_io_kbd_needed,
++    .post_load = chumby_io_kbd_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BOOL(kbd_settled, ChumbyIOState),
++        VMSTATE_BOOL(kbd_ready, ChumbyIOState),
++        VMSTATE_TIMER_PTR(kbd_timer, ChumbyIOState),
++        VMSTATE_INT64(kbd_deadline, ChumbyIOState),
++        VMSTATE_STRUCT_ARRAY(kbd_keys, ChumbyIOState, CHUMBY_IO_KBD_KEYS, 1,
++                             vmstate_chumby_io_kbd_key, ChumbyIOKbdKey),
++        VMSTATE_INT32(kbd_nkeys, ChumbyIOState),
++        VMSTATE_INT32(kbd_next, ChumbyIOState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
+ static const VMStateDescription vmstate_chumby_io = {
+     .name = TYPE_CHUMBY_IO,
+     .version_id = 1,
+@@ -439,6 +502,10 @@ static const VMStateDescription vmstate_chumby_io = {
+         VMSTATE_BOOL(headphones, ChumbyIOState),
+         VMSTATE_END_OF_LIST()
+     },
++    .subsections = (const VMStateDescription * const []) {
++        &vmstate_chumby_io_kbd,
++        NULL
++    },
+ };
+ 
+ static void chumby_io_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/misc/chumby_io.h b/include/hw/misc/chumby_io.h
+index 7c70bd323..30a407abb 100644
+--- a/include/hw/misc/chumby_io.h
++++ b/include/hw/misc/chumby_io.h
+@@ -33,6 +33,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(ChumbyIOState, CHUMBY_IO)
+ /* Keys held while a plugged-in keyboard is being set up */
+ #define CHUMBY_IO_KBD_KEYS      32
+ 
++typedef struct ChumbyIOKbdKey {
++    uint32_t key;
++    bool down;
++} ChumbyIOKbdKey;
++
+ struct ChumbyIOState {
+     DeviceState parent_obj;
+ 
+@@ -54,12 +59,9 @@ struct ChumbyIOState {
+     QEMUBH *kbd_bh;
+     QEMUTimer *kbd_timer;
+     int64_t kbd_deadline;
+-    struct {
+-        unsigned int key;
+-        bool down;
+-    } kbd_keys[CHUMBY_IO_KBD_KEYS];
+-    int kbd_nkeys;
+-    int kbd_next;
++    ChumbyIOKbdKey kbd_keys[CHUMBY_IO_KBD_KEYS];
++    int32_t kbd_nkeys;
++    int32_t kbd_next;
+ 
+     /* Driven by the guest */
+     uint32_t backlight;
