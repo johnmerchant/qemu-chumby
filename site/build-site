@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 """site/build-site --commit COMMIT --sha256 DIR [--out DIR]: the project's
-web page, one static HTML page and its stylesheet, made from README.md and
-the machine's docs page (docs/system/arm/chumby-classic.rst, as patches/
-leave it), so that it says what they say.
+web page, one short static page for developers, and its stylesheet.
+
+It says only what a newcomer needs to get running, and links the README
+for the rest. What it takes from README.md and qemu-release (the command,
+the QEMU release, the platforms, neochumby's link and the README's
+sections it links) and what it says in its own words (the summary, the
+legal sentence, the licence) are looked up or checked there. The README is read with a small
+parser for the Markdown it uses, which refuses anything else, and each
+piece is looked up by its heading or its first words, so that a README
+that no longer has what the page shows fails the build rather than
+leaving the page to drift.
 
 Its downloads are COMMIT's builds on the `prebuilt` release, one for each
 platform in the README's table of prebuilt binaries, with the SHA-256s in
@@ -12,13 +20,9 @@ tarballs beside them, if there, give their sizes). It writes OUT (default
 _site): index.html, style.css and downloads.json, the downloads as
 [{platform, name, url, sha256, sha256_url, size}].
 
-Python 3's standard library only. The README and the docs page are read
-with small parsers for the Markdown and reStructuredText they use, which
-refuse anything else, so that a construct they don't know fails the build
-rather than showing up mangled.
+Python 3's standard library only.
 """
 import argparse
-import glob
 import html
 import json
 import os
@@ -28,11 +32,12 @@ import sys
 
 REPO = "https://github.com/johnmerchant/qemu-chumby"
 RELEASE = REPO + "/releases/download/prebuilt"
-DOCS_RST = "docs/system/arm/chumby-classic.rst"
-LABELS = {
-    "linux-x86_64": "Linux, x86_64",
-    "linux-aarch64": "Linux, aarch64",
-    "macos-arm64": "macOS, Apple silicon",
+# Each platform's name, and what it can do in a few words: the README's
+# table of prebuilt binaries says it at length, and names the platforms.
+PLATFORMS = {
+    "linux-x86_64": ("Linux x86_64", "Static; headless, no audio."),
+    "linux-aarch64": ("Linux aarch64", "Static; headless, no audio."),
+    "macos-arm64": ("macOS, Apple silicon", "macOS 15+; window and audio."),
 }
 
 
@@ -46,7 +51,7 @@ def esc(s):
 
 def slug(text):
     """GitHub's anchor for a heading."""
-    text = re.sub(r"<[^>]+>", "", text).strip().lower()
+    text = re.sub(r"[`*]", "", text).strip().lower()
     text = re.sub(r"[^\w\- ]", "", text)
     return text.replace(" ", "-")
 
@@ -114,80 +119,37 @@ def md_blocks(text):
 
 def md_cells(row):
     row = row.strip()
-    assert row.startswith("|") and row.endswith("|")
     cells = re.split(r"(?<!\\)\|", row[1:-1])
     return [c.strip().replace("\\|", "|") for c in cells]
 
 
-class Links:
-    """Where the README's links go on the page: its own anchors that the
-    page has stay there, the others go to the README on GitHub, and
-    relative paths to the files at COMMIT."""
-
-    def __init__(self, commit):
-        self.commit = commit
-        self.ids = set()
-
-    def href(self, url):
-        if url.startswith("#"):
-            return url if url[1:] in self.ids else REPO + "#" + url[1:]
-        if re.match(r"[a-z]+:", url):
-            return url
-        return "%s/blob/%s/%s" % (REPO, self.commit, url)
-
-
-def md_inline(text, links):
+def md_inline(text, commit):
+    """A line of the README's Markdown as HTML: code, links and bold. Its
+    links to its own anchors go to the README on GitHub, relative ones to
+    the files at COMMIT."""
     codes = []
 
     def code(m):
         codes.append("<code>%s</code>" % esc(m.group(1)))
         return "\0%d\0" % (len(codes) - 1)
 
+    def href(url):
+        if url.startswith("#"):
+            return REPO + url
+        if re.match(r"[a-z]+:", url):
+            return url
+        return "%s/blob/%s/%s" % (REPO, commit, url)
+
     text = re.sub(r"`([^`]+)`", code, text)
     if "`" in text or "![" in text:
         raise Error("README.md: inline Markdown this script doesn't know: %r" % text)
     text = esc(text)
     text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
-                  lambda m: '<a href="%s">%s</a>' % (esc(links.href(html.unescape(m.group(2)))), m.group(1)), text)
+                  lambda m: '<a href="%s">%s</a>' % (esc(href(html.unescape(m.group(2)))), m.group(1)), text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
     if re.search(r"\*\S|\S\*|\[[^\]]*\]\(", text):
         raise Error("README.md: inline Markdown this script doesn't know: %r" % text)
     return re.sub(r"\0(\d+)\0", lambda m: codes[int(m.group(1))], text)
-
-
-def table_html(head, rows, inline, caption=None):
-    out = ['<div class="table" role="region" tabindex="0"%s>' % (' aria-label="%s"' % esc(caption) if caption else "")]
-    out.append("<table>")
-    if caption:
-        out.append('<caption class="vh">%s</caption>' % esc(caption))
-    out.append("<thead><tr>%s</tr></thead>" % "".join('<th scope="col">%s</th>' % inline(c) for c in head))
-    out.append("<tbody>")
-    for r in rows:
-        out.append("<tr><th scope=\"row\">%s</th>%s</tr>" % (inline(r[0]), "".join("<td>%s</td>" % inline(c) for c in r[1:])))
-    out.append("</tbody></table></div>")
-    return "\n".join(out)
-
-
-def code_html(text, label="Commands"):
-    return '<pre tabindex="0" aria-label="%s"><code>%s</code></pre>' % (esc(label), esc(text))
-
-
-def md_html(blocks, links, shift=0):
-    inline = lambda t: md_inline(t, links)  # noqa: E731
-    out = []
-    for b in blocks:
-        if b.kind == "heading":
-            n = min(b.level + shift, 6)
-            out.append('<h%d id="%s">%s</h%d>' % (n, slug(b.text), inline(b.text), n))
-        elif b.kind == "para":
-            out.append("<p>%s</p>" % inline(b.text))
-        elif b.kind == "list":
-            out.append("<ul>%s</ul>" % "".join("<li>%s</li>" % inline(i) for i in b.items))
-        elif b.kind == "code":
-            out.append(code_html(b.text))
-        elif b.kind == "table":
-            out.append(table_html(b.head, b.rows, inline))
-    return "\n".join(out)
 
 
 class Readme:
@@ -204,24 +166,14 @@ class Readme:
                 return self.blocks[i + 1:j]
         raise Error("README.md has no section %r" % title)
 
-    def take(self, title, start, codes=1):
-        """From the block of a section that begins with START through the
-        CODES-th code block after it."""
-        blocks = self.section(title)
-        for i, b in enumerate(blocks):
-            if getattr(b, "text", "").startswith(start):
-                for j in range(i, len(blocks)):
-                    if blocks[j].kind == "code":
-                        codes -= 1
-                        if not codes:
-                            return blocks[i:j + 1]
-                raise Error("README.md, %r: too few code blocks after %r" % (title, start))
-        raise Error("README.md, %r: nothing begins %r" % (title, start))
+    def anchor(self, title):
+        self.section(title)
+        return "%s#%s" % (REPO, slug(title))
 
     def para(self, title, start):
         for b in self.section(title):
             if b.kind == "para" and b.text.startswith(start):
-                return b
+                return b.text
         raise Error("README.md, %r: no paragraph begins %r" % (title, start))
 
     def table(self, title, first_col):
@@ -231,152 +183,10 @@ class Readme:
         raise Error("README.md, %r: no table headed %r" % (title, first_col))
 
 
-# reStructuredText, as the docs page writes it.
-
-def rst_inline(text, ids):
-    codes = []
-
-    def code(m):
-        codes.append("<code>%s</code>" % esc(m.group(1)))
-        return "\0%d\0" % (len(codes) - 1)
-
-    text = re.sub(r"``(.+?)``", code, text)
-
-    def ref(m):
-        target = "doc-" + slug(m.group(1))
-        if target not in ids:
-            raise Error("%s: no section %r" % (DOCS_RST, m.group(1)))
-        codes.append('<a href="#%s">%s</a>' % (target, esc(m.group(1))))
-        return "\0%d\0" % (len(codes) - 1)
-
-    text = re.sub(r"`([^`]+)`_", ref, text)
-    if re.search(r"[`|]|:\w+:`|\*\S|\[\d+\]_", text):
-        raise Error("%s: inline markup this script doesn't know: %r" % (DOCS_RST, text))
-    return re.sub(r"\0(\d+)\0", lambda m: codes[int(m.group(1))], esc(text))
-
-
-def rst_html(text, top):
-    """The page, its title at heading level TOP; ids prefixed doc-."""
-    lines = text.split("\n")
-    levels = {}
-    blocks = []
-    i = 0
-
-    def indented(i):
-        """The indented block from line i, dedented, and the line after it."""
-        body = []
-        while i < len(lines) and (lines[i].startswith(" ") or not lines[i].strip()):
-            body.append(lines[i])
-            i += 1
-        while body and not body[-1].strip():
-            body.pop()
-        while body and not body[0].strip():
-            body.pop(0)
-        n = min(len(l) - len(l.lstrip()) for l in body if l.strip())
-        return "\n".join(l[n:] for l in body), i
-
-    while i < len(lines):
-        line = lines[i]
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        if not line.strip():
-            i += 1
-        elif nxt and re.fullmatch(r"([=\-~^\"'])\1+", nxt) and len(nxt) >= len(line):
-            level = levels.setdefault(nxt[0], len(levels))
-            blocks.append(("heading", top + level, line))
-            i += 2
-        elif line.startswith(".. code-block::"):
-            body, i = indented(i + 1)
-            blocks.append(("code", body))
-        elif line.startswith(".."):
-            raise Error("%s:%d: a directive this script doesn't know: %r" % (DOCS_RST, i + 1, line))
-        elif line.startswith("- "):
-            items = []
-            while i < len(lines) and lines[i].strip():
-                if lines[i].startswith("- "):
-                    items.append(lines[i][2:])
-                elif lines[i].startswith("  "):
-                    items[-1] += " " + lines[i].strip()
-                else:
-                    raise Error("%s:%d: a list item?" % (DOCS_RST, i + 1))
-                i += 1
-            blocks.append(("list", items))
-        elif line.startswith(" "):
-            raise Error("%s:%d: an indented block this script doesn't know" % (DOCS_RST, i + 1))
-        else:
-            para = []
-            while i < len(lines) and lines[i].strip():
-                para.append(lines[i].strip())
-                i += 1
-            p = " ".join(para)
-            if p.endswith("::"):
-                blocks.append(("para", p[:-2].rstrip() + (":" if not p.endswith(" ::") else "")))
-                body, i = indented(i)
-                blocks.append(("code", body))
-            else:
-                blocks.append(("para", p))
-
-    ids = {"doc-" + slug(b[2]) for b in blocks if b[0] == "heading"}
-    out = []
-    for b in blocks:
-        if b[0] == "heading":
-            n = min(b[1], 6)
-            out.append('<h%d id="doc-%s">%s</h%d>' % (n, slug(b[2]), rst_inline(b[2], ids), n))
-        elif b[0] == "para":
-            out.append("<p>%s</p>" % rst_inline(b[1], ids))
-        elif b[0] == "list":
-            out.append("<ul>%s</ul>" % "".join("<li>%s</li>" % rst_inline(t, ids) for t in b[1]))
-        elif b[0] == "code":
-            out.append(code_html(b[1], "Example"))
-    return "\n".join(out)
-
-
-def docs_rst(patches):
-    """The docs page as the patches leave it: each patch's hunks for it,
-    applied in order, checking their context."""
-    header = "diff " + "--git a/%s b/%s\n" % (DOCS_RST, DOCS_RST)
-    lines = []
-    found = False
-    for patch in sorted(glob.glob(os.path.join(patches, "*.patch"))):
-        with open(patch, encoding="utf-8") as f:
-            text = f.read()
-        k = text.find(header)
-        if k < 0:
-            continue
-        found = True
-        rest = text[k + len(header):]
-        end = re.search(r"^(diff |-- \n)", rest, re.M)
-        body = (rest[:end.start()] if end else rest).split("\n")
-        offset = 0
-        i = 0
-        while i < len(body):
-            h = re.match(r"@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@", body[i])
-            i += 1
-            if not h:
-                continue
-            start, count = int(h.group(1)), int(h.group(2) or 1)
-            old, new = [], []
-            while i < len(body) and not body[i].startswith("@@"):
-                line = body[i]
-                if line.startswith(" ") or not line:
-                    old.append(line[1:])
-                    new.append(line[1:])
-                elif line.startswith("-"):
-                    old.append(line[1:])
-                elif line.startswith("+"):
-                    new.append(line[1:])
-                i += 1
-            # The blank line that ends the file's diff isn't context.
-            while len(old) > count and old[-1] == "" and new and new[-1] == "":
-                old.pop()
-                new.pop()
-            at = (start - 1 if count else start) + offset
-            if lines[at:at + len(old)] != old:
-                raise Error("%s: its hunk at line %d doesn't apply" % (os.path.basename(patch), start))
-            lines[at:at + len(old)] = new
-            offset += len(new) - len(old)
-    if not found:
-        raise Error("no patch in %s adds %s" % (patches, DOCS_RST))
-    return "\n".join(lines)
+def need(text, *words):
+    for w in words:
+        if w not in text:
+            raise Error("README.md no longer says %r, which the page does" % w)
 
 
 # The page.
@@ -405,101 +215,74 @@ def downloads(commit, sha_dir, platforms):
     return out
 
 
-def mib(n):
-    return "%.1f MiB" % (n / 1048576)
+def code_html(text, label):
+    return '<pre tabindex="0" aria-label="%s"><code>%s</code></pre>' % (esc(label), esc(text))
 
 
-def page(readme, rst, commit, dls):
-    links = Links(commit)
-    sections = [
-        ("overview", "Overview"),
-        ("what-is-modelled", "What is modelled"),
-        ("downloads", "Downloads"),
-        ("quick-start", "Quick start"),
-        ("documentation", "Documentation"),
-        ("legal", "Legal"),
-    ]
-    links.ids.update(s for s, _ in sections)
-    links.ids.update({"licence"})
-    md = lambda blocks, shift=1: md_html(blocks, links, shift)  # noqa: E731
-    inline = lambda t: md_inline(t, links)  # noqa: E731
+def page(readme, commit, qemu_version, dls):
+    title = readme.blocks[0].text
 
-    # The README's opening: its title, the one-line summary and the
-    # paragraphs before the first section, without the badges.
-    first = readme.blocks
-    assert first[0].kind == "heading" and first[0].level == 1
-    intro = []
-    for b in first[1:]:
+    # The README's opening: the command, neochumby's link (a badge) and the
+    # no-affiliation notice, which the page's one sentence shortens.
+    opening = []
+    for b in readme.blocks[1:]:
         if b.kind == "heading":
             break
-        if b.kind == "para" and b.text.startswith("[!["):
-            continue
-        intro.append(b)
-    tagline, intro = intro[0], intro[1:]
+        opening.append(b)
+    badges = next((b.text for b in opening if b.text.startswith("[![")), "")
+    m = re.search(r"\[!\[Companion: neochumby\]\([^)]*\)\]\((https://[^)]+)\)", badges)
+    if not m:
+        raise Error("README.md: no neochumby badge")
+    neochumby = m.group(1)
+    summary = next((b.text for b in opening if b.text.startswith("A QEMU machine for the Chumby Classic")), "")
+    m = re.search(r"`(qemu-system-arm -M chumby-classic)`", summary)
+    if not m:
+        raise Error("README.md: no summary naming qemu-system-arm -M chumby-classic")
+    command = m.group(1)
+    need(" ".join(b.text for b in opening if b.kind == "para"),
+         "i.MX21", "ARM926EJ-S", "not affiliated with or endorsed by Chumby Industries",
+         "anyone holding rights in Chumby")
+    need(" ".join(i for b in readme.section("Legal") if b.kind == "list" for i in b.items),
+         "It contains no Chumby software", "comes from your own device")
+    need(readme.para("Licence", "QEMU is GPL-2.0-or-later"), "GPL-2.0-or-later")
+    need(" ".join(b.text for b in readme.section("Control surface") if b.kind == "para"),
+         "QMP", "query-chumby-state")
 
-    modelled = readme.table("What is modelled", "Block")
-    prebuilt = readme.table("Prebuilt binaries", "Platform")
-    needs = readme.para("Prebuilt binaries", "They need nothing installed")
-    both = readme.para("Prebuilt binaries", "Both have VNC")
-    quarantine = readme.para("Prebuilt binaries", "On macOS, `curl` and `gh`")
-    images = readme.section("Images")[:2]
-
-    rows = {}
-    for r in prebuilt.rows:
-        for p in re.findall(r"`([^`]+)`", r[0]):
-            rows[p] = r
-    by = {d["platform"]: d for d in dls}
+    for d in dls:
+        if d["platform"] not in PLATFORMS:
+            raise Error("README.md: a platform this page doesn't describe: %s" % d["platform"])
 
     cards = []
     for d in dls:
-        r = rows[d["platform"]]
-        size = " &middot; %s" % mib(d["size"]) if d["size"] else ""
-        cant = ('<p class="cant"><strong>Can&rsquo;t:</strong> %s</p>' % inline(r[2])) if r[2] else ""
-        cards.append("""<article class="card" aria-labelledby="dl-{p}">
-<h3 id="dl-{p}">{label} <span class="plat">{p}</span></h3>
-<p class="needs">Needs nothing installed</p>
-<p>{what}</p>
-{cant}
-<p class="get"><a class="button" href="{url}">Download <span class="vh">for {label}</span><span class="fmt">.tar.xz{size}</span></a>
-<a href="{sha_url}">.sha256</a></p>
-<p class="sha"><span class="k">SHA-256</span> <code>{sha}</code></p>
-</article>""".format(p=esc(d["platform"]), label=esc(LABELS.get(d["platform"], d["platform"])),
-                     what=inline(r[1]), cant=cant, url=esc(d["url"]), sha_url=esc(d["sha256_url"]),
-                     sha=esc(d["sha256"]), size=size))
+        label, note = PLATFORMS[d["platform"]]
+        size = " (%.1f MiB)" % (d["size"] / 1048576) if d["size"] else ""
+        cards.append("""<li class="card">
+<h3>{label}</h3>
+<p class="note">{note}</p>
+<p><a class="button" href="{url}">Download<span class="vh"> for {label}</span> .tar.xz<span class="size">{size}</span></a></p>
+<p class="sha"><a href="{sha_url}">SHA-256<span class="vh"> file for {label}</span></a> <code>{sha}</code></p>
+</li>""".format(label=esc(label), note=esc(note), url=esc(d["url"]), sha_url=esc(d["sha256_url"]),
+                sha=esc(d["sha256"]), size=esc(size)))
 
-    linux = by.get("linux-x86_64") or dls[0]
-    get = "\n".join([
-        "curl -LO %s" % linux["url"],
-        "curl -LO %s" % linux["sha256_url"],
-        "sha256sum -c %s.sha256      # macOS: shasum -a 256 -c" % linux["name"],
-        "tar xJf %s" % linux["name"],
-        "%s/qemu-system-arm -M help | grep chumby" % linux["name"][:-len(".tar.xz")],
+    d0 = next((d for d in dls if d["platform"] == "linux-x86_64"), dls[0])
+    run = "\n".join([
+        "tar xJf qemu-chumby-*-%s.tar.xz" % d0["platform"],
+        "cd qemu-chumby-*-%s" % d0["platform"],
+        "./qemu-system-arm -M chumby-classic -kernel zImage \\",
+        "    -nic none -display none -serial stdio \\",
+        "    -qmp unix:qmp.sock,server=on,wait=off",
     ])
-    running = readme.section("Running")
 
-    quick = [
-        ("qs-chumby-app", "Chumby.app", "macOS",
-         md(readme.take("The Mac app: Chumby.app", "On macOS there is a native app", codes=2), 2),
-         "the-mac-app-chumbyapp"),
-        ("qs-chumby-desktop", "chumby-desktop", "Linux",
-         md([readme.section("The Linux app: chumby-desktop")[0]]
-            + readme.take("The Linux app: chumby-desktop", "It needs Qt", codes=1), 2),
-         "the-linux-app-chumby-desktop"),
-        ("qs-chumby-machine", "chumby-machine", "scripts and tests",
-         md(readme.take("Scripts and tests: chumby-machine", "`chumby-machine` runs", codes=1), 2)
-         + '\n<details><summary>All its commands</summary>\n%s\n</details>'
-         % md([readme.table("Scripts and tests: chumby-machine", "Command")], 2),
-         "scripts-and-tests-chumby-machine"),
+    more = [
+        (readme.anchor("Building"), "Build from source"),
+        (readme.anchor("What is modelled"), "What&rsquo;s emulated"),
+        (readme.anchor("Control surface"), "Drive it from code (QMP)"),
+        (readme.anchor("Scripts and tests: chumby-machine"), "chumby-machine (scripts, tests)"),
+        (readme.anchor("The Mac app: Chumby.app"), "Chumby.app (macOS)"),
+        (readme.anchor("The Linux app: chumby-desktop"), "chumby-desktop (Linux)"),
+        (readme.anchor("Images"), "Images from your own Chumby"),
     ]
-    qs_html = "\n".join("""<article class="qs" aria-labelledby="{id}">
-<h3 id="{id}">{name} <span class="plat">{for_}</span></h3>
-{body}
-<p class="more"><a href="{repo}#{anchor}">More in the README<span class="vh"> about {name}</span></a></p>
-</article>""".format(id=i, name=esc(n), for_=esc(f), body=b, repo=REPO, anchor=a) for i, n, f, b, a in quick)
-
-    nav = "\n".join('<li><a href="#%s">%s</a></li>' % (i, esc(t)) for i, t in sections)
     short = commit[:12]
-    title = esc(first[0].text)
 
     return """<!doctype html>
 <html lang="en">
@@ -507,105 +290,65 @@ def page(readme, rst, commit, dls):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>{title}: the Chumby Classic in QEMU</title>
-<meta name="description" content="{desc}">
+<title>{title}</title>
+<meta name="description" content="A QEMU machine for the Chumby Classic: {command}">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='3' width='14' height='10' rx='2' fill='%23127a6a'/%3E%3Crect x='3' y='5' width='10' height='6' rx='.5' fill='%23e9f6f3'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <a class="skip" href="#main">Skip to the content</a>
-<header class="top">
-<div class="wrap bar">
-<a class="name" href="#overview">{title}</a>
-<nav aria-label="Sections"><ul>
-{nav}
-</ul></nav>
-<a class="gh" href="{repo}">Source on GitHub</a>
-</div>
+<main id="main" class="wrap">
+
+<header class="intro">
+<h1>{title}</h1>
+<p class="lead">The Chumby Classic&rsquo;s i.MX21 (ARM926EJ-S) and board devices in QEMU {qemu}:
+<code class="nw">{command}</code>.</p>
+<p class="links"><a href="{repo}">Source on GitHub</a> <a href="{neochumby}">neochumby</a></p>
 </header>
-<main id="main">
-<section id="overview" class="hero" aria-labelledby="overview-h">
-<div class="wrap">
-<h1 id="overview-h">{title}</h1>
-<p class="tagline">{tagline}</p>
-{intro}
-<p class="ctas"><a class="button" href="#downloads">Downloads</a> <a class="button alt" href="#quick-start">Quick start</a></p>
-</div>
-</section>
 
-<section id="what-is-modelled" aria-labelledby="what-is-modelled-h">
-<div class="wrap">
-<h2 id="what-is-modelled-h">What is modelled</h2>
-{modelled}
-</div>
-</section>
-
-<section id="downloads" aria-labelledby="downloads-h">
-<div class="wrap">
-<h2 id="downloads-h">Downloads</h2>
-<p>The newest build of <code>qemu-system-arm</code> with the machine, from commit
-<a href="{repo}/commit/{commit}"><code>{short}</code></a> on main, for each platform:
-from the <a href="{repo}/releases/tag/prebuilt"><code>prebuilt</code></a> release, which keeps
-the builds of the newest 100 commits. {needs}</p>
-<div class="cards">
+<section aria-labelledby="download">
+<h2 id="download">Download</h2>
+<p>Main&rsquo;s newest build (<a href="{repo}/commit/{commit}"><code>{short}</code></a>). Needs nothing
+installed.</p>
+<ul class="cards">
 {cards}
-</div>
-<p>{both}</p>
-<p>{quarantine}</p>
-<h3 id="fetch-and-check">Fetch, check and run</h3>
-{get}
-<p>Then boot your own Chumby&rsquo;s kernel and flash:</p>
-{running}
-</div>
+</ul>
 </section>
 
-<section id="quick-start" aria-labelledby="quick-start-h">
-<div class="wrap">
-<h2 id="quick-start-h">Quick start</h2>
-{images}
-<div class="qss">
-{quick}
-</div>
-</div>
+<section aria-labelledby="run">
+<h2 id="run">Run</h2>
+{run}
+<p>A zImage of your own Chumby&rsquo;s kernel, or any for the MX21ADS. The console is on your
+terminal, QMP on <code>qmp.sock</code>.</p>
 </section>
 
-<section id="documentation" class="doc" aria-labelledby="documentation-h">
-<div class="wrap">
-<h2 id="documentation-h">Documentation</h2>
-<p class="note">The machine&rsquo;s page in QEMU&rsquo;s documentation, <code>{rst_path}</code>, as the patches add it.</p>
-<div class="rst">
-{rst}
-</div>
-</div>
+<section aria-labelledby="more">
+<h2 id="more">More in the README</h2>
+<ul class="more">
+{more}
+</ul>
 </section>
 
-<section id="legal" aria-labelledby="legal-h">
-<div class="wrap">
-<h2 id="legal-h">Legal</h2>
-{legal}
-<h3 id="licence">Licence</h3>
-{licence}
-</div>
+<section aria-labelledby="legal">
+<h2 id="legal">Legal</h2>
+<p>An independent project, not affiliated with or endorsed by Chumby Industries or anyone holding rights
+in Chumby; it contains none of the Chumby&rsquo;s software, so bring your own firmware.
+<a href="{legal_href}">The full Legal section</a>.</p>
+<p>Licence: GPL-2.0-or-later.</p>
 </section>
 </main>
-<footer>
-<div class="wrap">
-<p>Made from <a href="{repo}/tree/{commit}">{title} at <code>{short}</code></a>&rsquo;s README and docs.
-GPL-2.0-or-later. Not affiliated with or endorsed by Chumby Industries, Blue Octy or anyone holding
-rights in Chumby; &ldquo;Chumby&rdquo; is a trademark of its owner.</p>
-</div>
+<footer class="wrap">
+<p><a href="{repo}/releases/tag/prebuilt">Older builds</a> &middot;
+<a href="downloads.json">downloads.json</a></p>
 </footer>
 </body>
 </html>
 """.format(
-        title=title, desc=esc(re.sub(r"`", "", tagline.text)), nav=nav, repo=REPO,
-        tagline=inline(tagline.text), intro=md(intro),
-        modelled=table_html(modelled.head, modelled.rows, inline, "What is modelled"),
-        commit=esc(commit), short=esc(short), needs=inline(needs.text),
-        cards="\n".join(cards), both=inline(both.text), quarantine=inline(quarantine.text),
-        get=code_html(get), running=md([b for b in running if b.kind == "code"][:1]),
-        images=md(images), quick=qs_html, rst_path=esc(DOCS_RST), rst=rst_html(rst, 3),
-        legal=md(readme.section("Legal")), licence=md(readme.section("Licence")))
+        title=esc(title), command=esc(command), qemu=esc(qemu_version), repo=REPO,
+        neochumby=esc(neochumby), commit=esc(commit), short=esc(short), cards="\n".join(cards),
+        run=code_html(run, "Unpack and boot"),
+        more="\n".join('<li><a href="%s">%s</a></li>' % (esc(h), t) for h, t in more),
+        legal_href=readme.anchor("Legal"))
 
 
 def main():
@@ -620,14 +363,17 @@ def main():
         raise Error("--commit: a full commit ID, please")
     with open(os.path.join(a.root, "README.md"), encoding="utf-8") as f:
         readme = Readme(f.read())
-    rst = docs_rst(os.path.join(a.root, "patches"))
+    with open(os.path.join(a.root, "qemu-release"), encoding="utf-8") as f:
+        m = re.search(r"^version=([\w.]+)$", f.read(), re.M)
+    if not m:
+        raise Error("qemu-release: no version")
     platforms = []
     for r in readme.table("Prebuilt binaries", "Platform").rows:
         platforms += re.findall(r"`([^`]+)`", r[0])
     if not platforms:
         raise Error("README.md: no platforms in the prebuilt binaries' table")
     dls = downloads(a.commit, a.sha256, platforms)
-    text = page(readme, rst, a.commit, dls)
+    text = page(readme, a.commit, m.group(1), dls)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "index.html"), "w", encoding="utf-8") as f:
         f.write(text)
