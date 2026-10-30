@@ -1,0 +1,707 @@
+Description: hw/arm: Add the Chumby Classic machine
+ The Chumby Classic: an i.MX21 with 64 MiB of SDRAM, 64 MiB of NAND flash
+ (-drive if=mtd), a 320x240 LCD with a TSC2100 touchscreen and audio
+ codec on CSPI3 and its pen interrupt on GPIO PE19, the crypto processor
+ on UART3, the sensor card on CSPI1 and the board's lines.
+ .
+ It boots a zImage directly as an MX21ADS (machine type 851), the type
+ the Chumby's own kernel is built for, with the stock command line unless
+ -append is given. The device's own 2.6.16 kernel and root disk run
+ unmodified to its control panel.
+ .
+ - Audio: the codec's link goes to the AUDMUX's peripheral ports (its
+   DIN on port 2 and DOUT on port 1, as the stock driver routes them),
+   with the usual "audiodev" machine property.
+ - Board lines: a chumby-io device takes the PWM's output, the keypad
+   port's rows and columns and the LCD's brightness. Its properties
+   (button, button-key, headphones, usb-keyboard) are the machine's too,
+   so -M chumby-classic,button-key=pause and qom-set /machine headphones
+   true work.
+ - Identity: the guid (XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX, 32 hex
+   digits), serial (16 letters or digits) and hwversion (MAJOR.MINOR,
+   each 0 to 255) properties go to the crypto processor; the hardware
+   version also goes on the default kernel command line, as
+   chumby_hwversion=. The stock software takes the device ID from the
+   GUID ("cpi -p", via guidgen.sh, in download_cp's control panel
+   request), so each emulated Chumby should have its own. A malformed
+   value is refused at startup with an error saying what was expected.
+   The identity is fixed once the machine is created: the parts were
+   given it then, so a later set is refused rather than reported
+   without the guest seeing it.
+ - Sensor card: the stock kernel's chumby_accel module drives it on
+   CSPI1 (SPI_CHAN 0). The card's two select lines are GPIOs, PD28 (SS0)
+   and PD27 (SS1), which the driver sets by hand and the card decodes
+   into four chip selects: SS1:SS0 = 2 is the Kionix accelerometer, 1
+   the Atmel AT25080A "DC ID" EEPROM, and 3 is idle, which the driver
+   always passes through between the two. A decoder on the board drives
+   the parts' chip selects from the GPIO outputs, and CSPI1 hands them
+   bytes (its "bytewise" mode). A machine has no vmsd, so the board
+   registers a small VMState of its own, "chumby-classic", for the
+   decoder (a value of 4 or more is refused; a state without it loads
+   with the decoder idle); the parts' own state says whether each is
+   selected, so the decoder's outputs are not driven again on load.
+ - Accelerometer: /machine/accel. The machine properties accel-x,
+   accel-y and accel-z, in milli-g, set its x-mg, y-mg and z-mg, at
+   startup (-M) or at run time (qom-set /machine accel-x 500). They start
+   at 0, 0, 1000: 1 g on Z, as for the part lying flat. Which way up the
+   card sits in a Chumby isn't known; that is a guess, and the stock
+   software doesn't settle it.
+ - DC ID EEPROM: contents in the stock layouts, consistent with the
+   identity. 0x300 holds the revision, 00.00.MAJOR.MINOR from the
+   hardware version, and 0x304 the last 12 characters of the serial
+   number, which the driver reads into /proc/DCversion. 0x000 holds what
+   the stock "dcid" tool reads (dcid -o, sent with the control panel
+   request by download_cp): the magic "sexi", one tag and "pus!", a tag
+   being a big-endian 16-bit length with bit 7 marking a container, a
+   4-character name and its tags or value bytes. The tags are made up,
+   as no real card's contents are known:
+   <dcid><vers>01</vers><hwvr>MAJOR MINOR</hwvr></dcid>
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -871,6 +871,7 @@ Chumby Classic (i.MX21)
+ M: John Merchant <john@johnmerchant.dev>
+ L: qemu-arm@nongnu.org
+ S: Maintained
++F: hw/arm/chumby_classic.c
+ F: hw/arm/fsl-imx21.c
+ F: hw/audio/imx21_*.c
+ F: hw/block/imx21_nfc.c
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -496,6 +496,16 @@ config FSL_IMX21
+     select SSI
+     select USB_IMX21
+     select WDT_IMX2
++
++config CHUMBY_CLASSIC
++    bool
++    default y
++    depends on TCG && ARM
++    select FSL_IMX21
++    select TSC2100
++    select KXP74
++    select AT25080A
++
+ config FSL_IMX25
+     bool
+     default y
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+new file mode 100644
+--- /dev/null
++++ b/hw/arm/chumby_classic.c
+@@ -0,0 +1,597 @@
++/*
++ * Chumby Classic
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The Chumby Classic: a Freescale i.MX21 with 64 MiB of SDRAM, 64 MiB of
++ * small-page NAND flash, a 320x240 touchscreen LCD (a TI TSC2100 on
++ * CSPI3, its PINTDAV output on GPIO PE19), a crypto processor on UART3
++ * and the top button (the "squeeze switch") on keypad row 0, low while
++ * pressed. UART1 is the console.
++ *
++ * The board boots Linux directly: -kernel takes a zImage and the kernel
++ * is entered as on an MX21ADS (machine type 851), which is what the
++ * Chumby's own kernel is built for. The NAND image is "-drive if=mtd".
++ *
++ * The TSC2100 is also the audio codec, on the AUDMUX's peripheral ports:
++ * its DIN on port 2, its DOUT on port 1; the stock kernel routes SSI1 to
++ * both. The machine's "audiodev" property picks its audio backend.
++ *
++ * The board's own lines (backlight, LCD power, speaker mute, headphone
++ * jack, top button) are the chumby-io device. Its "button", "headphones"
++ * and "button-key" properties are the machine's too: qom-set /machine
++ * button true presses the top button.
++ *
++ * CSPI1 goes to the sensor card. Its select lines are GPIOs, PD28 (SS0)
++ * and PD27 (SS1), which the card decodes into four chip selects:
++ * SS1:SS0 = 2 selects the Kionix KXP74 accelerometer, 1 the AT25080A
++ * "DC ID" EEPROM, 3 nothing (idle). The accelerometer is /machine/accel;
++ * the machine's accel-x, accel-y and accel-z properties set its x-mg,
++ * y-mg and z-mg, the acceleration in milli-g along each of its axes, at
++ * startup or at any time after.
++ *
++ * The device identity, which the crypto processor reports and the EEPROM
++ * holds part of, is set with the machine properties "guid", "serial"
++ * (16 characters) and "hwversion" ("major.minor"), e.g.
++ * -M chumby-classic,guid=01234567-89AB-4CDE-8F01-23456789ABCD
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/arm/fsl-imx21.h"
++#include "hw/arm/boot.h"
++#include "hw/arm/machines-qom.h"
++#include "hw/char/chumby_cp.h"
++#include "hw/core/boards.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "hw/input/tsc2100.h"
++#include "hw/misc/chumby_io.h"
++#include "hw/nvram/at25080a.h"
++#include "hw/sensor/kxp74.h"
++#include "hw/ssi/ssi.h"
++#include "migration/vmstate.h"
++#include "qemu/cutils.h"
++#include "qemu/uuid.h"
++#include "qemu/units.h"
++#include "system/address-spaces.h"
++#include "qemu/error-report.h"
++#include "qom/object.h"
++#include "system/blockdev.h"
++#include "system/qtest.h"
++
++#define CHUMBY_MACH_TYPE        851     /* MACH_TYPE_MX21ADS */
++
++/*
++ * The command line the stock boot loader gives the first root disk; the
++ * hardware version is appended.
++ */
++#define CHUMBY_DEFAULT_CMDLINE  "console=ttyS0,38400 root=/dev/mtdblock5 " \
++                                "rootfstype=cramfs init=/linuxrc " \
++                                "chumby_hwversion="
++
++/* PINTDAV: GPIO port E, pin 19 */
++#define CHUMBY_PINTDAV_GPIO     (4 * IMX21_GPIO_PINS_PER_PORT + 19)
++
++/* The codec's serial data: DIN on AUDMUX peripheral port 2, DOUT on 1 */
++#define CHUMBY_CODEC_DIN_PORT   1
++#define CHUMBY_CODEC_DOUT_PORT  0
++
++/* Keypad port pins: rows 0-7, then columns 0-7 */
++#define CHUMBY_BUTTON_KPP_PIN   0       /* top button, row 0 */
++#define CHUMBY_HPIN_KPP_PIN     3       /* headphone detect, row 3 */
++#define CHUMBY_LCD_ON_KPP_PIN   (8 + 2) /* LCD power, column 2 */
++#define CHUMBY_MUTE_KPP_PIN     (8 + 4) /* speaker mute, column 4 */
++
++/* The sensor card's select lines, SS0 and SS1: GPIO port D, pins 28, 27 */
++#define CHUMBY_SENSOR_SS0_GPIO  (3 * IMX21_GPIO_PINS_PER_PORT + 28)
++#define CHUMBY_SENSOR_SS1_GPIO  (3 * IMX21_GPIO_PINS_PER_PORT + 27)
++
++/* SS1:SS0 as the sensor card decodes them */
++#define CHUMBY_SENSOR_CS_DCID   1
++#define CHUMBY_SENSOR_CS_ACCEL  2
++#define CHUMBY_SENSOR_CS_IDLE   3
++#define CHUMBY_SENSOR_NUM_CS    4
++
++/* The accelerometer standing upright and still, in milli-g */
++#define CHUMBY_ACCEL_UPRIGHT_X  0
++#define CHUMBY_ACCEL_UPRIGHT_Y  0
++#define CHUMBY_ACCEL_UPRIGHT_Z  1000
++
++/*
++ * The DC ID EEPROM. The stock driver reads a four-byte revision at 0x300
++ * and a 12-character serial number at 0x304 (/proc/DCversion). The stock
++ * "dcid" tool reads 0x000-0x2ff: "sexi", one tag, "pus!". A tag is a
++ * 16-bit big-endian length, counting its own 6-byte header, with bit 7
++ * set for a container of tags; a 4-character name; then its tags or its
++ * value bytes, which the tool prints in hex.
++ */
++#define CHUMBY_DCID_REV_ADDR    0x300
++#define CHUMBY_DCID_SERIAL_ADDR 0x304
++#define CHUMBY_DCID_SERIAL_LEN  12
++#define CHUMBY_DCID_TAG_HDR     6
++#define CHUMBY_DCID_TAG_PARENT  0x80
++
++#define TYPE_CHUMBY_CLASSIC_MACHINE MACHINE_TYPE_NAME("chumby-classic")
++OBJECT_DECLARE_SIMPLE_TYPE(ChumbyClassicState, CHUMBY_CLASSIC_MACHINE)
++
++struct ChumbyClassicState {
++    MachineState parent_obj;
++
++    FslIMX21State soc;
++    ChumbyIOState io;
++    /* The device identity */
++    char *guid;
++    char *serial;
++    char *hwversion;
++    QemuUUID guid_bytes;
++    uint8_t hw_major, hw_minor;
++
++    /* The accelerometer, and the acceleration it starts with */
++    DeviceState *accel;
++    int32_t accel_mg[KXP74_AXES];
++
++    /* The sensor card's chip-select decoder: SS1:SS0, and its outputs */
++    uint32_t sensor_sel;
++    qemu_irq sensor_cs[CHUMBY_SENSOR_NUM_CS];
++};
++
++static struct arm_boot_info chumby_binfo;
++
++/* Wires the board's lines to the keypad port, PWM and LCD controller. */
++static void chumby_classic_connect_io(ChumbyClassicState *s)
++{
++    DeviceState *io = DEVICE(&s->io);
++    DeviceState *kpp = DEVICE(&s->soc.kpp);
++
++    qdev_realize(io, NULL, &error_fatal);
++    qdev_connect_gpio_out(s->soc.pwm, 0,
++                          qdev_get_gpio_in_named(io, CHUMBY_IO_BACKLIGHT, 0));
++    qdev_connect_gpio_out(kpp, CHUMBY_LCD_ON_KPP_PIN,
++                          qdev_get_gpio_in_named(io, CHUMBY_IO_LCD_POWER, 0));
++    qdev_connect_gpio_out(kpp, CHUMBY_MUTE_KPP_PIN,
++                          qdev_get_gpio_in_named(io, CHUMBY_IO_AMP_MUTE, 0));
++    qdev_connect_gpio_out_named(io, CHUMBY_IO_LCD_BRIGHTNESS, 0,
++                                qdev_get_gpio_in_named(DEVICE(&s->soc.lcdc),
++                                                       IMX21_LCDC_BRIGHTNESS,
++                                                       0));
++    qdev_connect_gpio_out_named(io, CHUMBY_IO_BUTTON_N, 0,
++                                qdev_get_gpio_in(kpp, CHUMBY_BUTTON_KPP_PIN));
++    qdev_connect_gpio_out_named(io, CHUMBY_IO_HEADPHONES_N, 0,
++                                qdev_get_gpio_in(kpp, CHUMBY_HPIN_KPP_PIN));
++}
++
++static bool chumby_classic_codec_dac(void *opaque, int16_t *samples,
++                                     int frames)
++{
++    return imx21_audmux_transmit(opaque, CHUMBY_CODEC_DIN_PORT, samples,
++                                 frames);
++}
++
++static bool chumby_classic_codec_adc(void *opaque, int16_t *samples,
++                                     int frames)
++{
++    return imx21_audmux_receive(opaque, CHUMBY_CODEC_DOUT_PORT, samples,
++                                frames);
++}
++
++/* The identity is fixed once the machine is created. */
++static bool chumby_classic_identity_settable(const char *name, Error **errp)
++{
++    if (phase_check(PHASE_MACHINE_INITIALIZED)) {
++        error_setg(errp, "%s can only be set when the machine is created",
++                   name);
++        return false;
++    }
++    return true;
++}
++
++static char *chumby_classic_get_guid(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->guid);
++}
++
++static void chumby_classic_set_guid(Object *obj, const char *value,
++                                    Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++
++    if (!chumby_classic_identity_settable("guid", errp)) {
++        return;
++    }
++    if (qemu_uuid_parse(value, &s->guid_bytes) < 0) {
++        error_setg(errp, "invalid GUID '%s': expected 32 hex digits as "
++                   "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", value);
++        return;
++    }
++    g_free(s->guid);
++    s->guid = g_ascii_strup(value, -1);
++}
++
++static char *chumby_classic_get_serial(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->serial);
++}
++
++static void chumby_classic_set_serial(Object *obj, const char *value,
++                                      Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    const char *p;
++
++    if (!chumby_classic_identity_settable("serial", errp)) {
++        return;
++    }
++    for (p = value; *p && g_ascii_isalnum(*p); p++) {
++        /* letters and digits only */
++    }
++    if (*p || strlen(value) != CHUMBY_CP_SERIAL_LEN) {
++        error_setg(errp, "invalid serial number '%s': expected %d letters "
++                   "or digits", value, CHUMBY_CP_SERIAL_LEN);
++        return;
++    }
++    g_free(s->serial);
++    s->serial = g_strdup(value);
++}
++
++static char *chumby_classic_get_hwversion(Object *obj, Error **errp)
++{
++    return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->hwversion);
++}
++
++static void chumby_classic_set_hwversion(Object *obj, const char *value,
++                                         Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    unsigned int major, minor;
++    char end;
++
++    if (!chumby_classic_identity_settable("hwversion", errp)) {
++        return;
++    }
++    if (!g_ascii_isdigit(value[0]) ||
++        sscanf(value, "%3u.%3u%c", &major, &minor, &end) != 2 ||
++        major > 255 || minor > 255) {
++        error_setg(errp, "invalid hardware version '%s': expected "
++                   "MAJOR.MINOR, each 0 to 255", value);
++        return;
++    }
++    s->hw_major = major;
++    s->hw_minor = minor;
++    g_free(s->hwversion);
++    s->hwversion = g_strdup_printf("%u.%u", major, minor);
++}
++
++static const char *const chumby_accel_props[KXP74_AXES] = {
++    "x-mg", "y-mg", "z-mg"
++};
++
++static void chumby_classic_get_accel(Object *obj, Visitor *v,
++                                     const char *name, void *opaque,
++                                     Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    int axis = (uintptr_t)opaque;
++    int64_t value = s->accel_mg[axis];
++
++    if (s->accel) {
++        value = object_property_get_int(OBJECT(s->accel),
++                                        chumby_accel_props[axis], errp);
++    }
++    visit_type_int(v, name, &value, errp);
++}
++
++static void chumby_classic_set_accel(Object *obj, Visitor *v,
++                                     const char *name, void *opaque,
++                                     Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    int axis = (uintptr_t)opaque;
++    int64_t value;
++
++    if (!visit_type_int(v, name, &value, errp)) {
++        return;
++    }
++    if (value < -KXP74_ACCEL_LIMIT_MG || value > KXP74_ACCEL_LIMIT_MG) {
++        error_setg(errp, "%s: %" PRId64 " mg is out of range (%d to %d)",
++                   name, value, -KXP74_ACCEL_LIMIT_MG, KXP74_ACCEL_LIMIT_MG);
++        return;
++    }
++    s->accel_mg[axis] = value;
++    if (s->accel) {
++        object_property_set_int(OBJECT(s->accel), chumby_accel_props[axis],
++                                value, errp);
++    }
++}
++
++/* The sensor card's decoder: line 0 is SS0, line 1 SS1 */
++static void chumby_classic_sensor_select(void *opaque, int n, int level)
++{
++    ChumbyClassicState *s = opaque;
++    int i;
++
++    s->sensor_sel = deposit32(s->sensor_sel, n, 1, !!level);
++    for (i = 0; i < CHUMBY_SENSOR_NUM_CS; i++) {
++        /* Active low; an unused select has no line. */
++        qemu_set_irq(s->sensor_cs[i], s->sensor_sel != i);
++    }
++}
++
++static int chumby_classic_post_load(void *opaque, int version_id)
++{
++    ChumbyClassicState *s = opaque;
++
++    /*
++     * Each part's own state says whether it is selected, so the decoder's
++     * outputs need not be driven again.
++     */
++    return s->sensor_sel < CHUMBY_SENSOR_NUM_CS ? 0 : -EINVAL;
++}
++
++/*
++ * The board's own state, outside its devices. A machine is not a device,
++ * so this is registered by itself.
++ */
++static const VMStateDescription vmstate_chumby_classic = {
++    .name = "chumby-classic",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = chumby_classic_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sensor_sel, ChumbyClassicState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++/* Appends a DC ID tag header to @buf. */
++static void chumby_dcid_tag(GByteArray *buf, const char *name, int len,
++                            bool parent)
++{
++    uint8_t hdr[CHUMBY_DCID_TAG_HDR] = {
++        0, (CHUMBY_DCID_TAG_HDR + len) | (parent ? CHUMBY_DCID_TAG_PARENT : 0)
++    };
++
++    memcpy(&hdr[2], name, 4);
++    g_byte_array_append(buf, hdr, sizeof(hdr));
++}
++
++/*
++ * Programs the DC ID EEPROM. The tags are made up, as no real card's
++ * contents are known: <dcid><vers>01</vers><hwvr>MAJOR MINOR</hwvr>
++ * </dcid>. The revision is 00.00.MAJOR.MINOR and the serial number the
++ * last 12 characters of the device's.
++ */
++static void chumby_classic_program_dcid(ChumbyClassicState *s,
++                                        AT25080AState *dcid)
++{
++    g_autoptr(GByteArray) buf = g_byte_array_new();
++    const uint8_t vers = 1;
++    const uint8_t hwvr[2] = { s->hw_major, s->hw_minor };
++    const uint8_t rev[4] = { 0, 0, s->hw_major, s->hw_minor };
++
++    g_byte_array_append(buf, (const uint8_t *)"sexi", 4);
++    chumby_dcid_tag(buf, "dcid", 2 * CHUMBY_DCID_TAG_HDR + sizeof(vers) +
++                    sizeof(hwvr), true);
++    chumby_dcid_tag(buf, "vers", sizeof(vers), false);
++    g_byte_array_append(buf, &vers, sizeof(vers));
++    chumby_dcid_tag(buf, "hwvr", sizeof(hwvr), false);
++    g_byte_array_append(buf, hwvr, sizeof(hwvr));
++    g_byte_array_append(buf, (const uint8_t *)"pus!", 4);
++    at25080a_program(dcid, 0, buf->data, buf->len);
++
++    at25080a_program(dcid, CHUMBY_DCID_REV_ADDR, rev, sizeof(rev));
++    at25080a_program(dcid, CHUMBY_DCID_SERIAL_ADDR,
++                     s->serial + CHUMBY_CP_SERIAL_LEN - CHUMBY_DCID_SERIAL_LEN,
++                     CHUMBY_DCID_SERIAL_LEN);
++}
++
++/* The sensor card on CSPI1: the accelerometer and the DC ID EEPROM */
++static void chumby_classic_init_sensors(ChumbyClassicState *s)
++{
++    SSIBus *spi = (SSIBus *)qdev_get_child_bus(DEVICE(&s->soc.cspi[0]),
++                                               "spi");
++    DeviceState *accel, *dcid;
++    int i;
++
++    accel = qdev_new(TYPE_KXP74);
++    qdev_prop_set_uint8(accel, "cs", CHUMBY_SENSOR_CS_ACCEL);
++    object_property_add_child(OBJECT(s), "accel", OBJECT(accel));
++    for (i = 0; i < KXP74_AXES; i++) {
++        object_property_set_int(OBJECT(accel), chumby_accel_props[i],
++                                s->accel_mg[i], &error_abort);
++    }
++    ssi_realize_and_unref(accel, spi, &error_fatal);
++    s->accel = accel;
++    s->sensor_cs[CHUMBY_SENSOR_CS_ACCEL] =
++        qdev_get_gpio_in_named(accel, SSI_GPIO_CS, 0);
++
++    dcid = qdev_new(TYPE_AT25080A);
++    qdev_prop_set_uint8(dcid, "cs", CHUMBY_SENSOR_CS_DCID);
++    object_property_add_child(OBJECT(s), "dcid", OBJECT(dcid));
++    chumby_classic_program_dcid(s, AT25080A(dcid));
++    ssi_realize_and_unref(dcid, spi, &error_fatal);
++    s->sensor_cs[CHUMBY_SENSOR_CS_DCID] =
++        qdev_get_gpio_in_named(dcid, SSI_GPIO_CS, 0);
++
++    s->sensor_sel = CHUMBY_SENSOR_CS_IDLE;
++    qdev_connect_gpio_out(DEVICE(&s->soc.gpio), CHUMBY_SENSOR_SS0_GPIO,
++                          qemu_allocate_irq(chumby_classic_sensor_select,
++                                            s, 0));
++    qdev_connect_gpio_out(DEVICE(&s->soc.gpio), CHUMBY_SENSOR_SS1_GPIO,
++                          qemu_allocate_irq(chumby_classic_sensor_select,
++                                            s, 1));
++    chumby_classic_sensor_select(s, 0, 1);
++    vmstate_register(NULL, 0, &vmstate_chumby_classic, s);
++}
++
++static void chumby_classic_init(MachineState *machine)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(machine);
++    DriveInfo *nand = drive_get(IF_MTD, 0, 0);
++    DeviceState *tsc;
++    Chardev *cp;
++    SSIBus *spi;
++
++    if (machine->ram_size > FSL_IMX21_SDRAM0_SIZE) {
++        g_autofree char *sz = size_to_str(FSL_IMX21_SDRAM0_SIZE);
++
++        error_report("RAM size more than %s is not supported", sz);
++        exit(EXIT_FAILURE);
++    }
++
++    object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_FSL_IMX21);
++
++    if (nand) {
++        qdev_prop_set_drive_err(DEVICE(&s->soc.nfc), "drive",
++                                blk_by_legacy_dinfo(nand), &error_fatal);
++    }
++
++    /* The crypto processor answers on UART3. */
++    cp = qemu_chardev_new("chumby-cp", TYPE_CHARDEV_CHUMBY_CP, NULL, NULL,
++                          &error_fatal);
++    chumby_cp_set_identity(CHARDEV_CHUMBY_CP(cp), s->guid_bytes.data,
++                           s->serial, s->hw_major, s->hw_minor);
++    qdev_prop_set_chr(DEVICE(&s->soc.uart[2]), "chardev", cp);
++
++    /* The sensor card's parts take bytes. */
++    qdev_prop_set_bit(DEVICE(&s->soc.cspi[0]), "bytewise", true);
++
++    qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
++
++    memory_region_add_subregion(get_system_memory(), FSL_IMX21_SDRAM0_ADDR,
++                                machine->ram);
++
++    /* The touchscreen controller on CSPI3's first chip select */
++    spi = (SSIBus *)qdev_get_child_bus(DEVICE(&s->soc.cspi[2]), "spi");
++    tsc = qdev_new(TYPE_TSC2100);
++    if (machine->audiodev) {
++        qdev_prop_set_string(tsc, "audiodev", machine->audiodev);
++    }
++    ssi_realize_and_unref(tsc, spi, &error_fatal);
++    tsc2100_set_audio_link(TSC2100(tsc), chumby_classic_codec_dac,
++                           chumby_classic_codec_adc, &s->soc.audmux);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc.cspi[2]), 1,
++                       qdev_get_gpio_in_named(tsc, SSI_GPIO_CS, 0));
++    qdev_connect_gpio_out_named(tsc, TSC2100_PINTDAV, 0,
++                                qdev_get_gpio_in(DEVICE(&s->soc.gpio),
++                                                 CHUMBY_PINTDAV_GPIO));
++
++    chumby_classic_connect_io(s);
++
++    chumby_classic_init_sensors(s);
++
++    if (!machine->kernel_cmdline || !*machine->kernel_cmdline) {
++        g_free(machine->kernel_cmdline);
++        machine->kernel_cmdline = g_strconcat(CHUMBY_DEFAULT_CMDLINE,
++                                              s->hwversion, NULL);
++    }
++
++    chumby_binfo.ram_size = machine->ram_size;
++    chumby_binfo.loader_start = FSL_IMX21_SDRAM0_ADDR;
++    chumby_binfo.board_id = CHUMBY_MACH_TYPE;
++
++    if (!qtest_enabled()) {
++        arm_load_kernel(&s->soc.cpu, machine, &chumby_binfo);
++    }
++}
++
++static void chumby_classic_instance_init(Object *obj)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++    static const char *const io_props[] = {
++        "button", "headphones", "button-key", "usb-keyboard",
++    };
++    int i;
++
++    object_initialize_child(obj, "io", &s->io, TYPE_CHUMBY_IO);
++    for (i = 0; i < ARRAY_SIZE(io_props); i++) {
++        object_property_add_alias(obj, io_props[i], OBJECT(&s->io),
++                                  io_props[i]);
++    }
++
++    /* Standing upright and still */
++    s->accel_mg[KXP74_X] = CHUMBY_ACCEL_UPRIGHT_X;
++    s->accel_mg[KXP74_Y] = CHUMBY_ACCEL_UPRIGHT_Y;
++    s->accel_mg[KXP74_Z] = CHUMBY_ACCEL_UPRIGHT_Z;
++    object_property_set_str(obj, "guid", CHUMBY_CP_DEFAULT_GUID,
++                            &error_abort);
++    object_property_set_str(obj, "serial", CHUMBY_CP_DEFAULT_SERIAL,
++                            &error_abort);
++    object_property_set_str(obj, "hwversion",
++                            stringify(CHUMBY_CP_DEFAULT_HW_MAJOR) "."
++                            stringify(CHUMBY_CP_DEFAULT_HW_MINOR),
++                            &error_abort);
++}
++
++static void chumby_classic_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++    int i;
++
++    mc->desc = "Chumby Classic (Freescale i.MX21, ARM926)";
++    mc->init = chumby_classic_init;
++    mc->ignore_memory_transaction_failures = true;
++    mc->default_ram_size = FSL_IMX21_SDRAM0_SIZE;
++    mc->default_ram_id = "chumby.ram";
++
++    machine_add_audiodev_property(mc);
++
++    for (i = 0; i < KXP74_AXES; i++) {
++        static const char *const names[KXP74_AXES] = {
++            "accel-x", "accel-y", "accel-z"
++        };
++
++        object_class_property_add(oc, names[i], "int",
++                                  chumby_classic_get_accel,
++                                  chumby_classic_set_accel, NULL,
++                                  (void *)(uintptr_t)i);
++        object_class_property_set_description(oc, names[i],
++            "The acceleration along this accelerometer axis, in milli-g");
++    }
++
++    object_class_property_add_str(oc, "guid", chumby_classic_get_guid,
++                                  chumby_classic_set_guid);
++    object_class_property_set_description(oc, "guid",
++        "The device GUID, XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (default "
++        CHUMBY_CP_DEFAULT_GUID ")");
++    object_class_property_add_str(oc, "serial", chumby_classic_get_serial,
++                                  chumby_classic_set_serial);
++    object_class_property_set_description(oc, "serial",
++        "The serial number, 16 letters or digits (default "
++        CHUMBY_CP_DEFAULT_SERIAL ")");
++    object_class_property_add_str(oc, "hwversion",
++                                  chumby_classic_get_hwversion,
++                                  chumby_classic_set_hwversion);
++    object_class_property_set_description(oc, "hwversion",
++        "The hardware version, MAJOR.MINOR (default 3.8)");
++}
++
++static void chumby_classic_instance_finalize(Object *obj)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++
++    g_free(s->guid);
++    g_free(s->serial);
++    g_free(s->hwversion);
++}
++
++static const TypeInfo chumby_classic_info = {
++    .name = TYPE_CHUMBY_CLASSIC_MACHINE,
++    .parent = TYPE_MACHINE,
++    .instance_size = sizeof(ChumbyClassicState),
++    .instance_init = chumby_classic_instance_init,
++    .instance_finalize = chumby_classic_instance_finalize,
++    .class_init = chumby_classic_class_init,
++    .interfaces = arm_machine_interfaces,
++};
++
++static void chumby_classic_register_types(void)
++{
++    type_register_static(&chumby_classic_info);
++}
++
++type_init(chumby_classic_register_types)
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -41,6 +41,7 @@ arm_common_ss.add(when: 'CONFIG_XLNX_ZYNQMP_ARM', if_true: files('xlnx-zynqmp.c'
+ arm_common_ss.add(when: 'CONFIG_XLNX_VERSAL', if_true: files('xlnx-versal.c', 'xlnx-versal-virt.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX25', if_true: files('fsl-imx25.c', 'imx25_pdk.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('fsl-imx21.c'))
++arm_common_ss.add(when: 'CONFIG_CHUMBY_CLASSIC', if_true: files('chumby_classic.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX31', if_true: files('fsl-imx31.c', 'kzm.c'))
+ arm_common_ss.add(when: 'CONFIG_FSL_IMX6', if_true: files('fsl-imx6.c'))
+ arm_common_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files(

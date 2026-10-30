@@ -1,0 +1,268 @@
+Description: qapi: Add a schema for the Chumby board
+ A frontend for the chumby-classic machine shows what the guest does
+ with the board's outputs (dims or blanks its view with the backlight
+ and the LCD's power, shows the speaker as muted) and drives its inputs
+ (headphones, the top button, the accelerometer). Polling for the
+ outputs wastes wakeups.
+ .
+ Add qapi/chumby.json with query-chumby-state, returning the backlight
+ level (the PWM's duty cycle, 0 to 65535), LCD power, speaker mute,
+ headphones and button, the accelerometer's input (accel-x, accel-y and
+ accel-z, in milli-g) and the device identity (guid, serial and
+ hwversion), so that one command resynchronises a frontend; and the
+ events CHUMBY_BACKLIGHT, CHUMBY_LCD, CHUMBY_SPEAKER_MUTE and
+ CHUMBY_HEADPHONES. A backlight fade is many changes, so
+ CHUMBY_BACKLIGHT is rate-limited to one each 100 ms, the last level
+ always arriving. Machines without the board answer the query with an
+ error, from a stub.
+ .
+ The schema is a module of its own, for the board's other controls to
+ join.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -867,6 +867,13 @@ F: include/hw/misc/imx25_ccm.h
+ F: include/hw/watchdog/wdt_imx2.h
+ F: docs/system/arm/imx25-pdk.rst
+ 
++Chumby Classic (i.MX21)
++M: John Merchant <john@johnmerchant.dev>
++L: qemu-arm@nongnu.org
++S: Maintained
++F: qapi/chumby.json
++F: stubs/qmp-chumby.c
++
+ i.MX31 (kzm)
+ M: Peter Maydell <peter.maydell@linaro.org>
+ L: qemu-arm@nongnu.org
+diff --git a/monitor/monitor.c b/monitor/monitor.c
+--- a/monitor/monitor.c
++++ b/monitor/monitor.c
+@@ -336,6 +336,8 @@ static MonitorQAPIEventConf monitor_qapi_event_conf[QAPI_EVENT__MAX] = {
+     [QAPI_EVENT_VSERPORT_CHANGE]   = { 1000 * SCALE_MS },
+     [QAPI_EVENT_MEMORY_DEVICE_SIZE_CHANGE] = { 1000 * SCALE_MS },
+     [QAPI_EVENT_HV_BALLOON_STATUS_REPORT] = { 1000 * SCALE_MS },
++    /* A backlight fade is many changes; a display follows it this fast. */
++    [QAPI_EVENT_CHUMBY_BACKLIGHT]  = { 100 * SCALE_MS },
+ };
+ 
+ /*
+diff --git a/qapi/chumby.json b/qapi/chumby.json
+new file mode 100644
+--- /dev/null
++++ b/qapi/chumby.json
+@@ -0,0 +1,160 @@
++# -*- Mode: Python -*-
++# vim: filetype=python
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++##
++# ************
++# Chumby board
++# ************
++##
++
++##
++# The board-level controls of the ``chumby-classic`` machine: the
++# lines the guest drives (backlight, LCD power, speaker mute) and the
++# ones a user does (headphones, the top button).
++##
++
++##
++# @ChumbyState:
++#
++# The state of the Chumby's board-level lines, the acceleration its
++# accelerometer senses, and its identity.
++#
++# @backlight: the backlight's duty cycle, 0 (off) to 65535 (fully on),
++#     as the guest's PWM drives it
++#
++# @lcd-on: whether the guest has the LCD panel powered
++#
++# @speaker-mute: whether the guest has the speaker amplifier muted
++#
++# @headphones: whether headphones are plugged in
++#
++# @button: whether the top button is held
++#
++# @accel-x: the acceleration along the accelerometer's X axis, in
++#     milli-g (the machine's ``accel-x`` property)
++#
++# @accel-y: the same along its Y axis (``accel-y``)
++#
++# @accel-z: the same along its Z axis (``accel-z``)
++#
++# @guid: the device GUID the crypto processor reports (``guid``)
++#
++# @serial: the serial number, 16 letters or digits (``serial``)
++#
++# @hwversion: the hardware version, MAJOR.MINOR (``hwversion``)
++#
++# Since: 11.2
++##
++{ 'struct': 'ChumbyState',
++  'data': { 'backlight': 'uint16',
++            'lcd-on': 'bool',
++            'speaker-mute': 'bool',
++            'headphones': 'bool',
++            'button': 'bool',
++            'accel-x': 'int',
++            'accel-y': 'int',
++            'accel-z': 'int',
++            'guid': 'str',
++            'serial': 'str',
++            'hwversion': 'str' } }
++
++##
++# @query-chumby-state:
++#
++# Return the state of the Chumby's board-level lines, its
++# accelerometer's input and its identity.  Only the ``chumby-classic``
++# machine has them; other machines report an error.
++#
++# Since: 11.2
++#
++# .. qmp-example::
++#
++#     -> { "execute": "query-chumby-state" }
++#     <- { "return": { "backlight": 65535, "lcd-on": true,
++#                      "speaker-mute": false, "headphones": false,
++#                      "button": false,
++#                      "accel-x": 0, "accel-y": 0, "accel-z": 1000,
++#                      "guid": "C40BB1E0-0000-4000-8000-0E4000000001",
++#                      "serial": "0000000000000000",
++#                      "hwversion": "3.8" } }
++##
++{ 'command': 'query-chumby-state', 'returns': 'ChumbyState' }
++
++##
++# @CHUMBY_BACKLIGHT:
++#
++# Emitted when the guest changes the backlight's duty cycle.
++#
++# @level: the new duty cycle, 0 (off) to 65535 (fully on)
++#
++# .. note:: This event is rate-limited: a fade sends the first level
++#    at once and then at most one every 100 ms, the last being the
++#    final level.
++#
++# Since: 11.2
++#
++# .. qmp-example::
++#
++#     <- { "event": "CHUMBY_BACKLIGHT",
++#          "data": { "level": 32768 },
++#          "timestamp": { "seconds": 1265044230, "microseconds": 450486 } }
++##
++{ 'event': 'CHUMBY_BACKLIGHT',
++  'data': { 'level': 'uint16' } }
++
++##
++# @CHUMBY_LCD:
++#
++# Emitted when the guest powers the LCD panel on or off.
++#
++# @on: whether the panel is now powered
++#
++# Since: 11.2
++#
++# .. qmp-example::
++#
++#     <- { "event": "CHUMBY_LCD",
++#          "data": { "on": false },
++#          "timestamp": { "seconds": 1265044230, "microseconds": 450486 } }
++##
++{ 'event': 'CHUMBY_LCD',
++  'data': { 'on': 'bool' } }
++
++##
++# @CHUMBY_SPEAKER_MUTE:
++#
++# Emitted when the guest mutes or unmutes the speaker amplifier.
++#
++# @muted: whether the speaker is now muted
++#
++# Since: 11.2
++#
++# .. qmp-example::
++#
++#     <- { "event": "CHUMBY_SPEAKER_MUTE",
++#          "data": { "muted": true },
++#          "timestamp": { "seconds": 1265044230, "microseconds": 450486 } }
++##
++{ 'event': 'CHUMBY_SPEAKER_MUTE',
++  'data': { 'muted': 'bool' } }
++
++##
++# @CHUMBY_HEADPHONES:
++#
++# Emitted when headphones are plugged in or out (the machine's
++# ``headphones`` property).
++#
++# @inserted: whether headphones are now plugged in
++#
++# Since: 11.2
++#
++# .. qmp-example::
++#
++#     <- { "event": "CHUMBY_HEADPHONES",
++#          "data": { "inserted": true },
++#          "timestamp": { "seconds": 1265044230, "microseconds": 450486 } }
++##
++{ 'event': 'CHUMBY_HEADPHONES',
++  'data': { 'inserted': 'bool' } }
+diff --git a/qapi/meson.build b/qapi/meson.build
+--- a/qapi/meson.build
++++ b/qapi/meson.build
+@@ -61,6 +61,7 @@ if have_system
+     'acpi',
+     'acpi-hest',
+     'audio',
++    'chumby',
+     'cryptodev',
+     'qdev',
+     'pci',
+diff --git a/qapi/qapi-schema.json b/qapi/qapi-schema.json
+--- a/qapi/qapi-schema.json
++++ b/qapi/qapi-schema.json
+@@ -66,6 +66,7 @@
+ { 'include': 'misc.json' }
+ { 'include': 'misc-arm.json' }
+ { 'include': 'misc-i386.json' }
++{ 'include': 'chumby.json' }
+ { 'include': 'audio.json' }
+ { 'include': 'acpi.json' }
+ { 'include': 'acpi-hest.json' }
+diff --git a/stubs/meson.build b/stubs/meson.build
+--- a/stubs/meson.build
++++ b/stubs/meson.build
+@@ -78,6 +78,7 @@ if have_system
+   stub_ss.add(files('win32-kbd-hook.c'))
+   stub_ss.add(files('xen-hw-stub.c'))
+   stub_ss.add(files('qmp-arm-gic.c'))
++  stub_ss.add(files('qmp-chumby.c'))
+   stub_ss.add(files('qmp-i386-rtc.c'))
+   stub_ss.add(files('qmp-i386-sev.c'))
+   stub_ss.add(files('qmp-i386-sgx.c'))
+diff --git a/stubs/qmp-chumby.c b/stubs/qmp-chumby.c
+new file mode 100644
+--- /dev/null
++++ b/stubs/qmp-chumby.c
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-chumby.h"
++
++ChumbyState *qmp_query_chumby_state(Error **errp)
++{
++    error_setg(errp, "This machine has no Chumby board");
++    return NULL;
++}

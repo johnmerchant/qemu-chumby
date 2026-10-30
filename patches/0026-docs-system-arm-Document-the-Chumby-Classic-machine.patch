@@ -1,0 +1,312 @@
+Description: docs/system/arm: Document the Chumby Classic machine
+ The emulated devices and what is missing, how to boot the stock
+ firmware, the board's lines, identity, sensor card, audio and USB
+ (the stock root disk mounts a stick's first partition on /mnt/usb),
+ the watchdog, and a command line for interactive use.
+ .
+ That is without -icount: -icount shift=auto,sleep=off boots fast but
+ is wrong for a person at the screen. Measured with the stock firmware
+ on an otherwise busy host, without -icount /proc/uptime advanced
+ 61.13 s over 61.13 s of host time, while with -icount
+ shift=auto,sleep=off it advanced 153 s over 21 s with the guest idle,
+ and QEMU used a whole host core instead of 10% of one; a tap sent with
+ input-send-event reached a guest process reading /dev/input/event0 72
+ to 83 ms later.
+ .
+ A "Frontend interface" section lists what frontends rely on: the
+ machine properties, the state query, the events, the input conventions
+ and screendump, which will not change incompatibly without a note
+ there.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -900,6 +900,7 @@ F: qapi/chumby.json
+ F: stubs/qmp-chumby.c
+ F: include/hw/nvram/at25080a.h
+ F: include/hw/sensor/kxp74.h
++F: docs/system/arm/chumby-classic.rst
+ 
+ i.MX31 (kzm)
+ M: Peter Maydell <peter.maydell@linaro.org>
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+new file mode 100644
+--- /dev/null
++++ b/docs/system/arm/chumby-classic.rst
+@@ -0,0 +1,261 @@
++Chumby Classic (``chumby-classic``)
++===================================
++
++The ``chumby-classic`` machine emulates the Chumby Classic, a Wi-Fi
++internet appliance with a 320x240 touchscreen built around the Freescale
++i.MX21 SoC (ARM926EJ-S). It runs the device's own Linux 2.6.16 kernel and
++root disk unmodified, booting them from an image of its NAND flash.
++
++Emulated devices:
++
++- ARM926EJ-S CPU and 64 MiB of SDRAM
++- AITC interrupt controller
++- GPT1-3 timers
++- UART1-4 (UART1 is the console)
++- The crypto processor on UART3, with a settable identity (see
++  `Device identity`_); it holds no keys and refuses key and challenge
++  requests
++- Clock and reset module, PLLs locked at the boot loader's settings
++- GPIO ports A-F
++- Keypad port, used as GPIO: the top button (row 0), headphone detect
++  (row 3), LCD power (column 2) and speaker mute (column 4)
++- CSPI1-3, with a TI TSC2100 touchscreen controller and audio codec on
++  CSPI3
++- The sensor card on CSPI1: a Kionix KXP74 accelerometer and an Atmel
++  AT25080A EEPROM (the "DC ID" EEPROM), selected by GPIOs PD28 and PD27
++  through the card's decoder
++- LCD controller: background plane and graphic window, 16 bpp
++- NAND flash controller with a 64 MiB small-page NAND chip
++- PWM, driving the LCD backlight: the screen is dimmed by its duty cycle
++- USB host controller with a three-port full-speed root hub: control,
++  bulk, interrupt and isochronous transfers, so QEMU's USB devices
++  (``usb-storage``, ``usb-kbd``, ``usb-mouse``, ``usb-tablet``,
++  ``usb-audio``, ``usb-hub``...) can be plugged in with ``-device``
++- DMA controller: 16 channels, linear, 2D and FIFO transfers, repeat
++  (chaining) and the bus error status; the timeouts are not modelled
++- SSI1 and SSI2 (as slaves of the codec, in normal, network and I2S
++  modes, with their FIFOs, interrupts and DMA requests) and the audio
++  multiplexer's data routing
++- Watchdog: the stock kernel's ``chumby_sense1`` driver arms it for 2.5
++  seconds and services it every tick, and ``reboot`` resets the machine
++  through it. A missed service performs QEMU's watchdog action
++  (``-action watchdog=...``, a reset by default). The reset status
++  register reports power-on, software, watchdog or (after
++  ``system_reset``) external reset, which the guest shows in
++  ``/proc/resetReason``
++- RTC, counting days, hours, minutes and seconds from ``-rtc base=`` (by
++  default the host's time) on the ``-rtc clock=`` clock, with its alarm,
++  stopwatch and periodic interrupts. The stock kernel has no driver for it
++- I2C controller, with nothing on its bus (the stock kernel has no driver
++  for it either). I2C devices can be added to ``i2c-bus.0`` with
++  ``-device``
++
++Missing devices:
++
++- SDHC: the Chumby Classic has no SD card slot, and its kernel
++  registers no SDHC driver; its registers read back what was last
++  written
++- The USB OTG block's function (device) side, HNP and its transceiver
++  I2C master
++
++Boot options
++------------
++
++The machine boots a Linux kernel directly, as the Chumby's boot loader
++does: ``-kernel`` takes a zImage, which is entered with machine type 851
++(MX21ADS), the type the Chumby's kernel is built for. Without
++``-append``, the kernel gets the stock command line for the first root
++disk::
++
++  console=ttyS0,38400 root=/dev/mtdblock5 rootfstype=cramfs init=/linuxrc chumby_hwversion=3.8
++
++where ``3.8`` is the machine's ``hwversion``.
++
++The NAND flash is a raw image given with ``-drive if=mtd``. Its layout is
++that of ``nanddump``: 131072 records of 528 bytes, each a page's 512 data
++bytes followed by its 16 spare bytes, 69206016 bytes in all. Programs and
++erases are written back to the image unless the drive is read-only or a
++snapshot.
++
++Running
++-------
++
++.. code-block:: bash
++
++  $ qemu-system-arm -M chumby-classic -kernel zImage \
++      -drive if=mtd,file=nand.img,format=raw -serial stdio
++
++The pen is the absolute pointer: the left button presses the screen. It
++can also be driven from QMP with ``input-send-event`` (``abs`` events on
++the ``x`` and ``y`` axes, 0 to 32767 across the screen, and the ``left``
++button). ``screendump`` captures the screen.
++
++USB devices attach to the host controller's root hub, for example a
++disk image as a USB stick and a keyboard::
++
++  -drive if=none,id=stick,file=stick.img,format=raw \
++  -device usb-storage,drive=stick -device usb-kbd
++
++The stock root disk mounts the first partition of a stick, ``sda1``, on
++``/mnt/usb``.
++
++The top button (the "squeeze switch", ``/dev/switch`` in the guest) is the
++machine's ``button`` property: ``qom-set /machine button true`` presses
++it and ``qom-set /machine button false`` releases it. A key also holds it
++while the key is down, from any display's keyboard or from QMP's
++``send-key`` and ``input-send-event``: F12 unless the machine's
++``button-key`` option names another QKeyCode (``button-key=pause``), or
++``none``. Other keys go on to the guest's keyboard. Without one, the
++first key pressed plugs a USB keyboard (``usb-kbd``) into a free port of
++the root hub, as a user would plug one in to type: the keys are held
++until the guest has configured it (for up to 10 seconds), then typed
++into it. The machine's ``usb-keyboard=off`` option turns this off. A
++snapshot taken with the keyboard plugged in plugs it in again as it
++loads, into a machine started with the same command line.
++
++Headphones are plugged in and out with the machine's ``headphones``
++property (``qom-set /machine headphones true``); the guest reads the
++jack's switch in ``/proc/sys/sense1/hpin``.
++
++The guest's backlight level (the PWM's duty cycle, 0 to 65535) dims the
++displayed screen, and turning the LCD's power off blanks it. Until the
++guest first programs the PWM the backlight is full.
++
++The board's lines are reported over QMP: ``query-chumby-state`` returns
++the backlight level, LCD power, speaker mute, headphones and button (and
++the accelerometer's input and the identity, below), and the
++``CHUMBY_BACKLIGHT`` (at most one each 100 ms), ``CHUMBY_LCD``,
++``CHUMBY_SPEAKER_MUTE`` and ``CHUMBY_HEADPHONES`` events report changes.
++
++Sound goes to the audio backend given with ``-audiodev`` and the
++machine's ``audiodev`` property, as 16-bit stereo at the rate the
++TSC2100 is programmed for, with the DAC's volume and mutes; recording
++takes its input from the same backend (silence if it has none). For
++example, to record what the guest plays to a file::
++
++  -audiodev wav,id=snd0,path=out.wav -M chumby-classic,audiodev=snd0
++
++The accelerometer's axes are the machine properties ``accel-x``,
++``accel-y`` and ``accel-z``: the acceleration along each of the part's
++axes in milli-g, -16000 to 16000 (the part reads +/-2.5 g, 819.2 counts
++per g around 2048). They can be given with ``-M`` and set at any time to
++tilt or shake the device::
++
++  { "execute": "qom-set",
++    "arguments": { "path": "/machine", "property": "accel-x", "value": 500 } }
++
++They are the ``x-mg``, ``y-mg`` and ``z-mg`` properties of the part
++itself, ``/machine/accel``. They start at 0, 0 and 1000, 1 g on Z: the
++part lying flat, which is a guess at how the sensor card sits in an
++upright Chumby. The stock driver samples them every jiffy and reports
++the latest sample and a 16-sample average through ``/dev/accel``.
++
++The emulated clock follows the host's. ``-icount shift=auto,sleep=off``
++lets it run ahead while the guest is idle, which boots several times
++faster.
++
++Interactive use
++~~~~~~~~~~~~~~~
++
++For a person using the screen, run without ``-icount``:
++
++.. code-block:: bash
++
++  $ qemu-system-arm -M chumby-classic -kernel zImage \
++      -drive if=mtd,file=nand.img,format=raw -serial stdio
++
++Then the guest's clock keeps to wall-clock time, so its animations,
++timers and ``date`` run at their real pace, and the vCPU sleeps in the
++kernel's idle loop (``WFI``), so an idle Chumby costs the host little
++CPU time. With ``-icount shift=auto,sleep=off`` the guest's clock instead
++jumps ahead whenever it is idle, which suits scripted tests but makes
++timers fire early for a person watching, and it keeps a host core busy.
++
++The watchdog runs on the emulated clock, which stands still while the
++machine is paused. Without ``-icount`` that clock also runs on while the
++host is not running QEMU at all (the host sleeping, QEMU stopped by a
++signal or starved of CPU), so after the 2.5 second timeout runs out the
++guest gets another quarter of a second of running time to service the
++watchdog before it resets the machine. ``-action watchdog=none`` (or
++``pause``) turns the reset off, for instance while debugging the guest.
++
++Device identity
++---------------
++
++The machine properties ``guid``, ``serial`` and ``hwversion`` set the
++device's identity. The crypto processor reports all three (``cpi -p``
++prints the GUID, which the stock software uses as the device ID;
++``chumby_version -n`` and ``-h`` the others), and ``hwversion`` goes on
++the default kernel command line. The DC ID EEPROM holds the hardware
++version, as revision ``00.00.MAJOR.MINOR`` (``/proc/DCversion``) and in
++a made-up ``hwvr`` tag (``dcid -o``), and the last 12 characters of the
++serial number. The defaults are a made-up identity:
++
++.. code-block:: bash
++
++  $ qemu-system-arm -M chumby-classic,guid=C40BB1E0-0000-4000-8000-0E4000000001,serial=0000000000000000,hwversion=3.8 ...
++
++The GUID is 32 hex digits as ``XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX``,
++the serial number 16 letters or digits, and the hardware version
++``MAJOR.MINOR``; anything else is refused at startup. Give each emulated
++Chumby its own GUID so that it pairs with a server as a separate device.
++
++Frontend interface
++------------------
++
++A frontend (a window, a test harness, a script) controls and watches
++the machine with the names below. They are stable: they will not be
++renamed, removed or changed in meaning without a note in this section.
++New ones may be added, and a client should ignore fields it does not
++know.
++
++Machine properties, given with ``-M chumby-classic,NAME=VALUE``; all but
++the identity can also be read and set at any time with ``qom-get`` and
++``qom-set`` on ``/machine``:
++
++- ``button`` (bool): the top button, true while held
++- ``headphones`` (bool): true while headphones are plugged in
++- ``button-key`` (string): the QKeyCode that holds the top button,
++  ``f12`` by default, or ``none``
++- ``usb-keyboard`` (bool): whether an unheard key plugs in a USB
++  keyboard; on by default
++- ``accel-x``, ``accel-y``, ``accel-z`` (int): the acceleration along
++  each of the accelerometer's axes in milli-g, -16000 to 16000; 0, 0
++  and 1000 by default
++- ``guid``, ``serial``, ``hwversion`` (string): the identity,
++  ``XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX``, 16 letters or digits and
++  ``MAJOR.MINOR``; fixed once the machine is created
++
++``query-chumby-state`` returns the button, headphones, acceleration and
++identity together with the board's outputs, so that a frontend can
++resynchronise with one command:
++
++.. code-block:: json
++
++  { "backlight": 65535, "lcd-on": true, "speaker-mute": false,
++    "headphones": false, "button": false,
++    "accel-x": 0, "accel-y": 0, "accel-z": 1000,
++    "guid": "C40BB1E0-0000-4000-8000-0E4000000001",
++    "serial": "0000000000000000", "hwversion": "3.8" }
++
++``backlight`` is the PWM's duty cycle, 0 to 65535; ``lcd-on`` and
++``speaker-mute`` are the lines the guest drives. The events
++``CHUMBY_BACKLIGHT`` (``level``, at most one each 100 ms, the last
++being the final level), ``CHUMBY_LCD`` (``on``),
++``CHUMBY_SPEAKER_MUTE`` (``muted``) and ``CHUMBY_HEADPHONES``
++(``inserted``) report changes as they happen.
++
++Input:
++
++- The pen is QMP's ``input-send-event`` with ``abs`` events on the
++  ``x`` and ``y`` axes, 0 to 32767 across the screen left to right and
++  top to bottom, and the ``left`` button, down while the pen touches.
++  A tap is a press of 100 to 200 ms. Any display's absolute pointer
++  sends the same events.
++- Keys are QKeyCodes, from ``send-key``, ``input-send-event`` or a
++  display's keyboard. F12 (``button-key``) holds the top button; the
++  others go to the guest's USB keyboard.
++
++Output: ``screendump`` with ``"format": "png"`` (or the default PPM)
++writes the 320x240 screen as the LCD controller composes it, dimmed by
++the backlight.
+diff --git a/docs/system/target-arm.rst b/docs/system/target-arm.rst
+--- a/docs/system/target-arm.rst
++++ b/docs/system/target-arm.rst
+@@ -91,6 +91,7 @@ Board-specific documentation
+    arm/kzm
+    arm/nrf
+    arm/nuvoton
++   arm/chumby-classic
+    arm/imx25-pdk
+    arm/mcimx6ul-evk
+    arm/mcimx7d-sabre

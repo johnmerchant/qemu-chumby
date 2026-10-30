@@ -1,0 +1,1108 @@
+Description: hw/usb: Add the i.MX21 USB host controller
+ The i.MX21's USB OTG block as a host controller, on a QEMU USB bus with
+ three full-speed root hub ports, so -device usb-storage, usb-kbd,
+ usb-mouse, usb-tablet, usb-audio, usb-hub and the like attach to it.
+ .
+ The stock 2.6.16 "imx21-hc" driver works like this. It gives each
+ endpoint one of 32 endpoint transfer descriptors (ETDs) at offset 0x200:
+ word 0 holds address, endpoint, direction, speed, format and max
+ packet, word 1 the X/Y buffers in the 4 KiB data memory (DMEM) at
+ offset 0x1000, word 2 the interval, toggle and completion code, word 3
+ the byte count. For control, bulk and interrupt transfers it points the
+ ETD's DMA start address (0x900 + 4n) at a kernel buffer and enables the
+ ETD's DMA. Isochronous ETDs, two per endpoint, carry a start frame and
+ one packet; the stock snd-usb-audio buffers go through DMEM, others
+ through the DMA. Then it sets the ETD's bit in ETDENSET. When it is
+ done the controller sets the bit in ETDDONESTAT, which the driver only
+ scans on a SOF interrupt. It reads back the completion code, the
+ residual count and the toggle carry. Control transfers are three ETD
+ runs (setup, data, status). The status, fill and DMA enable registers
+ are "toggling": a 1 written flips the bit.
+ .
+ The model runs a control, bulk or interrupt ETD as one USB packet for
+ the whole byte count, with the data moved by the DMA (or from DMEM).
+ It writes back the completion code, residual count and toggle. A NAKed
+ ETD is retried on later frames: every frame for bulk, every polling
+ interval for interrupt, and at once when the device signals new data.
+ Asynchronous packets (usb-storage) complete from the port's complete
+ callback. An isochronous ETD runs in its start frame, oldest first.
+ Frames are 1 ms of virtual time and FRMNUB counts them. Port status
+ registers follow OHCI: write-1-to-act, write-1-to-clear change bits,
+ and resets that finish at once. The function side, HNP and the OTG
+ block's I2C master are not modelled. Chumby's board code doesn't use
+ the transceiver I2C master; its setup is under "#if 0".
+ .
+ Linux's imx21-hcd (5.9 and later) needs more of the controller than the
+ stock driver:
+ .
+ - Clearing an ETD's channel in ETDDMACHANLCLR clears its ETDDMAEN bit as
+   well as rewinding the DMA buffer pointer. The driver clears the
+   channel when it retires an ETD and enables DMA for the ETD's next use
+   with a read-modify-write of ETDDMAEN; with a stale enable left set,
+   that write toggled the DMA off and a control IN's data stage went to
+   DMEM.
+ - A control, bulk or interrupt ETD enabled through ETDENSET is due from
+   the next frame, not at once: a controller can't finish a transaction
+   while software is still enabling it. The driver enables the next
+   stage of a control transfer from its interrupt handler, then
+   acknowledges the SYSISR bits it read on entry, which would clear a
+   done interrupt raised during the write.
+ - While an enabled done status is unhandled, each frame raises DONEINT
+   as well as SOF. The driver walks all 32 ETDs for done status and then
+   writes back the SYSISR bits it read on entry, so an ETD completing
+   while the walk is past it has its DONEINT cleared unseen; and it masks
+   SOF unless an ETD looks stuck. Without this a keyboard's interrupt
+   endpoint went quiet after a few keys, or a control transfer timed out
+   during enumeration.
+ .
+ Packets in flight are not migrated; after a restore their ETDs run
+ again. They are cancelled before a load, so that a restore into a
+ running machine (loadvm) doesn't skip their ETDs as busy, nor let a late
+ completion write into the restored ETD and data memory.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -882,6 +882,7 @@ F: hw/misc/imx21_*.c
+ F: hw/rtc/imx21_rtc.c
+ F: hw/ssi/imx21_cspi.c
+ F: hw/timer/imx21_gpt.c
++F: hw/usb/hcd-imx21.c
+ F: include/hw/*/imx21_*.h
+ F: include/hw/input/imx21_kpp.h
+ F: qapi/chumby.json
+diff --git a/hw/usb/Kconfig b/hw/usb/Kconfig
+--- a/hw/usb/Kconfig
++++ b/hw/usb/Kconfig
+@@ -21,6 +21,10 @@ config USB_OHCI_PCI
+     depends on PCI
+     select USB_OHCI
+ 
++config USB_IMX21
++    bool
++    select USB
++
+ config USB_EHCI
+     bool
+     select USB
+diff --git a/hw/usb/hcd-imx21.c b/hw/usb/hcd-imx21.c
+new file mode 100644
+--- /dev/null
++++ b/hw/usb/hcd-imx21.c
+@@ -0,0 +1,985 @@
++/*
++ * i.MX21 USB OTG block: host controller
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The i.MX21 USB OTG module's host controller: a three-port root hub
++ * with OHCI-style port status registers, and a transfer engine driven by
++ * 32 endpoint transfer descriptors (ETDs) in the module's register
++ * space, with 4 KiB of on-chip data memory (DMEM) and a DMA engine that
++ * moves an ETD's data to and from system memory.
++ *
++ * Software writes an ETD (device address, endpoint, direction, format,
++ * max packet; X/Y buffers in DMEM; toggle, polling interval and
++ * completion code; byte count), points the ETD's DMA start address at
++ * system memory and enables the DMA, then sets the ETD's enable bit.
++ * The controller runs the transaction and reports completion through the
++ * ETD done status, the SOF and done interrupts and the completion code
++ * and residual count written back to the ETD.
++ *
++ * This model runs each control, bulk or interrupt ETD as one QEMU USB
++ * packet covering the whole byte count, retrying NAKed ones on later
++ * frames (every frame for bulk, every polling interval for interrupt).
++ * Isochronous ETDs run one packet in their start frame, with data moved
++ * either by the DMA or through DMEM. Frames are 1 ms of virtual time.
++ * Transceiver, HNP, the OTG block's own I2C master and the function
++ * (device) side are not modelled.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/core/sysbus.h"
++#include "hw/core/irq.h"
++#include "hw/usb/usb.h"
++#include "migration/vmstate.h"
++#include "system/dma.h"
++#include "system/address-spaces.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++#include "trace.h"
++
++#define TYPE_IMX21_USBOTG "imx21.usbotg"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21USBOTGState, IMX21_USBOTG)
++
++#define USBOTG_SIZE     0x2000
++#define REGS_SIZE       0x1000
++#define USBOTG_REGS     (REGS_SIZE / 4)
++#define DMEM_OFFSET     0x1000
++#define DMEM_SIZE       0x1000
++
++#define NUM_PORTS       3
++#define NUM_ETD         32
++
++/* OTG control */
++#define CINT_STAT       0x04
++#define CINT_STEN       0x08
++#define  CINT_HCINT     (1 << 0)
++#define RST_CTRL        0x10
++#define  RST_RSTHC      (1 << 0)
++#define  RST_RSTCTRL    (1 << 5)
++
++/* Host controller */
++#define HOST_CTRL       0x80
++#define  HOST_CTRL_HCRESET (1u << 31)
++#define SYSISR          0x88
++#define SYSIEN          0x8c
++#define  SYSI_PSCINT    (1 << 6)
++#define  SYSI_SOFINT    (1 << 2)
++#define  SYSI_DONEINT   (1 << 1)
++#define XBUFSTAT        0x98
++#define YBUFSTAT        0x9c
++#define XFILLSTAT       0xa8
++#define YFILLSTAT       0xac
++#define ETDENSET        0xc0
++#define ETDENCLR        0xc4
++#define ETDDONESTAT     0xd0
++#define ETDDONEEN       0xd4
++#define FRMNUB          0xe0
++#define ROOTHUBA        0xe8
++#define PORTSTAT0       0xf4
++#define PORTSTAT2       0xfc
++
++#define PORT_CCS        (1 << 0)
++#define PORT_PES        (1 << 1)
++#define PORT_PSS        (1 << 2)
++#define PORT_POCI       (1 << 3)
++#define PORT_PRS        (1 << 4)
++#define PORT_PPS        (1 << 8)
++#define PORT_LSDA       (1 << 9)
++#define PORT_CSC        (1 << 16)
++#define PORT_PESC       (1 << 17)
++#define PORT_PSSC       (1 << 18)
++#define PORT_OCIC       (1 << 19)
++#define PORT_PRSC       (1 << 20)
++#define PORT_WTC        (PORT_CSC | PORT_PESC | PORT_PSSC | PORT_OCIC | \
++                         PORT_PRSC)
++
++#define ETD_BASE        0x200
++#define ETD_END         (ETD_BASE + NUM_ETD * 16)
++
++/* DMA */
++#define ETDDMAEN        0x820
++#define ETDDMACHANLCLR  0x848
++#define ETDSMSA0        0x900
++#define ETDDMABUFPTR0   0xa00
++
++/* ETD fields */
++#define ETD_DIR_SETUP   0
++#define ETD_DIR_OUT     1
++#define ETD_DIR_IN      2
++#define ETD_FMT_CTRL    0
++#define ETD_FMT_ISO     1
++#define ETD_FMT_BULK    2
++#define ETD_FMT_INT     3
++
++#define CC_NOERROR      0x0
++#define CC_STALL        0x4
++#define CC_DEVNOTRESP   0x5
++#define CC_DATAOVERRUN  0x8
++#define CC_DATAUNDERRUN 0x9
++
++#define FRAME_NS        (1000 * 1000)
++
++typedef struct IMX21USBOTGState IMX21USBOTGState;
++
++typedef struct IMX21ETD {
++    IMX21USBOTGState *s;
++    USBPacket packet;
++    uint8_t *buf;
++    uint32_t len;
++    bool inflight;
++    /* Frame of the next attempt. */
++    uint32_t due;
++} IMX21ETD;
++
++struct IMX21USBOTGState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion container;
++    MemoryRegion iomem;
++    MemoryRegion dmem_io;
++    qemu_irq irq;
++    uint32_t regs[USBOTG_REGS];
++    uint8_t dmem[DMEM_SIZE];
++
++    USBBus bus;
++    USBPort ports[NUM_PORTS];
++    IMX21ETD etd[NUM_ETD];
++    QEMUTimer *frame_timer;
++    QEMUBH *bh;
++    int64_t frame_base;
++    uint32_t mig_frame;
++};
++
++#define R(off) (s->regs[(off) / 4])
++
++static uint32_t imx21_usb_frame(IMX21USBOTGState *s)
++{
++    return (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->frame_base) / FRAME_NS;
++}
++
++static uint32_t *etd_words(IMX21USBOTGState *s, int n)
++{
++    return &s->regs[(ETD_BASE + n * 16) / 4];
++}
++
++static void imx21_usb_update_irq(IMX21USBOTGState *s)
++{
++    bool level = (R(SYSISR) & R(SYSIEN)) != 0;
++
++    if (level) {
++        R(CINT_STAT) |= CINT_HCINT;
++    } else {
++        R(CINT_STAT) &= ~CINT_HCINT;
++    }
++    qemu_set_irq(s->irq, level && (R(CINT_STEN) & CINT_HCINT));
++}
++
++/* Arm the frame timer for the next frame anything is waiting for. */
++static void imx21_usb_arm(IMX21USBOTGState *s)
++{
++    uint32_t now = imx21_usb_frame(s);
++    uint32_t pending = R(ETDENSET);
++    bool any = false;
++    uint32_t next = 0;
++    int i;
++
++    for (i = 0; i < NUM_ETD; i++) {
++        IMX21ETD *e = &s->etd[i];
++        if (!(pending & (1u << i)) || e->inflight) {
++            continue;
++        }
++        if (!any || (int32_t)(e->due - next) < 0) {
++            next = e->due;
++            any = true;
++        }
++    }
++    /* While a done status is unhandled, keep raising SOF each frame. */
++    if (R(ETDDONESTAT) & R(ETDDONEEN)) {
++        if (!any || (int32_t)(now + 1 - next) < 0) {
++            next = now + 1;
++            any = true;
++        }
++    }
++    if (!any) {
++        timer_del(s->frame_timer);
++        return;
++    }
++    if ((int32_t)(next - now) <= 0) {
++        next = now + 1;
++    }
++    timer_mod(s->frame_timer, s->frame_base + (int64_t)next * FRAME_NS);
++}
++
++static USBDevice *imx21_usb_find_device(IMX21USBOTGState *s, uint8_t addr)
++{
++    int i;
++
++    for (i = 0; i < NUM_PORTS; i++) {
++        USBDevice *dev;
++        if (!(R(PORTSTAT0 + i * 4) & PORT_PES)) {
++            continue;
++        }
++        dev = usb_find_device(&s->ports[i], addr);
++        if (dev) {
++            return dev;
++        }
++    }
++    return NULL;
++}
++
++static void imx21_usb_etd_done(IMX21USBOTGState *s, int n, int cc,
++                               uint32_t actual)
++{
++    IMX21ETD *e = &s->etd[n];
++    uint32_t *w = etd_words(s, n);
++    uint32_t mask = 1u << n;
++    int fmt = (w[0] >> 14) & 3;
++    int dir = (w[0] >> 11) & 3;
++    uint32_t xbuf = w[1] & 0xffff;
++
++    if (dir == 3) {
++        dir = (w[2] >> 16) & 3;
++    }
++
++    if (dir == ETD_DIR_IN && actual) {
++        if (R(ETDDMAEN) & mask) {
++            dma_memory_write(&address_space_memory,
++                             s->regs[(ETDSMSA0 / 4) + n], e->buf, actual,
++                             MEMTXATTRS_UNSPECIFIED);
++        } else if (xbuf < DMEM_SIZE) {
++            memcpy(&s->dmem[xbuf], e->buf, MIN(actual, DMEM_SIZE - xbuf));
++        }
++        s->regs[(ETDDMABUFPTR0 / 4) + n] = s->regs[(ETDSMSA0 / 4) + n] +
++                                            actual;
++    }
++
++    if (fmt == ETD_FMT_ISO) {
++        w[3] = (cc << 12) | (actual & 0x3ff);
++    } else {
++        uint32_t mps = (w[0] >> 16) & 0x7ff;
++        uint32_t count = w[3] & 0x1fffff;
++        int tog = (w[2] >> 22) & 3;
++        uint32_t packets;
++
++        if (!mps) {
++            mps = 8;
++        }
++        tog = (tog & 2) ? (tog & 1) : ((w[0] >> 28) & 1);
++        packets = actual ? DIV_ROUND_UP(actual, mps) : 1;
++        if (dir == ETD_DIR_IN && actual && actual < count &&
++            actual % mps == 0) {
++            /* The transfer ended with a zero-length packet. */
++            packets++;
++        }
++        if (cc == CC_NOERROR || cc == CC_DATAUNDERRUN) {
++            tog ^= packets & 1;
++        }
++        w[0] = (w[0] & ~(1u << 28)) | ((uint32_t)tog << 28);
++        w[2] = (w[2] & 0x0fffffff) | ((uint32_t)cc << 28);
++        w[3] = (w[3] & ~0x1fffffu) | (count - MIN(actual, count));
++    }
++
++    if (dir == ETD_DIR_IN) {
++        R(XFILLSTAT) |= mask;
++    } else {
++        R(XFILLSTAT) &= ~mask;
++        R(YFILLSTAT) &= ~mask;
++    }
++
++    g_free(e->buf);
++    e->buf = NULL;
++    e->len = 0;
++    R(ETDENSET) &= ~mask;
++    R(ETDDONESTAT) |= mask;
++    if (R(ETDDONEEN) & mask) {
++        R(SYSISR) |= SYSI_DONEINT | SYSI_SOFINT;
++    }
++    trace_imx21_usb_etd_done(n, cc, actual);
++    imx21_usb_update_irq(s);
++}
++
++/* Complete an ETD from its packet's status, or schedule a NAK retry. */
++static void imx21_usb_packet_done(IMX21USBOTGState *s, int n)
++{
++    IMX21ETD *e = &s->etd[n];
++    uint32_t *w = etd_words(s, n);
++    int fmt = (w[0] >> 14) & 3;
++    int dir = (w[0] >> 11) & 3;
++    USBPacket *p = &e->packet;
++    uint32_t actual = p->actual_length;
++    int cc;
++
++    if (dir == 3) {
++        dir = (w[2] >> 16) & 3;
++    }
++
++    switch (p->status) {
++    case USB_RET_SUCCESS:
++        cc = CC_NOERROR;
++        if (dir == ETD_DIR_IN && fmt != ETD_FMT_ISO && actual < e->len &&
++            !((w[2] >> 18) & 1)) {
++            /* Short packet without buffer rounding. */
++            cc = CC_DATAUNDERRUN;
++        } else if (dir == ETD_DIR_IN && fmt == ETD_FMT_ISO &&
++                   actual < e->len) {
++            cc = CC_DATAUNDERRUN;
++        }
++        break;
++    case USB_RET_NAK:
++        if (fmt == ETD_FMT_ISO) {
++            cc = dir == ETD_DIR_IN ? CC_DATAUNDERRUN : CC_NOERROR;
++            actual = 0;
++            break;
++        }
++        /* Retry on a later frame; for interrupt, after the interval. */
++        if (fmt == ETD_FMT_INT) {
++            e->due = imx21_usb_frame(s) + MAX(w[2] & 0xff, 1);
++        } else {
++            e->due = imx21_usb_frame(s) + 1;
++        }
++        return;
++    case USB_RET_STALL:
++        cc = CC_STALL;
++        break;
++    case USB_RET_BABBLE:
++        cc = CC_DATAOVERRUN;
++        break;
++    case USB_RET_NODEV:
++    case USB_RET_IOERROR:
++    default:
++        cc = CC_DEVNOTRESP;
++        actual = 0;
++        break;
++    }
++    imx21_usb_etd_done(s, n, cc, actual);
++}
++
++static void imx21_usb_run_etd(IMX21USBOTGState *s, int n)
++{
++    IMX21ETD *e = &s->etd[n];
++    uint32_t *w = etd_words(s, n);
++    uint32_t mask = 1u << n;
++    uint8_t addr = w[0] & 0x7f;
++    uint8_t epnum = (w[0] >> 7) & 0xf;
++    int dir = (w[0] >> 11) & 3;
++    int fmt = (w[0] >> 14) & 3;
++    uint32_t xbuf = w[1] & 0xffff;
++    USBDevice *dev;
++    USBEndpoint *ep;
++    uint32_t len;
++    int pid;
++
++    if (fmt == ETD_FMT_ISO) {
++        len = w[3] & 0x3ff;
++    } else {
++        len = w[3] & 0x1fffff;
++    }
++
++    if (dir == 3) {
++        dir = (w[2] >> 16) & 3;
++    }
++    switch (dir) {
++    case ETD_DIR_SETUP:
++        pid = USB_TOKEN_SETUP;
++        break;
++    case ETD_DIR_OUT:
++        pid = USB_TOKEN_OUT;
++        break;
++    case ETD_DIR_IN:
++        pid = USB_TOKEN_IN;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "imx21-usb: ETD %d bad direction\n", n);
++        imx21_usb_etd_done(s, n, CC_DEVNOTRESP, 0);
++        return;
++    }
++
++    trace_imx21_usb_etd_run(n, addr, epnum, pid, fmt, len);
++
++    dev = imx21_usb_find_device(s, addr);
++    ep = dev ? usb_ep_get(dev, pid, epnum) : NULL;
++    if (!ep) {
++        imx21_usb_etd_done(s, n, CC_DEVNOTRESP, 0);
++        return;
++    }
++
++    g_free(e->buf);
++    e->buf = g_malloc0(MAX(len, 1));
++    e->len = len;
++    if (pid != USB_TOKEN_IN && len) {
++        if (R(ETDDMAEN) & mask) {
++            dma_memory_read(&address_space_memory,
++                            s->regs[(ETDSMSA0 / 4) + n], e->buf, len,
++                            MEMTXATTRS_UNSPECIFIED);
++            s->regs[(ETDDMABUFPTR0 / 4) + n] = s->regs[(ETDSMSA0 / 4) + n] +
++                                                len;
++        } else if (xbuf < DMEM_SIZE) {
++            memcpy(e->buf, &s->dmem[xbuf], MIN(len, DMEM_SIZE - xbuf));
++        }
++    }
++
++    usb_packet_setup(&e->packet, pid, ep, 0, n, false,
++                     fmt == ETD_FMT_INT);
++    usb_packet_addbuf(&e->packet, e->buf, len);
++    usb_handle_packet(dev, &e->packet);
++    if (e->packet.status == USB_RET_ASYNC) {
++        e->inflight = true;
++        return;
++    }
++    imx21_usb_packet_done(s, n);
++}
++
++static void imx21_usb_etd_enable(IMX21USBOTGState *s, int n)
++{
++    uint32_t *w = etd_words(s, n);
++    uint32_t frame = imx21_usb_frame(s);
++
++    if (((w[0] >> 14) & 3) == ETD_FMT_ISO) {
++        /* An isochronous ETD is due in its start frame. */
++        s->etd[n].due = frame + (int16_t)((w[2] & 0xffff) - (frame & 0xffff));
++    } else {
++        /*
++         * The others go out from the next frame on: the controller can't
++         * finish a transaction while software is still enabling it, and
++         * Linux's imx21-hcd enables the next stage of a control transfer
++         * from its interrupt handler, then acknowledges the interrupt
++         * status it read on entry, so a done raised in between is lost.
++         */
++        s->etd[n].due = frame + 1;
++    }
++}
++
++static void imx21_usb_process(IMX21USBOTGState *s)
++{
++    uint32_t frame = imx21_usb_frame(s);
++    uint32_t tried = 0;
++
++    /*
++     * Run the due ETDs oldest first, so that an endpoint's isochronous
++     * ETDs go out in frame order even when several are late.
++     */
++    for (;;) {
++        int i, best = -1;
++
++        for (i = 0; i < NUM_ETD; i++) {
++            IMX21ETD *e = &s->etd[i];
++            if (!(R(ETDENSET) & (1u << i)) || e->inflight ||
++                (tried & (1u << i)) || (int32_t)(e->due - frame) > 0) {
++                continue;
++            }
++            if (best < 0 || (int32_t)(e->due - s->etd[best].due) < 0) {
++                best = i;
++            }
++        }
++        if (best < 0) {
++            break;
++        }
++        tried |= 1u << best;
++        imx21_usb_run_etd(s, best);
++    }
++    imx21_usb_arm(s);
++}
++
++static void imx21_usb_bh(void *opaque)
++{
++    imx21_usb_process(opaque);
++}
++
++static void imx21_usb_frame_tick(void *opaque)
++{
++    IMX21USBOTGState *s = opaque;
++
++    /*
++     * While a done status is unhandled, raise the done interrupt again
++     * each frame, not just SOF. Linux's imx21-hcd acknowledges the SYSISR
++     * bits it read on entry to its handler, so a done raised while the
++     * handler runs is cleared unseen, and the handler keeps the SOF
++     * interrupt masked unless an ETD looks stuck.
++     */
++    if (R(ETDDONESTAT) & R(ETDDONEEN)) {
++        R(SYSISR) |= SYSI_DONEINT | SYSI_SOFINT;
++        imx21_usb_update_irq(s);
++    }
++    imx21_usb_process(s);
++}
++
++static void imx21_usb_cancel(IMX21USBOTGState *s, int n)
++{
++    IMX21ETD *e = &s->etd[n];
++
++    if (e->inflight) {
++        usb_cancel_packet(&e->packet);
++        e->inflight = false;
++    }
++    g_free(e->buf);
++    e->buf = NULL;
++    e->len = 0;
++}
++
++/* Root hub */
++
++static void imx21_usb_port_changed(IMX21USBOTGState *s)
++{
++    R(SYSISR) |= SYSI_PSCINT;
++    imx21_usb_update_irq(s);
++}
++
++static void imx21_usb_port_write(IMX21USBOTGState *s, int i, uint32_t val)
++{
++    uint32_t *r = &R(PORTSTAT0 + i * 4);
++    uint32_t old = *r;
++
++    *r &= ~(val & PORT_WTC);
++
++    if (val & PORT_CCS) {
++        /* ClearPortEnable */
++        *r &= ~PORT_PES;
++    }
++    if ((val & PORT_PES) && (*r & PORT_CCS)) {
++        *r |= PORT_PES;
++    }
++    if ((val & PORT_PSS) && (*r & PORT_CCS)) {
++        *r |= PORT_PSS;
++    }
++    if ((val & PORT_POCI) && (*r & PORT_PSS)) {
++        /* ClearSuspendStatus: resume completes at once. */
++        *r &= ~PORT_PSS;
++        *r |= PORT_PSSC;
++    }
++    if ((val & PORT_PRS) && (*r & PORT_CCS)) {
++        /* Reset completes at once and enables the port. */
++        usb_device_reset(s->ports[i].dev);
++        *r &= ~(PORT_PRS | PORT_PSS);
++        *r |= PORT_PES | PORT_PRSC;
++    }
++    if (val & PORT_PPS) {
++        *r |= PORT_PPS;
++    }
++    if (val & PORT_LSDA) {
++        /* ClearPortPower */
++        *r &= ~PORT_PPS;
++    }
++    trace_imx21_usb_port_write(i, val, old, *r);
++}
++
++static void imx21_usb_attach(USBPort *port)
++{
++    IMX21USBOTGState *s = port->opaque;
++    uint32_t *r = &R(PORTSTAT0 + port->index * 4);
++
++    *r |= PORT_CCS | PORT_CSC;
++    if (port->dev->speed == USB_SPEED_LOW) {
++        *r |= PORT_LSDA;
++    } else {
++        *r &= ~PORT_LSDA;
++    }
++    trace_imx21_usb_port_attach(port->index);
++    imx21_usb_port_changed(s);
++}
++
++static void imx21_usb_child_detach(USBPort *port, USBDevice *child)
++{
++    IMX21USBOTGState *s = port->opaque;
++    int i;
++
++    for (i = 0; i < NUM_ETD; i++) {
++        IMX21ETD *e = &s->etd[i];
++        if (e->inflight && e->packet.ep->dev == child) {
++            usb_cancel_packet(&e->packet);
++            e->inflight = false;
++        }
++    }
++    qemu_bh_schedule(s->bh);
++}
++
++static void imx21_usb_detach(USBPort *port)
++{
++    IMX21USBOTGState *s = port->opaque;
++    uint32_t *r = &R(PORTSTAT0 + port->index * 4);
++
++    imx21_usb_child_detach(port, port->dev);
++    if (*r & PORT_CCS) {
++        *r &= ~PORT_CCS;
++        *r |= PORT_CSC;
++    }
++    if (*r & PORT_PES) {
++        *r &= ~PORT_PES;
++        *r |= PORT_PESC;
++    }
++    trace_imx21_usb_port_detach(port->index);
++    imx21_usb_port_changed(s);
++}
++
++static void imx21_usb_wakeup(USBPort *port)
++{
++    IMX21USBOTGState *s = port->opaque;
++    uint32_t *r = &R(PORTSTAT0 + port->index * 4);
++
++    if (*r & PORT_PSS) {
++        *r &= ~PORT_PSS;
++        *r |= PORT_PSSC;
++        imx21_usb_port_changed(s);
++    }
++}
++
++static void imx21_usb_complete(USBPort *port, USBPacket *p)
++{
++    IMX21ETD *e = container_of(p, IMX21ETD, packet);
++    IMX21USBOTGState *s = e->s;
++
++    e->inflight = false;
++    imx21_usb_packet_done(s, e - s->etd);
++    qemu_bh_schedule(s->bh);
++}
++
++static void imx21_usb_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
++                                      unsigned int stream)
++{
++    IMX21USBOTGState *s = container_of(bus, IMX21USBOTGState, bus);
++    uint32_t frame = imx21_usb_frame(s);
++    int i;
++
++    /* New data on an endpoint: retry its NAKed ETDs now. */
++    for (i = 0; i < NUM_ETD; i++) {
++        IMX21ETD *e = &s->etd[i];
++        uint32_t fmt = (etd_words(s, i)[0] >> 14) & 3;
++        if ((R(ETDENSET) & (1u << i)) && !e->inflight &&
++            fmt != ETD_FMT_ISO && (int32_t)(e->due - frame) > 0) {
++            e->due = frame;
++        }
++    }
++    qemu_bh_schedule(s->bh);
++}
++
++static USBPortOps imx21_usb_port_ops = {
++    .attach = imx21_usb_attach,
++    .detach = imx21_usb_detach,
++    .child_detach = imx21_usb_child_detach,
++    .wakeup = imx21_usb_wakeup,
++    .complete = imx21_usb_complete,
++};
++
++static USBBusOps imx21_usb_bus_ops = {
++    .wakeup_endpoint = imx21_usb_wakeup_endpoint,
++};
++
++/* Reset the host controller, keeping what is plugged into the ports. */
++static void imx21_usb_host_reset(IMX21USBOTGState *s)
++{
++    int i;
++
++    for (i = 0; i < NUM_ETD; i++) {
++        imx21_usb_cancel(s, i);
++        s->etd[i].due = 0;
++    }
++    timer_del(s->frame_timer);
++    for (i = HOST_CTRL / 4; i < USBOTG_REGS; i++) {
++        s->regs[i] = 0;
++    }
++    memset(s->dmem, 0, sizeof(s->dmem));
++    /* Three downstream ports, no power switching. */
++    R(ROOTHUBA) = 0x00000103;
++    for (i = 0; i < NUM_PORTS; i++) {
++        USBDevice *dev = s->ports[i].dev;
++        if (dev && dev->attached) {
++            R(PORTSTAT0 + i * 4) = PORT_CCS | PORT_CSC |
++                (dev->speed == USB_SPEED_LOW ? PORT_LSDA : 0);
++        }
++    }
++    s->frame_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    imx21_usb_update_irq(s);
++}
++
++static uint64_t imx21_usbotg_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21USBOTGState *s = opaque;
++    uint32_t val;
++
++    switch (offset) {
++    case RST_CTRL:
++        /* Resets complete at once. */
++        val = 0;
++        break;
++    case FRMNUB:
++        val = imx21_usb_frame(s) & 0xffff;
++        break;
++    case ETDENCLR:
++    case ETDDMACHANLCLR:
++        val = 0;
++        break;
++    default:
++        val = s->regs[offset / 4];
++        break;
++    }
++    trace_imx21_usb_read(offset, val);
++    return val;
++}
++
++static void imx21_usbotg_write(void *opaque, hwaddr offset, uint64_t val,
++                               unsigned size)
++{
++    IMX21USBOTGState *s = opaque;
++    uint32_t *r = &s->regs[offset / 4];
++    int i;
++
++    trace_imx21_usb_write(offset, val);
++
++    switch (offset) {
++    case CINT_STAT:
++        break;
++    case CINT_STEN:
++        *r = val;
++        imx21_usb_update_irq(s);
++        break;
++    case RST_CTRL:
++        if (val & (RST_RSTHC | RST_RSTCTRL)) {
++            imx21_usb_host_reset(s);
++        }
++        break;
++    case HOST_CTRL:
++        if (val & HOST_CTRL_HCRESET) {
++            imx21_usb_host_reset(s);
++        }
++        *r = val & ~HOST_CTRL_HCRESET;
++        break;
++    case SYSISR:
++        *r &= ~val;
++        imx21_usb_update_irq(s);
++        break;
++    case SYSIEN:
++        *r = val;
++        imx21_usb_update_irq(s);
++        break;
++    case XBUFSTAT:
++    case YBUFSTAT:
++    case XFILLSTAT:
++    case YFILLSTAT:
++    case ETDDMAEN:
++        /* Writing 1 toggles a bit. */
++        *r ^= val;
++        break;
++    case ETDDONESTAT:
++        *r &= ~val;
++        imx21_usb_arm(s);
++        break;
++    case ETDENSET:
++        for (i = 0; i < NUM_ETD; i++) {
++            if ((val & (1u << i)) && !(*r & (1u << i))) {
++                imx21_usb_etd_enable(s, i);
++            }
++        }
++        *r |= val;
++        qemu_bh_schedule(s->bh);
++        break;
++    case ETDENCLR:
++        for (i = 0; i < NUM_ETD; i++) {
++            if (val & (1u << i)) {
++                imx21_usb_cancel(s, i);
++            }
++        }
++        R(ETDENSET) &= ~val;
++        break;
++    case ETDDMACHANLCLR:
++        /*
++         * Clearing an ETD's DMA channel also disables its DMA. Linux's
++         * imx21-hcd relies on that: it clears the channel when it retires
++         * an ETD and later enables DMA with a read-modify-write of
++         * ETDDMAEN, which would otherwise toggle a stale enable off.
++         */
++        R(ETDDMAEN) &= ~val;
++        for (i = 0; i < NUM_ETD; i++) {
++            if (val & (1u << i)) {
++                s->regs[(ETDDMABUFPTR0 / 4) + i] =
++                    s->regs[(ETDSMSA0 / 4) + i];
++            }
++        }
++        break;
++    case FRMNUB:
++        break;
++    case ROOTHUBA:
++        /* The port count is fixed. */
++        *r = (*r & 0xff) | (val & ~0xffu);
++        break;
++    case PORTSTAT0 ... PORTSTAT2:
++        imx21_usb_port_write(s, (offset - PORTSTAT0) / 4, val);
++        break;
++    default:
++        *r = val;
++        break;
++    }
++}
++
++static const MemoryRegionOps imx21_usbotg_ops = {
++    .read = imx21_usbotg_read,
++    .write = imx21_usbotg_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static uint64_t imx21_usb_dmem_read(void *opaque, hwaddr offset,
++                                    unsigned size)
++{
++    IMX21USBOTGState *s = opaque;
++
++    return ldn_le_p(&s->dmem[offset], size);
++}
++
++static void imx21_usb_dmem_write(void *opaque, hwaddr offset, uint64_t val,
++                                 unsigned size)
++{
++    IMX21USBOTGState *s = opaque;
++
++    stn_le_p(&s->dmem[offset], size, val);
++}
++
++static const MemoryRegionOps imx21_usb_dmem_ops = {
++    .read = imx21_usb_dmem_read,
++    .write = imx21_usb_dmem_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_usbotg_reset(DeviceState *dev)
++{
++    IMX21USBOTGState *s = IMX21_USBOTG(dev);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    imx21_usb_host_reset(s);
++}
++
++static void imx21_usbotg_init(Object *obj)
++{
++    IMX21USBOTGState *s = IMX21_USBOTG(obj);
++
++    memory_region_init(&s->container, obj, TYPE_IMX21_USBOTG, USBOTG_SIZE);
++    memory_region_init_io(&s->iomem, obj, &imx21_usbotg_ops, s,
++                          TYPE_IMX21_USBOTG ".regs", REGS_SIZE);
++    memory_region_init_io(&s->dmem_io, obj, &imx21_usb_dmem_ops, s,
++                          TYPE_IMX21_USBOTG ".dmem", DMEM_SIZE);
++    memory_region_add_subregion(&s->container, 0, &s->iomem);
++    memory_region_add_subregion(&s->container, DMEM_OFFSET, &s->dmem_io);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->container);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++}
++
++static void imx21_usbotg_realize(DeviceState *dev, Error **errp)
++{
++    IMX21USBOTGState *s = IMX21_USBOTG(dev);
++    int i;
++
++    usb_bus_new(&s->bus, sizeof(s->bus), &imx21_usb_bus_ops, dev);
++    for (i = 0; i < NUM_PORTS; i++) {
++        usb_register_port(&s->bus, &s->ports[i], s, i, &imx21_usb_port_ops,
++                          USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL);
++    }
++    for (i = 0; i < NUM_ETD; i++) {
++        s->etd[i].s = s;
++        usb_packet_init(&s->etd[i].packet);
++    }
++    s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, imx21_usb_frame_tick, s);
++    s->bh = qemu_bh_new_guarded(imx21_usb_bh, s,
++                                &dev->mem_reentrancy_guard);
++}
++
++static int imx21_usbotg_pre_save(void *opaque)
++{
++    IMX21USBOTGState *s = opaque;
++
++    /* Store the frame number, not the clock it is counted from. */
++    s->mig_frame = imx21_usb_frame(s);
++    return 0;
++}
++
++static int imx21_usbotg_pre_load(void *opaque)
++{
++    IMX21USBOTGState *s = opaque;
++    int i;
++
++    /*
++     * A restore into a running machine: its packets in flight belong to
++     * the state being replaced, and must not complete into the new one.
++     */
++    for (i = 0; i < NUM_ETD; i++) {
++        imx21_usb_cancel(s, i);
++    }
++    return 0;
++}
++
++static int imx21_usbotg_post_load(void *opaque, int version_id)
++{
++    IMX21USBOTGState *s = opaque;
++
++    s->frame_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
++                    (int64_t)s->mig_frame * FRAME_NS;
++    /* Packets in flight are lost; run their ETDs again. */
++    qemu_bh_schedule(s->bh);
++    return 0;
++}
++
++static const VMStateDescription vmstate_imx21_etd = {
++    .name = TYPE_IMX21_USBOTG ".etd",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(due, IMX21ETD),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static const VMStateDescription vmstate_imx21_usbotg = {
++    .name = TYPE_IMX21_USBOTG,
++    .version_id = 2,
++    .minimum_version_id = 2,
++    .pre_save = imx21_usbotg_pre_save,
++    .pre_load = imx21_usbotg_pre_load,
++    .post_load = imx21_usbotg_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, IMX21USBOTGState, USBOTG_REGS),
++        VMSTATE_UINT8_ARRAY(dmem, IMX21USBOTGState, DMEM_SIZE),
++        VMSTATE_STRUCT_ARRAY(etd, IMX21USBOTGState, NUM_ETD, 1,
++                             vmstate_imx21_etd, IMX21ETD),
++        VMSTATE_UINT32(mig_frame, IMX21USBOTGState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_usbotg_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = imx21_usbotg_realize;
++    dc->vmsd = &vmstate_imx21_usbotg;
++    device_class_set_legacy_reset(dc, imx21_usbotg_reset);
++    dc->desc = "i.MX21 USB OTG (host controller)";
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++}
++
++static const TypeInfo imx21_usbotg_info = {
++    .name = TYPE_IMX21_USBOTG,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21USBOTGState),
++    .instance_init = imx21_usbotg_init,
++    .class_init = imx21_usbotg_class_init,
++};
++
++static void imx21_usbotg_register_types(void)
++{
++    type_register_static(&imx21_usbotg_info);
++}
++
++type_init(imx21_usbotg_register_types)
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -17,6 +17,7 @@ system_ss.add(when: 'CONFIG_USB_UHCI', if_true: files('hcd-uhci.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI', if_true: files('hcd-ohci.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI_PCI', if_true: files('hcd-ohci-pci.c'))
+ system_ss.add(when: 'CONFIG_USB_OHCI_SYSBUS', if_true: files('hcd-ohci-sysbus.c'))
++system_ss.add(when: 'CONFIG_USB_IMX21', if_true: files('hcd-imx21.c'))
+ system_ss.add(when: 'CONFIG_USB_EHCI', if_true: files('hcd-ehci.c'))
+ system_ss.add(when: 'CONFIG_USB_EHCI_PCI', if_true: files('hcd-ehci-pci.c'))
+ system_ss.add(when: 'CONFIG_USB_EHCI_SYSBUS', if_true: files('hcd-ehci-sysbus.c'))
+diff --git a/hw/usb/trace-events b/hw/usb/trace-events
+--- a/hw/usb/trace-events
++++ b/hw/usb/trace-events
+@@ -377,3 +377,12 @@ canokey_handle_data_out(uint8_t ep_out, uint32_t out_len) "ep %d len %d"
+ canokey_handle_data_in(uint8_t ep_in, uint32_t in_len) "ep %d len %d"
+ canokey_realize(void)
+ canokey_unrealize(void)
++
++# hcd-imx21.c
++imx21_usb_read(uint64_t offset, uint32_t val) "offset 0x%03" PRIx64 " -> 0x%08x"
++imx21_usb_write(uint64_t offset, uint64_t val) "offset 0x%03" PRIx64 " <- 0x%08" PRIx64
++imx21_usb_etd_run(int etd, int addr, int ep, int pid, int fmt, uint32_t len) "ETD %d dev %d ep %d pid 0x%02x format %d len %u"
++imx21_usb_etd_done(int etd, int cc, uint32_t actual) "ETD %d cc 0x%x actual %u"
++imx21_usb_port_write(int port, uint32_t val, uint32_t old, uint32_t new) "port %d write 0x%08x: 0x%08x -> 0x%08x"
++imx21_usb_port_attach(int port) "port %d"
++imx21_usb_port_detach(int port) "port %d"
