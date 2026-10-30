@@ -18,6 +18,7 @@ int run_app(rust::Str app_id, rust::Str version);
 void send_key(int key, int modifiers, std::uint32_t scan_code, rust::Str text, bool press);
 void send_mouse(double x, double y, int kind);
 bool grab_window(rust::Str path);
+rust::String window_title();
 void quit_app();
 
 } // namespace chumby

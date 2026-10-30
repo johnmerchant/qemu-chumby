@@ -12,6 +12,7 @@
 //!     click X Y               a mouse click at X, Y in the window
 //!     grab FILE               the window's image to FILE (PNG)
 //!     log FILE                the console's output so far to FILE
+//!     title                   print the window's title
 //!     console TEXT            type TEXT and Enter on the serial console
 //!     call ACTION [ARGS]      what a control does: save, load, pause,
 //!                             resume, reset, shake, tilt P R, headphones
@@ -175,6 +176,10 @@ pub fn run(script: PathBuf, qt: Qt) {
                     let path = rest.to_owned();
                     let ok = on_gui(&qt, move |_| qobject::grab_window(&path)).unwrap_or(false);
                     eprintln!("test: grab {rest}: {}", if ok { "saved" } else { "FAILED" });
+                }
+                "title" => {
+                    let t = on_gui(&qt, |_| qobject::window_title()).unwrap_or_default();
+                    eprintln!("test: title {t:?}");
                 }
                 "console" => {
                     let line = rest.to_owned();

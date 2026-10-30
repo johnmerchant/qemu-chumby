@@ -28,6 +28,8 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
     public var scale: Double?
     /// A unix socket on the Mac for UART2, the link: QEMU connects to it.
     public var link: String?
+    /// The window's title and QEMU's -name; nil: made from the images.
+    public var title: String?
     /// Passed to QEMU as they are.
     public var extra: [String] = []
 
@@ -45,6 +47,9 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
         --scale N       points per Chumby pixel (default: a real Chumby's size)
         --link SOCK     UART2 to the unix socket SOCK, which a program here
                         listens on (no network)
+        --title TEXT    the window's title and QEMU's -name (default: "Chumby —"
+                        and the images folder's name, or the kernel's folder's,
+                        then the kernel's version once it prints it)
         -- ARGS         passed to QEMU as they are
 
         With no images, a start window offers to open some, and the Chumbys
@@ -85,6 +90,7 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
             case "--audio": o.audio = try value(a)
             case "--state": o.state = try value(a)
             case "--link": o.link = try value(a)
+            case "--title": o.title = try value(a)
             case "--write": o.write = true
             case "--fast": o.fast = true
             case "--scale":
@@ -119,11 +125,61 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
         return FileManager.default.fileExists(atPath: p) ? p : nil
     }
 
-    /// A short name for recents and the window title.
+    /// A short name for recents and the window title: the images
+    /// folder's name, or the folder the kernel is in
+    /// (sideload-dist-stable/sideload-zImage: sideload-dist-stable).
     public var displayName: String {
-        if let images { return (images as NSString).lastPathComponent }
-        if let kernel { return (kernel as NSString).lastPathComponent }
-        return "Chumby"
+        let name: String
+        if let images {
+            name = URL(fileURLWithPath: images).standardizedFileURL.lastPathComponent
+        } else if let kernel {
+            let url = URL(fileURLWithPath: kernel).standardizedFileURL
+            let dir = url.deletingLastPathComponent().lastPathComponent
+            name = dir.isEmpty || dir == "/" ? url.lastPathComponent : dir
+        } else {
+            return "Chumby"
+        }
+        return shortened(name, to: 40)
+    }
+
+    /// The window's title, and QEMU's -name: --title, or "Chumby — " and
+    /// displayName, and the kernel's version once it is known.
+    public func windowTitle(linux: String? = nil) -> String {
+        if let title { return title }
+        if isEmpty { return "Chumby" }
+        var t = "Chumby — " + displayName
+        if let linux { t += " · Linux " + shortened(linux, to: 32) }
+        if link != nil { t += " · linked" }
+        return t
+    }
+}
+
+/// S, at most MAX characters: its middle elided.
+public func shortened(_ s: String, to max: Int) -> String {
+    guard s.count > max else { return s }
+    let head = (max - 1) / 2
+    return String(s.prefix(head)) + "…" + String(s.suffix(max - 1 - head))
+}
+
+/// The kernel's version, from the console's first output: the word after
+/// "Linux version " in the boot banner.
+public struct LinuxVersionWatch {
+    private var tail = ""
+    private var seen = 0
+    public private(set) var version: String?
+    public init() {}
+
+    /// The version, the first time it is complete in what was printed.
+    public mutating func feed(_ bytes: [UInt8]) -> String? {
+        // The banner is the kernel's first line: give up after 64 KB.
+        guard version == nil, seen < 65536 else { return nil }
+        seen += bytes.count
+        tail = String((tail + String(decoding: bytes, as: UTF8.self)).suffix(400))
+        guard let r = tail.range(of: "Linux version ") else { return nil }
+        let rest = tail[r.upperBound...]
+        guard let end = rest.firstIndex(where: { $0.isWhitespace }), end > rest.startIndex else { return nil }
+        version = String(rest[..<end])
+        return version
     }
 }
 
@@ -214,7 +270,9 @@ public struct QemuCommand {
         }
         guard let kernel = o.kernelPath else { throw LaunchError("no kernel: give an images directory or --kernel") }
         var machine = "chumby-classic"
-        var args = ["-name", "Chumby", "-kernel", kernel,
+        // guest= takes any text; a comma in it is doubled.
+        let name = "guest=" + o.windowTitle().replacingOccurrences(of: ",", with: ",,")
+        var args = ["-name", name, "-kernel", kernel,
                     "-qmp", "unix:\(qmpPath),server=on,wait=off",
                     "-serial", "unix:\(consolePath),server=on,wait=off",
                     "-monitor", "none", "-nic", "none",

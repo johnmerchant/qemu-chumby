@@ -36,7 +36,8 @@ ApplicationWindow {
     minimumWidth: 22 * unit
     minimumHeight: 18 * unit
     visible: true
-    title: !active ? "Chumby" : machine.paused ? qsTr("Chumby (paused)") : "Chumby"
+    // What is running (--title, or the images' folder and the kernel's version).
+    title: !active ? "Chumby" : machine.paused ? qsTr("%1 (paused)").arg(machine.title) : machine.title
 
     FontMetrics { id: fm }
     Machine { id: machine }

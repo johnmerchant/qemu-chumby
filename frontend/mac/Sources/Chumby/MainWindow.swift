@@ -125,7 +125,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         w.contentMinSize = NSSize(width: 200, height: 150)
         w.contentViewController = split
         w.toolbar?.isVisible = true
-        w.title = s.options.displayName
+        w.title = s.options.windowTitle()
         w.subtitle = "Starting…"
         scale = s.options.scale.map { CGFloat($0) } ?? realSizeScale(on: w.screen ?? NSScreen.main)
         fitWindow()
@@ -139,6 +139,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         case .starting:
             w.subtitle = "Starting…"
         case .running:
+            w.title = s.options.windowTitle(linux: s.linuxVersion)
             if s.message == nil {
                 w.subtitle = s.running ? "Running · no network" : "Paused"
             } else {

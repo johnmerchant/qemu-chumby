@@ -106,11 +106,12 @@ class Console(QtCore.QObject):
 
 class Panel(QtWidgets.QMainWindow):
     def __init__(self, qmp, events, con_path, proc, display, audio,
-                 snapshot="chumby", other="chumby-fast"):
+                 snapshot="chumby", other="chumby-fast", title="Chumby"):
         super().__init__()
         self.qmp, self.events, self.proc = qmp, events, proc
         self.snapshot, self.other = snapshot, other
-        self.setWindowTitle("Chumby")
+        self.title = title
+        self.setWindowTitle(title)
         props = {p["name"] for p in qmp.cmd("qom-list", path="/machine")}
         self.has = lambda *names: all(n in props for n in names)
 
@@ -441,7 +442,7 @@ class Panel(QtWidgets.QMainWindow):
         self.pause.setToolTip("Stop the Chumby (Ctrl+P)" if running
                               else "Carry on (Ctrl+P)")
         self.banner.setVisible(not running)
-        self.setWindowTitle("Chumby" if running else "Chumby (paused)")
+        self.setWindowTitle(self.title if running else self.title + " (paused)")
         self.runstate.setText("\u25b6 Running" if running else "\u23f8 Paused")
         self.runstate.setStyleSheet("color: #2e8b57; font-weight: bold;" if running
                                     else "color: #c47f00; font-weight: bold;")
