@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""qemu-sync [--dry-run | --self-test]: keeps qemu-release in step with
+QEMU's releases. CI's qemu-sync job runs it daily; run by hand, it does
+the same from a checkout of main.
+
+QEMU's releases are its tags at https://gitlab.com/qemu-project/qemu,
+vMAJOR.MINOR.PATCH only (never -rc). Two bumps can be due:
+
+  point   the newest release of the pinned series (11.1.x), which the
+          patches should still apply to;
+  series  the newest release of the newest newer series (11.2.x,
+          12.0.x...), which will likely need porting.
+
+Each is one commit on a fixed branch, qemu-bump/point or
+qemu-bump/series, made from the current commit (main): qemu-release
+(version, url, sha256) and the README's mentions of the version. Its
+tarball is downloaded from download.qemu.org and checked against the
+.sig beside it, a detached signature by QEMU's release key, which is
+pinned here (FINGERPRINT, and qemu-release-key.asc): nothing else is
+trusted, and the SHA-256 written is that of the verified file.
+
+The branch is force-pushed and a pull request opened (or, for a newer
+release than the open one targets, updated) with gh, then CI is run on
+the branch with workflow_dispatch, since what GITHUB_TOKEN pushes or
+opens starts no workflow. If an open pull request already targets the
+version, nothing is done. Where the repository doesn't let workflows
+open pull requests, the branch is pushed and the URL to open one by
+hand is printed. Nothing is merged or approved.
+
+--dry-run does everything but commit, push and touch pull requests: it
+finds the releases, downloads and verifies what's due, and prints the
+plan. --self-test checks the verification: the pinned release's tarball
+must pass and match qemu-release's SHA-256, and a copy with one byte
+changed must fail.
+
+Needs git, gpgv, and for anything but --self-test, gh (GH_TOKEN).
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+UPSTREAM = "https://gitlab.com/qemu-project/qemu"
+DOWNLOAD = "https://download.qemu.org"
+
+# QEMU's release key: Michael Roth's, which has signed QEMU's source
+# tarballs since 2013 and every 11.x release. https://www.qemu.org/download/
+# gives this fingerprint, and keys.openpgp.org and keyserver.ubuntu.com
+# both serve the key with it; qemu-release-key.asc is keys.openpgp.org's
+# copy. A release signed with any other key fails here.
+FINGERPRINT = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
+KEYFILE = os.path.join(HERE, "qemu-release-key.asc")
+
+BRANCHES = {"point": "qemu-bump/point", "series": "qemu-bump/series"}
+BOT = "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+
+
+def run(*cmd, check=True, capture=True, **kw):
+    r = subprocess.run(cmd, check=False, text=True,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None, **kw)
+    if check and r.returncode != 0:
+        sys.exit(f"{' '.join(cmd)}: exit {r.returncode}\n{r.stderr or ''}")
+    return r
+
+
+def parse(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def fmt(v):
+    return ".".join(str(x) for x in v)
+
+
+def releases():
+    """Every final release tagged upstream, as (major, minor, patch)."""
+    out = run("git", "ls-remote", "--tags", "--refs", UPSTREAM + ".git").stdout
+    vs = set()
+    for line in out.splitlines():
+        m = re.fullmatch(r"[0-9a-f]+\trefs/tags/v(\d+)\.(\d+)\.(\d+)", line)
+        if m:
+            vs.add(tuple(int(x) for x in m.groups()))
+    if not vs:
+        sys.exit(f"no releases found at {UPSTREAM}")
+    return sorted(vs)
+
+
+def due(current, vs):
+    """{kind: version} of the bumps due from current."""
+    plan = {}
+    point = max(v for v in vs if v[:2] == current[:2])
+    if point > current:
+        plan["point"] = point
+    newer = [v for v in vs if v[:2] > current[:2]]
+    if newer:
+        plan["series"] = max(newer)
+    return plan
+
+
+def tarball_url(v):
+    return f"{DOWNLOAD}/qemu-{fmt(v)}.tar.xz"
+
+
+def published(url):
+    req = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=60):
+            return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
+def download(url, path):
+    print(f"fetching {url}", flush=True)
+    with urllib.request.urlopen(url, timeout=300) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def keyring(tmp):
+    """KEYFILE unarmoured into tmp, for gpgv, once its primary key is
+    checked to be FINGERPRINT's."""
+    ring = os.path.join(tmp, "qemu-release-key.gpg")
+    if os.path.exists(ring):
+        return ring
+    with open(KEYFILE) as f:
+        text = f.read()
+    m = re.search(r"-----BEGIN PGP PUBLIC KEY BLOCK-----\n(?:[^\n]+\n)*\n"
+                  r"([A-Za-z0-9+/=\n]+?)\n=[A-Za-z0-9+/]{4}\n"
+                  r"-----END PGP PUBLIC KEY BLOCK-----", text)
+    if not m:
+        sys.exit(f"{KEYFILE}: not an armoured public key")
+    data = base64.b64decode(m.group(1))
+    # The first packet, the primary key: a v4 key's fingerprint is the
+    # SHA-1 of 0x99, its two-byte length and its body (RFC 4880 12.2).
+    tag = data[0]
+    if tag & 0xC0 == 0xC0:  # new format
+        if (tag & 0x3F) != 6 or data[1] >= 224:
+            sys.exit(f"{KEYFILE}: unexpected first packet")
+        if data[1] < 192:
+            n, off = data[1], 2
+        else:
+            n, off = ((data[1] - 192) << 8) + data[2] + 192, 3
+    elif tag & 0x80 and (tag >> 2) & 0xF == 6:  # old format
+        lt = tag & 3
+        size = {0: 1, 1: 2, 2: 4}[lt]
+        n, off = int.from_bytes(data[1:1 + size], "big"), 1 + size
+    else:
+        sys.exit(f"{KEYFILE}: unexpected first packet")
+    key = data[off:off + n]
+    fpr = hashlib.sha1(b"\x99" + n.to_bytes(2, "big") + key).hexdigest().upper()
+    if key[0] != 4 or fpr != FINGERPRINT:
+        sys.exit(f"{KEYFILE} is not the key {FINGERPRINT} (it's {fpr})")
+    with open(ring, "wb") as f:
+        f.write(data)
+    return ring
+
+
+def verify(path, sig, tmp):
+    """True if sig is a good signature of path by FINGERPRINT's key."""
+    r = run("gpgv", "--keyring", keyring(tmp), "--status-fd", "1", sig, path,
+            check=False)
+    status = [l.split() for l in r.stdout.splitlines()]
+    good = any(l[1:2] == ["GOODSIG"] for l in status)
+    # VALIDSIG's last field is the signing key's primary fingerprint.
+    valid = any(l[1:2] == ["VALIDSIG"] and l[-1] == FINGERPRINT for l in status)
+    return r.returncode == 0 and good and valid
+
+
+def fetch_verified(v, tmp):
+    """The verified tarball of v in tmp, and its SHA-256."""
+    url = tarball_url(v)
+    path = os.path.join(tmp, os.path.basename(url))
+    download(url, path)
+    download(url + ".sig", path + ".sig")
+    if not verify(path, path + ".sig", tmp):
+        sys.exit(f"{url}: its signature does not verify with {FINGERPRINT}")
+    digest = sha256(path)
+    print(f"verified {os.path.basename(url)}: signed by {FINGERPRINT}, "
+          f"SHA-256 {digest}")
+    os.unlink(path)
+    os.unlink(path + ".sig")
+    return digest
+
+
+def pinned():
+    vals = {}
+    with open(os.path.join(HERE, "qemu-release")) as f:
+        for line in f:
+            k, _, val = line.strip().partition("=")
+            vals[k] = val
+    return vals
+
+
+def self_test():
+    p = pinned()
+    v = parse(p["version"])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, os.path.basename(p["url"]))
+        download(p["url"], path)
+        download(p["url"] + ".sig", path + ".sig")
+        if not verify(path, path + ".sig", tmp):
+            sys.exit(f"FAIL: {fmt(v)}'s tarball does not verify")
+        if sha256(path) != p["sha256"]:
+            sys.exit(f"FAIL: {fmt(v)}'s tarball verifies but isn't qemu-release's")
+        print(f"ok: {fmt(v)}'s tarball verifies and matches qemu-release")
+        with open(path, "r+b") as f:
+            f.seek(os.path.getsize(path) // 2)
+            b = f.read(1)
+            f.seek(-1, 1)
+            f.write(bytes([b[0] ^ 1]))
+        if verify(path, path + ".sig", tmp):
+            sys.exit("FAIL: a tampered tarball verifies")
+        print("ok: a tampered tarball fails")
+
+
+def gh_json(*args):
+    return json.loads(run("gh", *args).stdout or "null")
+
+
+def repo():
+    r = os.environ.get("GITHUB_REPOSITORY")
+    if r:
+        return r
+    url = run("git", "-C", HERE, "remote", "get-url", "origin").stdout.strip()
+    m = re.search(r"github\.com[:/](.+?)(\.git)?$", url)
+    return m.group(1)
+
+
+def remote_version(branch):
+    """The version qemu-release pins on origin's branch, or None."""
+    if not run("git", "-C", HERE, "ls-remote", "--heads", "origin", branch).stdout.strip():
+        return None
+    run("git", "-C", HERE, "fetch", "-q", "origin", f"refs/heads/{branch}")
+    text = run("git", "-C", HERE, "show", "FETCH_HEAD:qemu-release").stdout
+    m = re.search(r"^version=(.+)$", text, re.M)
+    return m.group(1) if m else None
+
+
+def changes(old, new):
+    """Markdown on what changed upstream from old to new."""
+    s = (f"QEMU's changelog for {new[0]}.{new[1]}: "
+         f"https://wiki.qemu.org/ChangeLog/{new[0]}.{new[1]}\n\n"
+         f"Upstream's changes: {UPSTREAM}/-/compare/v{fmt(old)}...v{fmt(new)}\n")
+    if old[:2] != new[:2]:
+        return s
+    # A stable release: its commits, from GitLab's compare.
+    q = urllib.parse.urlencode({"from": f"v{fmt(old)}", "to": f"v{fmt(new)}"})
+    try:
+        with urllib.request.urlopen(
+                "https://gitlab.com/api/v4/projects/qemu-project%2Fqemu/"
+                f"repository/compare?{q}", timeout=60) as r:
+            commits = json.load(r)["commits"]
+    except Exception as e:
+        print(f"no commit list from GitLab: {e}", file=sys.stderr)
+        return s
+    s += f"\n<details><summary>{len(commits)} commits</summary>\n\n"
+    for c in commits:
+        # As code, so that no @name or #number in it links anything.
+        title = c["title"].replace("`", "'")
+        s += f"- `{title}`\n"
+    return s + "\n</details>\n"
+
+
+def edit_files(old, new, digest):
+    o, n = fmt(old), fmt(new)
+    with open(os.path.join(HERE, "qemu-release"), "w") as f:
+        f.write(f"version={n}\nurl={tarball_url(new)}\nsha256={digest}\n")
+    readme = os.path.join(HERE, "README.md")
+    with open(readme) as f:
+        text = f.read()
+    for a, b in [
+        (f"[![QEMU {o}](https://img.shields.io/badge/QEMU-{o}-orange)]",
+         f"[![QEMU {n}](https://img.shields.io/badge/QEMU-{n}-orange)]"),
+        (f"The patches apply to QEMU {o} (", f"The patches apply to QEMU {n} ("),
+    ]:
+        if text.count(a) != 1:
+            sys.exit(f"README.md: expected one {a!r}")
+        text = text.replace(a, b)
+    with open(readme, "w") as f:
+        f.write(text)
+
+
+def message(kind, old, new):
+    o, n = fmt(old), fmt(new)
+    what = ("the newest release of the pinned series," if kind == "point"
+            else f"the newest release of a newer series, {new[0]}.{new[1]},")
+    text = (f"QEMU {n}, {what} in place of {o}: qemu-release and the "
+            f"README's mentions of the version. The tarball's signature was "
+            f"checked with QEMU's release key, {FINGERPRINT}, and the SHA-256 "
+            f"is that of the verified file.")
+    return (f"qemu-release: QEMU {n}\n\n{textwrap.fill(text, 72)}\n\n"
+            f"Made by CI's qemu-sync job (./qemu-sync).\n")
+
+
+def body(kind, old, new, digest):
+    o, n = fmt(old), fmt(new)
+    if kind == "point":
+        expect = ("A point release of the pinned series: the patches should "
+                  "still apply.")
+    else:
+        expect = (f"A newer series: the patches will likely need porting to "
+                  f"{new[0]}.{new[1]} before CI passes.")
+    return (f"QEMU {n} is out; this pins it in place of {o}.\n\n{expect}\n\n"
+            f"**This pull request's CI says whether the patch series still "
+            f"applies to {n} and builds:** `./build` applies `patches/*.patch` "
+            f"to the new tarball, and the builds boot the smoke test.\n\n"
+            f"## Upstream\n\n{changes(old, new)}\n"
+            f"## The tarball\n\n{tarball_url(new)}, verified against its "
+            f"`.sig` with QEMU's release key `{FINGERPRINT}` "
+            f"(`qemu-release-key.asc`).\nSHA-256: `{digest}`\n\n"
+            f"Opened by CI's `qemu-sync` job, which updates this pull request "
+            f"when a newer release comes out. It is never merged automatically.\n")
+
+
+def bump(kind, old, new, digest, base, dry):
+    branch = BRANCHES[kind]
+    n = fmt(new)
+    r = repo()
+    title = f"qemu-release: QEMU {n}"
+    prs = gh_json("pr", "list", "-R", r, "--head", branch, "--state", "open",
+                  "--json", "number,url")
+    have = remote_version(branch)
+    if prs and have == n:
+        print(f"{kind}: {prs[0]['url']} already targets {n}; nothing to do")
+        return
+    if dry:
+        verb = f"update {prs[0]['url']}" if prs else "open a pull request"
+        push = "" if have == n and not prs else f"force-push {branch} (main + one commit), "
+        print(f"{kind}: would {push}{verb}: {title!r}")
+        return
+
+    if have != n:
+        run("git", "-C", HERE, "switch", "-q", "-C", branch, base)
+        edit_files(old, new, digest)
+        run("git", "-C", HERE, "add", "qemu-release", "README.md")
+        env = dict(os.environ, TZ="UTC")
+        run("git", "-C", HERE, "-c", "user.name=github-actions[bot]",
+            "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+            "commit", "-q", "--author", BOT, "-F", "-",
+            input=message(kind, old, new), env=env)
+        run("git", "-C", HERE, "push", "-q", "--force", "origin", f"HEAD:refs/heads/{branch}")
+        run("git", "-C", HERE, "switch", "-q", "--detach", base)
+        print(f"{kind}: pushed {branch} with {n}")
+
+    text = body(kind, old, new, digest)
+    if prs:
+        run("gh", "pr", "edit", prs[0]["url"], "--title", title, "--body", text)
+        print(f"{kind}: updated {prs[0]['url']}")
+    else:
+        c = run("gh", "pr", "create", "-R", r, "--base", "main", "--head", branch,
+                "--title", title, "--body", text, check=False)
+        if c.returncode != 0:
+            url = f"https://github.com/{r}/compare/main...{branch}?expand=1"
+            note = (f"{kind}: {branch} is pushed with QEMU {n}, but no pull "
+                    f"request could be opened ({c.stderr.strip()}). Workflows "
+                    f"may need permission to open them; until then, open it "
+                    f"by hand: {url}")
+            print(f"::warning::{note}")
+            summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary:
+                with open(summary, "a") as f:
+                    f.write(f"{note}\n\nIts body:\n\n{text}\n")
+            return
+        print(f"{kind}: opened {c.stdout.strip()}")
+    # Pushes and pull requests made with GITHUB_TOKEN start no workflow:
+    # CI is run on the branch by hand, and its checks show on the PR.
+    if os.environ.get("GITHUB_ACTIONS"):
+        run("gh", "workflow", "run", "ci.yml", "-R", r, "--ref", branch)
+        print(f"{kind}: started CI on {branch}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test()
+
+    current = parse(pinned()["version"])
+    vs = releases()
+    print(f"pinned: {fmt(current)}; newest upstream: {fmt(max(vs))}; "
+          f"newest of {current[0]}.{current[1]}: "
+          f"{fmt(max(v for v in vs if v[:2] == current[:2]))}")
+    plan = due(current, vs)
+    if not plan:
+        print("nothing due: the pin is the newest release")
+        return
+    base = run("git", "-C", HERE, "rev-parse", "HEAD").stdout.strip()
+    with tempfile.TemporaryDirectory() as tmp:
+        for kind, new in plan.items():
+            if not published(tarball_url(new)) or not published(tarball_url(new) + ".sig"):
+                print(f"{kind}: {fmt(new)} is tagged, but its tarball or "
+                      f"signature isn't on {DOWNLOAD} yet; later")
+                continue
+            print(f"{kind}: {fmt(current)} -> {fmt(new)}")
+            digest = fetch_verified(new, tmp)
+            bump(kind, current, new, digest, base, a.dry_run)
+
+
+if __name__ == "__main__":
+    main()
