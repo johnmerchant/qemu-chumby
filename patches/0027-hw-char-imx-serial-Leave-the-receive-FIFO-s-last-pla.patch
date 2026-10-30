@@ -1,0 +1,96 @@
+Description: hw/char/imx_serial: Leave the receive FIFO's last place free of a chardev
+ The i.MX UART flags the character stored in the receive FIFO's 32nd
+ place as an overrun (URXD_OVRRUN), and the model does too. A real line
+ brings a character at a time, so the guest has emptied the FIFO long
+ before it fills. A chardev, though, brings at once as many characters
+ as imx_can_receive() allows, which is the whole free space, so any
+ burst of 32 or more fills the last place. The guest's driver then drops
+ the flagged character, or with the Chumby's 2.6.16 driver, in raw mode,
+ passes on a 0 in its place: a byte lost or changed in every burst.
+ .
+ Add an "rx-headroom" property, off by default so other machines are
+ unchanged. With it, a chardev is offered one place fewer than is free,
+ so it never fills the last place. Nothing is lost by that: a chardev
+ keeps what it hasn't delivered until the guest has read more. The
+ i.MX21 SoC sets it on its four UARTs, so a socket or a pipe given to
+ one with -serial can stream into the guest.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -11,7 +11,10 @@ Emulated devices:
+ - ARM926EJ-S CPU and 64 MiB of SDRAM
+ - AITC interrupt controller
+ - GPT1-3 timers
+-- UART1-4 (UART1 is the console)
++- UART1-4 (UART1 is the console; UART2 and UART4 are the second and
++  fourth ``-serial``). A chardev never fills a receive FIFO's last
++  place, which the hardware flags as an overrun, so a socket or a pipe
++  can stream into a UART without losing a byte
+ - The crypto processor on UART3, with a settable identity (see
+   `Device identity`_); it holds no keys and refuses key and challenge
+   requests
+diff --git a/hw/arm/fsl-imx21.c b/hw/arm/fsl-imx21.c
+--- a/hw/arm/fsl-imx21.c
++++ b/hw/arm/fsl-imx21.c
+@@ -125,6 +125,8 @@ static void fsl_imx21_realize(DeviceState *dev, Error **errp)
+         if (!chr || !*chr) {
+             qdev_prop_set_chr(uart, "chardev", serial_hd(i));
+         }
++        /* So that a socket or a pipe can stream into it (imx_serial.c). */
++        qdev_prop_set_bit(uart, "rx-headroom", true);
+         if (!fsl_imx21_map(aitc, SYS_BUS_DEVICE(uart), uarts[i].addr,
+                            uarts[i].irq, errp)) {
+             return;
+diff --git a/hw/char/imx_serial.c b/hw/char/imx_serial.c
+--- a/hw/char/imx_serial.c
++++ b/hw/char/imx_serial.c
+@@ -387,8 +387,24 @@ static void imx_serial_write(void *opaque, hwaddr offset,
+ static int imx_can_receive(void *opaque)
+ {
+     IMXSerialState *s = (IMXSerialState *)opaque;
++    int room;
+ 
+-    return s->ucr2 & UCR2_RXEN ? fifo32_num_free(&s->rx_fifo) : 0;
++    if (!(s->ucr2 & UCR2_RXEN)) {
++        return 0;
++    }
++    room = fifo32_num_free(&s->rx_fifo);
++    /*
++     * A character stored in the FIFO's last place is flagged as an
++     * overrun (URXD_OVRRUN), as the hardware flags it, and drivers drop
++     * or blank it. A real line brings one character at a time, and the
++     * guest empties the FIFO long before it fills; a chardev brings at
++     * once as many as there is room for. With rx-headroom it is offered
++     * one place fewer, so nothing it brings is flagged.
++     */
++    if (s->rx_headroom && room > 0) {
++        room--;
++    }
++    return room;
+ }
+ 
+ static void imx_put_data(void *opaque, uint32_t value)
+@@ -466,6 +482,7 @@ static void imx_serial_init(Object *obj)
+ 
+ static const Property imx_serial_properties[] = {
+     DEFINE_PROP_CHR("chardev", IMXSerialState, chr),
++    DEFINE_PROP_BOOL("rx-headroom", IMXSerialState, rx_headroom, false),
+ };
+ 
+ static void imx_serial_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/char/imx_serial.h b/include/hw/char/imx_serial.h
+--- a/include/hw/char/imx_serial.h
++++ b/include/hw/char/imx_serial.h
+@@ -123,6 +123,7 @@ struct IMXSerialState {
+ 
+     qemu_irq irq;
+     CharFrontend chr;
++    bool rx_headroom;
+ };
+ 
+ #endif
