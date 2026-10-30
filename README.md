@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/johnmerchant/qemu-chumby/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/johnmerchant/qemu-chumby/actions/workflows/ci.yml?query=branch%3Amain)
 [![Licence: GPL-2.0-or-later](https://img.shields.io/badge/licence-GPL--2.0--or--later-blue)](#licence)
-[![QEMU 11.1.2](https://img.shields.io/badge/QEMU-11.1.2-orange)](qemu-release)
+[![QEMU 11.1.3](https://img.shields.io/badge/QEMU-11.1.3-orange)](qemu-release)
 [![Platforms: macOS, Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#prebuilt-binaries)
 [![Prebuilt binaries](https://img.shields.io/badge/prebuilt-binaries-brightgreen)](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
 [![Website](https://img.shields.io/badge/website-qemu--chumby-teal)](https://johnmerchant.github.io/qemu-chumby/)
@@ -63,7 +63,7 @@ reference for the stable control surface: the machine properties,
 `query-chumby-state`, the `CHUMBY_*` events, the pen and key conventions
 and `screendump`.
 
-The patches apply to QEMU 11.1.2 (`qemu-release` pins the tarball and its
+The patches apply to QEMU 11.1.3 (`qemu-release` pins the tarball and its
 SHA-256). CI's daily `qemu-sync` job (`./qemu-sync`) proposes each newer
 release as a pull request, whose CI says whether they still apply.
 
