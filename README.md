@@ -5,6 +5,7 @@
 [![QEMU 11.1.2](https://img.shields.io/badge/QEMU-11.1.2-orange)](qemu-release)
 [![Platforms: macOS, Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#prebuilt-binaries)
 [![Prebuilt binaries](https://img.shields.io/badge/prebuilt-binaries-brightgreen)](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
+[![Website](https://img.shields.io/badge/website-qemu--chumby-teal)](https://johnmerchant.github.io/qemu-chumby/)
 [![Companion: neochumby](https://img.shields.io/badge/companion-neochumby-purple)](https://github.com/johnmerchant/neochumby)
 
 A QEMU machine for the Chumby Classic: `qemu-system-arm -M chumby-classic`.

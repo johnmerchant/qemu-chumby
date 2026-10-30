@@ -23,6 +23,11 @@
 # and what it links) and COPYING. The release keeps the newest 100 commits'
 # builds. Pull requests build and test, and publish nothing.
 #
+# The project's page, https://johnmerchant.github.io/qemu-chumby/, is made
+# by site/build-site on every run (`site`) and deployed to GitHub Pages
+# from main once `publish` has put the builds it links on the release
+# (`pages`).
+#
 # Run by hand (workflow_dispatch), it builds COMMIT (default: the branch's
 # head) with this workflow, and with `publish` set, publishes it, but only
 # if COMMIT is on main: a build for a commit that main had before this
@@ -320,3 +325,58 @@ jobs:
               gh api -X DELETE "repos/$GH_REPO/releases/assets/$id"
             fi
           done < "$RUNNER_TEMP/assets"
+
+  # The project's page (site/build-site), from this commit's README.md and
+  # patches/ and the builds' .sha256 files: built on every run as a check,
+  # and uploaded as the Pages artifact that `pages` deploys.
+  site:
+    name: Site
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/dl
+          merge-multiple: true
+      - name: Build
+        run: python3 -I site/build-site --commit "$COMMIT" --sha256 "$RUNNER_TEMP/dl" --out _site
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  # On main, once `publish` has put this commit's builds on the release:
+  # the downloads the page links are checked, then it is deployed to
+  # https://johnmerchant.github.io/qemu-chumby/.
+  pages:
+    name: Deploy the site
+    needs: [site, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/configure-pages@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/pages
+      - name: Its downloads are there
+        run: |
+          mkdir "$RUNNER_TEMP/site"
+          tar -C "$RUNNER_TEMP/site" -xf "$RUNNER_TEMP/pages/artifact.tar"
+          jq -r '.[] | .url, .sha256_url' "$RUNNER_TEMP/site/downloads.json" > "$RUNNER_TEMP/urls"
+          test -s "$RUNNER_TEMP/urls"
+          while read -r url; do
+            echo "$url"
+            curl -fsSIL -o /dev/null --retry 3 "$url"
+          done < "$RUNNER_TEMP/urls"
+      - uses: actions/deploy-pages@v5
+        id: deploy
