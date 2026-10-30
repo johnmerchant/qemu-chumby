@@ -119,7 +119,7 @@ jobs:
             ${{ matrix.builder }} sh -ec '
               apk add -q --no-cache build-base python3 ninja pkgconf linux-headers \
                 curl xz patch git glib-dev glib-static pixman-dev pixman-static \
-                libpng-dev libpng-static zlib-dev zlib-static
+                libpng-dev libpng-static zlib-dev zlib-static pcre2-dev pcre2-static
               trap "chown -R $HOST_IDS out" EXIT
               ./build --portable out'
       - name: Build
@@ -158,9 +158,9 @@ jobs:
             echo
             if [ "$RUNNER_OS" = Linux ]; then
               echo "Needs nothing installed. A static executable, with musl, glib,"
-              echo "pixman, libpng and zlib linked in: it runs on any ${{ matrix.platform }}"
-              echo "Linux, whatever its libc or layout (Ubuntu, Debian, Fedora, Alpine,"
-              echo "NixOS...)."
+              echo "pcre2, pixman, libpng and zlib linked in: it runs on any Linux on"
+              echo "$(uname -m), whatever its libc or layout (Ubuntu, Debian, Fedora,"
+              echo "Alpine, NixOS...)."
               echo
               echo "Headless: -display none, VNC (a unix socket or TCP), QMP, PNG"
               echo "screendumps, usb-kbd and usb-storage. No window and no sound"

@@ -15,7 +15,7 @@
 # other optional libraries, VNC (unix sockets too) and PNG screendumps.
 #   Linux: a static binary (-static-pie), linked against static glib,
 #     pixman, libpng and zlib; on Alpine, with build-base python3 ninja
-#     pkgconf linux-headers git and glib, pixman, libpng and zlib's -dev and
+#     pkgconf linux-headers git and glib, pcre2, pixman, libpng and zlib's -dev and
 #     -static packages. No window, and no sound (-audiodev none or wav).
 #   macOS: glib, pixman and libpng (portable-deps) are built here as
 #     static libraries, so the binary links only the system's libraries

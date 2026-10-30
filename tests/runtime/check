@@ -16,8 +16,11 @@ case $(uname -s) in
         if command -v file >/dev/null 2>&1; then
             file -b "$q"
         fi
-        interp=$(readelf -lW "$q" | grep -i 'program interpreter' || true)
-        needed=$(readelf -dW "$q" | grep '(NEEDED)' || true)
+        # Each on its own, so that set -e catches readelf failing.
+        headers=$(readelf -lW "$q")
+        dynamic=$(readelf -dW "$q")
+        interp=$(echo "$headers" | grep -i 'program interpreter' || true)
+        needed=$(echo "$dynamic" | grep '(NEEDED)' || true)
         if [ -n "$interp$needed" ]; then
             echo "$q: not static:" >&2
             echo "$interp" >&2
@@ -27,7 +30,8 @@ case $(uname -s) in
         echo "no program interpreter, no shared libraries (readelf)"
         ;;
     Darwin)
-        libs=$(otool -L "$q" | tail -n +2 | sed 's/^[[:space:]]*//')
+        libs=$(otool -L "$q")
+        libs=$(echo "$libs" | tail -n +2 | sed 's/^[[:space:]]*//')
         echo "$libs"
         bad=$(echo "$libs" | grep -v -e '^/usr/lib/' -e '^/System/Library/' || true)
         if [ -n "$bad" ]; then
