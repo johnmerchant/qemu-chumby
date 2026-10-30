@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# qemu-system-arm with the chumby-classic machine, built with ./build on
-# each host it's meant for (Linux x86_64 and aarch64, macOS on Apple
-# silicon), booted on tests/smoke/run's kernel of a few instructions (no
-# firmware, no network), and the Linux builds booted again on stock runners
-# that have none of the build's packages.
+# qemu-system-arm with the chumby-classic machine, built with
+# ./build --portable on each host it's meant for (Linux x86_64 and aarch64,
+# macOS on Apple silicon) so that it runs with nothing installed: static on
+# Linux, and linking only the system's libraries on macOS, as
+# tests/runtime/check checks. Each is booted on tests/smoke/run's kernel of
+# a few instructions (no firmware, no network); the macOS build again with
+# Homebrew moved out of the way, and the Linux builds again on stock
+# runners and in Alpine and NixOS containers, none of which have any of the
+# build's packages.
 #
 # Each commit on main publishes its binaries as assets of one prerelease,
 # `prebuilt`, so that others (neochumby's CI) can fetch the build of the
@@ -15,8 +19,9 @@
 #
 # COMMIT is the full commit ID; PLATFORM is linux-x86_64, linux-aarch64 or
 # macos-arm64. Each tarball holds qemu-system-arm, RUNTIME (what it needs
-# to run, its shared libraries) and COPYING. The release keeps the newest
-# 100 commits' builds. Pull requests build and test, and publish nothing.
+# to run, which is nothing, and what it links) and COPYING. The release
+# keeps the newest 100 commits' builds. Pull requests build and test, and
+# publish nothing.
 #
 # Run by hand (workflow_dispatch), it builds COMMIT (default: the branch's
 # head) with this workflow, and with `publish` set, publishes it, but only
@@ -47,8 +52,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # The build's own sources come from COMMIT; tests/smoke/run and
-  # chumby_machine.py, which test it, from this workflow's commit (in .ci/).
+  # The build's own sources come from COMMIT; tests/ and chumby_machine.py,
+  # which test it, from this workflow's commit (in .ci/).
   COMMIT: ${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
@@ -58,34 +63,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux builds run in a bare Ubuntu 24.04 container, with only
-          # the packages README.md lists (and not libfdt-dev, so that QEMU
-          # links its own copy of dtc): the binary then needs only those
-          # packages' libraries, and glibc 2.39 or later.
+          # Linux builds run in Alpine (musl), whose -static packages make
+          # a static binary (see ./build): started with docker run rather
+          # than as the job's container, since actions don't run in Alpine
+          # on aarch64.
           - platform: linux-x86_64
             runner: ubuntu-24.04
-            container: ubuntu:24.04
+            builder: alpine:3.22
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
-            container: ubuntu:24.04
+            builder: alpine:3.22
+          # Homebrew gives only the build's tools: ./build --portable
+          # builds glib, pixman and libpng itself and looks nowhere else.
           - platform: macos-arm64
             runner: macos-15
-            container: ''
+            builder: ''
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container }}
     timeout-minutes: 90
     steps:
       - name: Packages
-        if: runner.os == 'Linux'
-        run: |
-          apt-get update -q
-          DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
-            build-essential python3 python3-venv ninja-build pkg-config \
-            libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev \
-            curl xz-utils patch ca-certificates git
-      - name: Packages
         if: runner.os == 'macOS'
-        run: brew install ninja pkg-config glib pixman libpng
+        run: brew install ninja pkgconf
 
       - uses: actions/checkout@v4
         with:
@@ -95,11 +93,13 @@ jobs:
         with:
           path: .ci
 
-      - name: Restore the QEMU tarball
+      - name: Restore the tarballs
         uses: actions/cache@v4
         with:
-          path: out/qemu-*.tar.xz
-          key: qemu-tarball-${{ hashFiles('qemu-release') }}
+          path: |
+            out/*.tar.xz
+            out/*.tar.gz
+          key: tarballs-${{ hashFiles('qemu-release', 'portable-deps') }}
 
       # The binary, keyed by everything it's built from: a hit skips the
       # build.
@@ -108,13 +108,26 @@ jobs:
         uses: actions/cache@v4
         with:
           path: out/obj/qemu-system-arm
-          key: qemu-${{ matrix.platform }}-${{ matrix.container || matrix.runner }}-${{ hashFiles('build', 'qemu-release', 'patches/*.patch') }}
+          key: qemu-portable-${{ matrix.platform }}-${{ matrix.builder || matrix.runner }}-${{ hashFiles('build', 'qemu-release', 'portable-deps', 'patches/*.patch') }}
 
       # Into out/: ./build's default directory, build/ beside it, is the
       # script itself.
       - name: Build
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: ./build out
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w -e HOST_IDS="$(id -u):$(id -g)" \
+            ${{ matrix.builder }} sh -ec '
+              apk add -q --no-cache build-base python3 ninja pkgconf linux-headers \
+                curl xz patch git glib-dev glib-static pixman-dev pixman-static \
+                libpng-dev libpng-static zlib-dev zlib-static
+              trap "chown -R $HOST_IDS out" EXIT
+              ./build --portable out'
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: ./build --portable out
+
+      - name: Needs nothing installed
+        run: .ci/tests/runtime/check out/obj/qemu-system-arm
 
       - name: Smoke test
         run: python3 .ci/tests/smoke/run out/obj/qemu-system-arm
@@ -138,28 +151,33 @@ jobs:
             echo "qemu-chumby commit: $COMMIT"
             echo "  https://github.com/johnmerchant/qemu-chumby/tree/$COMMIT"
             echo "QEMU release: $version ($url), with that commit's patches/"
-            echo "Platform: ${{ matrix.platform }}, built on ${{ matrix.container || matrix.runner }}"
+            echo "Platform: ${{ matrix.platform }}, built on ${{ matrix.builder || matrix.runner }}"
             echo
-            echo "The source is the commit above: ./build there rebuilds this binary."
-            echo "GPL-2.0-or-later (COPYING)."
+            echo "The source is the commit above: ./build --portable there rebuilds"
+            echo "this binary. GPL-2.0-or-later (COPYING)."
             echo
             if [ "$RUNNER_OS" = Linux ]; then
-              echo "Needs glibc 2.39 or later (Ubuntu 24.04, Debian 13 or newer) and"
-              echo "glib, pixman, libpng and zlib. On Debian and Ubuntu:"
-              echo "  apt-get install libglib2.0-0t64 libpixman-1-0 libpng16-16t64 zlib1g"
+              echo "Needs nothing installed. A static executable, with musl, glib,"
+              echo "pixman, libpng and zlib linked in: it runs on any ${{ matrix.platform }}"
+              echo "Linux, whatever its libc or layout (Ubuntu, Debian, Fedora, Alpine,"
+              echo "NixOS...)."
               echo
-              echo "Shared libraries (ldd):"
-              ldd "dist/$name/qemu-system-arm" | sed 's/ (0x[0-9a-f]*)$//'
+              echo "Headless: -display none, VNC (a unix socket or TCP), QMP, PNG"
+              echo "screendumps, usb-kbd and usb-storage. No window and no sound"
+              echo "(-audiodev none or wav only); for those, ./build or Nix."
             else
-              # Whatever the runner's Homebrew had that QEMU's configure
-              # found, not only what ./build asks for.
-              formulae=$(otool -L "dist/$name/qemu-system-arm" | sed -n 's#^[[:space:]]*/opt/homebrew/opt/\([^/]*\)/.*#\1#p' | sort -u | tr '\n' ' ')
-              echo "Needs macOS 15 or later on Apple silicon, and these Homebrew packages:"
-              echo "  brew install $formulae"
+              echo "Needs nothing installed: macOS 15 or later on Apple silicon. glib,"
+              echo "pixman and libpng are linked in, and it links only the system's"
+              echo "libraries and frameworks. The Cocoa window, CoreAudio, VNC (a unix"
+              echo "socket or TCP), QMP and PNG screendumps are built in."
               echo
-              echo "Shared libraries (otool -L):"
-              otool -L "dist/$name/qemu-system-arm" | tail -n +2
+              echo "Signed ad hoc. curl and gh leave what they download unquarantined;"
+              echo "if a browser quarantined the tarball, clear that before running:"
+              echo "  xattr -dr com.apple.quarantine qemu-chumby-*"
             fi
+            echo
+            echo "What it links (tests/runtime/check):"
+            .ci/tests/runtime/check "dist/$name/qemu-system-arm"
           } > "dist/$name/RUNTIME"
           cat "dist/$name/RUNTIME"
           tar -C dist -cJf "dist/$name.tar.xz" "$name"
@@ -172,6 +190,19 @@ jobs:
           cat "$name.tar.xz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # The tarball as a Mac without Homebrew has it: unpacked and booted
+      # with /opt/homebrew moved away.
+      - name: Without Homebrew
+        if: runner.os == 'macOS'
+        run: |
+          mkdir "$RUNNER_TEMP/mac"
+          tar -C "$RUNNER_TEMP/mac" -xJf "dist/${{ steps.package.outputs.name }}.tar.xz"
+          q=$(echo "$RUNNER_TEMP"/mac/qemu-chumby-*/qemu-system-arm)
+          sudo mv /opt/homebrew /opt/homebrew.away
+          trap 'sudo mv /opt/homebrew.away /opt/homebrew' EXIT
+          "$q" -M help | grep '^chumby-classic '
+          /usr/bin/python3 .ci/tests/smoke/run "$q"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
@@ -182,8 +213,8 @@ jobs:
           retention-days: 7
 
   # The Linux tarballs on GitHub's stock runners, as another project's CI
-  # would use them: checked, unpacked and booted with no packages
-  # installed.
+  # would use them, and in Alpine (musl) and NixOS (no /lib or /usr/lib)
+  # containers: checked, unpacked and booted with no packages installed.
   stock:
     name: Run on a stock runner (${{ matrix.runner }})
     needs: build
@@ -210,13 +241,29 @@ jobs:
           sha256sum -c ./*.sha256
           tar xJf ./*.tar.xz
           q=$(echo "$RUNNER_TEMP"/dl/qemu-chumby-*/qemu-system-arm)
-          if ldd "$q" | grep 'not found'; then
-            exit 1
-          fi
+          "$GITHUB_WORKSPACE/tests/runtime/check" "$q"
           "$q" -M help | grep '^chumby-classic '
           echo "QEMU=$q" >> "$GITHUB_ENV"
       - name: Smoke test
         run: python3 tests/smoke/run "$QEMU"
+      # The smoke test needs Python, which the NixOS image hasn't: there,
+      # QEMU boots the same kernel and its console is read.
+      - name: In Alpine and NixOS
+        run: |
+          mkdir "$RUNNER_TEMP/k"
+          python3 tests/smoke/run --kernel "$RUNNER_TEMP/k/smoke.bin"
+          for image in alpine:3.22 nixos/nix:latest; do
+            echo "== $image"
+            docker run --rm --network none -v "$(dirname "$QEMU"):/q:ro" \
+              -v "$RUNNER_TEMP/k:/k:ro" "$image" sh -c '
+                /q/qemu-system-arm -M help | grep "^chumby-classic "
+                timeout 20 /q/qemu-system-arm -M chumby-classic -kernel /k/smoke.bin \
+                  -nic none -display none -monitor none -serial stdio
+                true' > "$RUNNER_TEMP/console" 2>&1
+            cat "$RUNNER_TEMP/console"
+            grep -q '^chumby-classic ' "$RUNNER_TEMP/console"
+            grep -q 'chumby-classic: smoke kernel up' "$RUNNER_TEMP/console"
+          done
 
   publish:
     name: Publish

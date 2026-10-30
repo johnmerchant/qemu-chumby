@@ -9,6 +9,10 @@ accelerometer can be set, and QEMU quits when asked.
 No firmware, no network (chumby-machine runs QEMU with -nic none), no
 display: it runs on any CI runner. QEMU is the argument, else $QEMU, else
 build/obj/qemu-system-arm.
+
+tests/smoke/run --kernel FILE writes the kernel to FILE and quits, for a
+boot without Python (qemu-system-arm -M chumby-classic -kernel FILE -nic
+none -display none -serial stdio prints MESSAGE).
 """
 import os
 import struct
@@ -90,6 +94,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--kernel":
+        with open(sys.argv[2], "wb") as f:
+            f.write(kernel())
+        sys.exit(0)
     try:
         main()
     except cm.Error as e:

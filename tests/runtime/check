@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# tests/runtime/check QEMU: checks that QEMU (a ./build --portable binary)
+# needs nothing installed to run, and prints what it links, for RUNTIME.
+#   Linux: a static executable: no program interpreter (dynamic loader)
+#     and no shared libraries.
+#   macOS: only the system's libraries (/usr/lib) and frameworks
+#     (/System/Library), as otool -L lists them.
+set -eu
+
+q=${1:?usage: tests/runtime/check QEMU}
+
+case $(uname -s) in
+    Linux)
+        if command -v file >/dev/null 2>&1; then
+            file -b "$q"
+        fi
+        interp=$(readelf -lW "$q" | grep -i 'program interpreter' || true)
+        needed=$(readelf -dW "$q" | grep '(NEEDED)' || true)
+        if [ -n "$interp$needed" ]; then
+            echo "$q: not static:" >&2
+            echo "$interp" >&2
+            echo "$needed" >&2
+            exit 1
+        fi
+        echo "no program interpreter, no shared libraries (readelf)"
+        ;;
+    Darwin)
+        libs=$(otool -L "$q" | tail -n +2 | sed 's/^[[:space:]]*//')
+        echo "$libs"
+        bad=$(echo "$libs" | grep -v -e '^/usr/lib/' -e '^/System/Library/' || true)
+        if [ -n "$bad" ]; then
+            echo "$q: links libraries outside /usr/lib and /System/Library:" >&2
+            echo "$bad" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "tests/runtime/check: Linux or macOS only" >&2
+        exit 1
+        ;;
+esac
