@@ -1,0 +1,742 @@
+Description: hw/dma: Add the i.MX21 DMA controller
+ The i.MX21's DMAC has sixteen channels, each with its own interrupt, and
+ 32 request lines from the peripherals. The stock Chumby kernel uses it
+ for audio (the TSC2100 driver chains SSI1 transfers period by period
+ with RPT and ACRPT, and reads CCNR for the playback position) and offers
+ it to user space through /dev/udma (chumby_udma.c) for memory-to-memory
+ copies with 2D geometry, checking the error status registers on every
+ interrupt.
+ .
+ Model the channels' linear (incrementing or decrementing), 2D and FIFO
+ ends with 8-, 16- and 32-bit ports, request-driven bursts (BLR bytes per
+ request while the request stays asserted) and free-running memory-to-
+ memory transfers, repeat with automatic clear, forced bursts, CCNR, the
+ interrupt status and mask, and the transfer error status for bus errors.
+ The request lines are the device's GPIO inputs. The timeouts are not
+ modelled and transfers take no time.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -873,6 +873,7 @@ L: qemu-arm@nongnu.org
+ S: Maintained
+ F: hw/block/imx21_nfc.c
+ F: hw/display/imx21_lcdc.c
++F: hw/dma/imx21_dma.c
+ F: hw/gpio/imx21_gpio.c
+ F: hw/input/imx21_kpp.c
+ F: hw/intc/imx21_aitc.c
+diff --git a/hw/dma/imx21_dma.c b/hw/dma/imx21_dma.c
+new file mode 100644
+--- /dev/null
++++ b/hw/dma/imx21_dma.c
+@@ -0,0 +1,611 @@
++/*
++ * i.MX21 DMA controller (DMAC)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Sixteen channels, each with its own interrupt, moving data between
++ * memory and peripheral FIFOs or from memory to memory. A channel's
++ * source and destination are each linear (incrementing or decrementing),
++ * 2D (X bytes per row, Y rows, W bytes from one row to the next, from
++ * register set A or B) or a FIFO (a fixed address), with 8-, 16- or
++ * 32-bit ports.
++ *
++ * A channel with REN set moves one burst (BLR bytes, 0 meaning 64) each
++ * time its request line (RSSR) is seen asserted, and keeps going while
++ * it stays asserted; one without REN runs to the end as soon as it is
++ * enabled. At the end of a transfer the channel's DISR bit is set; with
++ * RPT set it then starts again from SAR, DAR and CNTR, which software may
++ * have rewritten meanwhile (ACRPT clears RPT as it does so), otherwise it
++ * stops until CEN is set again. CCNR counts the bytes moved so far.
++ *
++ * A bus error on either side stops the channel and sets its DSESR bit.
++ * The burst, request and buffer-overflow timeouts are not modelled: their
++ * status registers stay clear. Transfers take no time.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/dma/imx21_dma.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/module.h"
++#include "qemu/units.h"
++#include "system/address-spaces.h"
++#include "trace.h"
++
++#define DCR     0x00
++#define DISR    0x04
++#define DIMR    0x08
++#define DBTOSR  0x0c
++#define DRTOSR  0x10
++#define DSESR   0x14
++#define DBOSR   0x18
++#define DBTOCR  0x1c
++#define WSRA    0x40
++#define XSRA    0x44
++#define YSRA    0x48
++#define WSRB    0x4c
++#define XSRB    0x50
++#define YSRB    0x54
++#define CHAN_BASE   0x80
++#define CHAN_SIZE   0x40
++
++/* Channel registers */
++#define SAR     0x00
++#define DAR     0x04
++#define CNTR    0x08
++#define CCR     0x0c
++#define RSSR    0x10
++#define BLR     0x14
++#define RTOR    0x18    /* BUCR for memory-to-memory channels */
++#define CCNR    0x1c
++
++#define DCR_DEN     (1 << 0)
++#define DCR_DRST    (1 << 1)
++#define DCR_DAM     (1 << 2)
++
++#define CCR_CEN     (1 << 0)
++#define CCR_FRC     (1 << 1)
++#define CCR_RPT     (1 << 2)
++#define CCR_REN     (1 << 3)
++#define CCR_SSIZ_SHIFT  4
++#define CCR_DSIZ_SHIFT  6
++#define CCR_MSEL    (1 << 8)
++#define CCR_MDIR    (1 << 9)
++#define CCR_SMOD_SHIFT  10
++#define CCR_DMOD_SHIFT  12
++#define CCR_ACRPT   (1 << 14)
++#define CCR_MASK    0x7ffd     /* FRC reads as zero */
++
++#define MOD_LINEAR  0
++#define MOD_2D      1
++#define MOD_FIFO    2
++#define MOD_EOBFIFO 3
++
++#define CNTR_MASK   0xffffff
++#define CHAN_MASK   ((1 << IMX21_DMA_CHANNELS) - 1)
++
++/*
++ * Bytes a channel moves in one go before giving the main loop a turn, so
++ * that a channel kept busy for ever (repeating, with a request that never
++ * drops) cannot hang the machine.
++ */
++#define SLICE_BYTES (256 * KiB)
++
++static void imx21_dma_update_irq(IMX21DMAState *s)
++{
++    uint32_t pending = (s->disr | s->dbtosr | s->drtosr | s->dsesr |
++                        s->dbosr) & ~s->dimr;
++    int i;
++
++    for (i = 0; i < IMX21_DMA_CHANNELS; i++) {
++        qemu_set_irq(s->irq[i], (pending >> i) & 1);
++    }
++}
++
++static void imx21_dma_load(IMX21DMAChannel *c)
++{
++    c->src = c->sar;
++    c->dst = c->dar;
++    c->count = c->cntr & CNTR_MASK;
++    c->done = 0;
++    c->active = true;
++}
++
++static unsigned imx21_dma_port_size(uint32_t field)
++{
++    static const unsigned sizes[4] = { 4, 1, 2, 4 };
++
++    return sizes[field & 3];
++}
++
++/*
++ * The address of byte @off of one side of a transfer, and how many bytes
++ * from there are contiguous (at most @len).
++ */
++static hwaddr imx21_dma_addr(IMX21DMAState *s, IMX21DMAChannel *c,
++                             bool dst, uint32_t off, uint32_t *len)
++{
++    unsigned mode = (c->ccr >> (dst ? CCR_DMOD_SHIFT : CCR_SMOD_SHIFT)) & 3;
++    unsigned size = imx21_dma_port_size(c->ccr >>
++                                        (dst ? CCR_DSIZ_SHIFT :
++                                         CCR_SSIZ_SHIFT));
++    uint32_t base = dst ? c->dst : c->src;
++    int set = !!(c->ccr & CCR_MSEL);
++    uint32_t x;
++
++    switch (mode) {
++    case MOD_FIFO:
++    case MOD_EOBFIFO:
++        *len = MIN(*len, size);
++        return base;
++    case MOD_2D:
++        x = s->xsr[set];
++        if (x) {
++            *len = MIN(*len, x - off % x);
++            return base + (off / x) * s->wsr[set] + off % x;
++        }
++        /* fall through */
++    default:
++        if (c->ccr & CCR_MDIR) {
++            *len = MIN(*len, size);
++            return base - off;
++        }
++        return base + off;
++    }
++}
++
++/* Move @len bytes of channel @ch; false on a bus error. */
++static bool imx21_dma_move(IMX21DMAState *s, int ch, uint32_t len)
++{
++    IMX21DMAChannel *c = &s->ch[ch];
++    uint8_t buf[4096];
++    uint32_t off, n, run;
++    hwaddr addr;
++    MemTxResult res;
++
++    while (len) {
++        n = MIN(len, sizeof(buf));
++        for (off = 0; off < n; off += run) {
++            run = n - off;
++            addr = imx21_dma_addr(s, c, false, c->done + off, &run);
++            res = address_space_read(&address_space_memory, addr,
++                                     MEMTXATTRS_UNSPECIFIED, buf + off, run);
++            if (res != MEMTX_OK) {
++                trace_imx21_dma_error(ch, addr);
++                return false;
++            }
++        }
++        for (off = 0; off < n; off += run) {
++            run = n - off;
++            addr = imx21_dma_addr(s, c, true, c->done + off, &run);
++            res = address_space_write(&address_space_memory, addr,
++                                      MEMTXATTRS_UNSPECIFIED, buf + off, run);
++            if (res != MEMTX_OK) {
++                trace_imx21_dma_error(ch, addr);
++                return false;
++            }
++        }
++        c->done += n;
++        len -= n;
++    }
++    return true;
++}
++
++static bool imx21_dma_requested(IMX21DMAState *s, IMX21DMAChannel *c)
++{
++    return c->force || ((s->requests >> (c->rssr & 31)) & 1);
++}
++
++/*
++ * Run channel @ch for at most @budget bytes: one burst if it moves on
++ * requests, else to the end of its transfer. Returns the bytes moved.
++ */
++static uint32_t imx21_dma_run_channel(IMX21DMAState *s, int ch,
++                                      uint32_t budget)
++{
++    IMX21DMAChannel *c = &s->ch[ch];
++    uint32_t len, burst;
++
++    if (!c->active || !(s->dcr & DCR_DEN)) {
++        return 0;
++    }
++    if (c->ccr & CCR_REN) {
++        if (!imx21_dma_requested(s, c)) {
++            return 0;
++        }
++        burst = c->blr & 0x3f;
++        len = MIN(burst ? burst : 64, c->count - c->done);
++    } else {
++        len = MIN(budget, c->count - c->done);
++    }
++    c->force = false;
++
++    if (!imx21_dma_move(s, ch, len)) {
++        c->active = false;
++        s->dsesr |= 1 << ch;
++        imx21_dma_update_irq(s);
++        return len;
++    }
++
++    if (c->done >= c->count) {
++        trace_imx21_dma_done(ch, c->count, !!(c->ccr & CCR_RPT));
++        s->disr |= 1 << ch;
++        if (c->ccr & CCR_RPT) {
++            if (c->ccr & CCR_ACRPT) {
++                c->ccr &= ~CCR_RPT;
++            }
++            imx21_dma_load(c);
++        } else {
++            c->active = false;
++        }
++        imx21_dma_update_irq(s);
++    }
++    /* An empty transfer moves nothing: count it so that loops end. */
++    return MAX(len, 1);
++}
++
++static void imx21_dma_run(IMX21DMAState *s)
++{
++    uint32_t budget = SLICE_BYTES, n, moved;
++    int i;
++
++    /* A peripheral's request may change while a burst writes to it. */
++    if (s->running) {
++        return;
++    }
++    s->running = true;
++    do {
++        moved = 0;
++        for (i = 0; i < IMX21_DMA_CHANNELS && budget; i++) {
++            n = imx21_dma_run_channel(s, i, budget);
++            n = MIN(n, budget);
++            budget -= n;
++            moved += n;
++        }
++    } while (moved && budget);
++    s->running = false;
++
++    if (!budget) {
++        qemu_bh_schedule(s->bh);
++    }
++}
++
++static void imx21_dma_bh(void *opaque)
++{
++    imx21_dma_run(opaque);
++}
++
++static void imx21_dma_set_request(void *opaque, int line, int level)
++{
++    IMX21DMAState *s = opaque;
++
++    s->requests = deposit32(s->requests, line, 1, !!level);
++    if (level) {
++        imx21_dma_run(s);
++    }
++}
++
++static void imx21_dma_reset_regs(IMX21DMAState *s)
++{
++    s->dcr = 0;
++    s->disr = 0;
++    s->dimr = CHAN_MASK;
++    s->dbtosr = 0;
++    s->drtosr = 0;
++    s->dsesr = 0;
++    s->dbosr = 0;
++    s->dbtocr = 0;
++    memset(s->wsr, 0, sizeof(s->wsr));
++    memset(s->xsr, 0, sizeof(s->xsr));
++    memset(s->ysr, 0, sizeof(s->ysr));
++    memset(s->ch, 0, sizeof(s->ch));
++}
++
++static uint64_t imx21_dma_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21DMAState *s = opaque;
++    IMX21DMAChannel *c;
++    uint64_t r = 0;
++
++    switch (offset) {
++    case DCR:
++        r = s->dcr;
++        break;
++    case DISR:
++        r = s->disr;
++        break;
++    case DIMR:
++        r = s->dimr;
++        break;
++    case DBTOSR:
++        r = s->dbtosr;
++        break;
++    case DRTOSR:
++        r = s->drtosr;
++        break;
++    case DSESR:
++        r = s->dsesr;
++        break;
++    case DBOSR:
++        r = s->dbosr;
++        break;
++    case DBTOCR:
++        r = s->dbtocr;
++        break;
++    case WSRA:
++    case WSRB:
++        r = s->wsr[offset == WSRB];
++        break;
++    case XSRA:
++    case XSRB:
++        r = s->xsr[offset == XSRB];
++        break;
++    case YSRA:
++    case YSRB:
++        r = s->ysr[offset == YSRB];
++        break;
++    case CHAN_BASE ... CHAN_BASE + IMX21_DMA_CHANNELS * CHAN_SIZE - 1:
++        c = &s->ch[(offset - CHAN_BASE) / CHAN_SIZE];
++        switch (offset & (CHAN_SIZE - 1)) {
++        case SAR:
++            r = c->sar;
++            break;
++        case DAR:
++            r = c->dar;
++            break;
++        case CNTR:
++            r = c->cntr;
++            break;
++        case CCR:
++            r = c->ccr;
++            break;
++        case RSSR:
++            r = c->rssr;
++            break;
++        case BLR:
++            r = c->blr;
++            break;
++        case RTOR:
++            r = c->rtor;
++            break;
++        case CCNR:
++            r = c->done;
++            break;
++        default:
++            goto bad;
++        }
++        break;
++    default:
++    bad:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        break;
++    }
++    trace_imx21_dma_read(offset, r);
++    return r;
++}
++
++static void imx21_dma_write_ccr(IMX21DMAState *s, IMX21DMAChannel *c,
++                                uint32_t val)
++{
++    uint32_t old = c->ccr;
++
++    c->ccr = val & CCR_MASK;
++    if ((val & CCR_CEN) && !(old & CCR_CEN)) {
++        imx21_dma_load(c);
++    } else if (!(val & CCR_CEN)) {
++        c->active = false;
++        c->force = false;
++    }
++    if ((val & CCR_FRC) && c->active) {
++        c->force = true;
++    }
++    qemu_bh_schedule(s->bh);
++}
++
++static void imx21_dma_write(void *opaque, hwaddr offset, uint64_t val,
++                            unsigned size)
++{
++    IMX21DMAState *s = opaque;
++    IMX21DMAChannel *c;
++
++    trace_imx21_dma_write(offset, val);
++
++    switch (offset) {
++    case DCR:
++        if (val & DCR_DRST) {
++            imx21_dma_reset_regs(s);
++        }
++        s->dcr = val & (DCR_DEN | DCR_DAM);
++        qemu_bh_schedule(s->bh);
++        break;
++    case DISR:
++        s->disr &= ~val;
++        break;
++    case DIMR:
++        s->dimr = val & CHAN_MASK;
++        break;
++    case DBTOSR:
++        s->dbtosr &= ~val;
++        break;
++    case DRTOSR:
++        s->drtosr &= ~val;
++        break;
++    case DSESR:
++        s->dsesr &= ~val;
++        break;
++    case DBOSR:
++        s->dbosr &= ~val;
++        break;
++    case DBTOCR:
++        s->dbtocr = val & 0xffff;
++        break;
++    case WSRA:
++    case WSRB:
++        s->wsr[offset == WSRB] = val & 0xffff;
++        break;
++    case XSRA:
++    case XSRB:
++        s->xsr[offset == XSRB] = val & 0xffff;
++        break;
++    case YSRA:
++    case YSRB:
++        s->ysr[offset == YSRB] = val & 0xffff;
++        break;
++    case CHAN_BASE ... CHAN_BASE + IMX21_DMA_CHANNELS * CHAN_SIZE - 1:
++        c = &s->ch[(offset - CHAN_BASE) / CHAN_SIZE];
++        switch (offset & (CHAN_SIZE - 1)) {
++        case SAR:
++            c->sar = val;
++            break;
++        case DAR:
++            c->dar = val;
++            break;
++        case CNTR:
++            c->cntr = val & CNTR_MASK;
++            break;
++        case CCR:
++            imx21_dma_write_ccr(s, c, val);
++            break;
++        case RSSR:
++            c->rssr = val & 31;
++            break;
++        case BLR:
++            c->blr = val & 0x3f;
++            break;
++        case RTOR:
++            c->rtor = val & 0xffff;
++            break;
++        case CCNR:
++            /* read-only */
++            break;
++        default:
++            goto bad;
++        }
++        break;
++    default:
++    bad:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return;
++    }
++    imx21_dma_update_irq(s);
++}
++
++static const MemoryRegionOps imx21_dma_ops = {
++    .read = imx21_dma_read,
++    .write = imx21_dma_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_dma_reset(DeviceState *dev)
++{
++    IMX21DMAState *s = IMX21_DMA(dev);
++
++    imx21_dma_reset_regs(s);
++    imx21_dma_update_irq(s);
++}
++
++static void imx21_dma_init(Object *obj)
++{
++    IMX21DMAState *s = IMX21_DMA(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    int i;
++
++    memory_region_init_io(&s->iomem, obj, &imx21_dma_ops, s,
++                          TYPE_IMX21_DMA, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    for (i = 0; i < IMX21_DMA_CHANNELS; i++) {
++        sysbus_init_irq(sbd, &s->irq[i]);
++    }
++    qdev_init_gpio_in(DEVICE(obj), imx21_dma_set_request, IMX21_DMA_REQUESTS);
++    s->bh = qemu_bh_new_guarded(imx21_dma_bh, s,
++                                &DEVICE(obj)->mem_reentrancy_guard);
++}
++
++static const VMStateDescription vmstate_imx21_dma_channel = {
++    .name = TYPE_IMX21_DMA "-channel",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(sar, IMX21DMAChannel),
++        VMSTATE_UINT32(dar, IMX21DMAChannel),
++        VMSTATE_UINT32(cntr, IMX21DMAChannel),
++        VMSTATE_UINT32(ccr, IMX21DMAChannel),
++        VMSTATE_UINT32(rssr, IMX21DMAChannel),
++        VMSTATE_UINT32(blr, IMX21DMAChannel),
++        VMSTATE_UINT32(rtor, IMX21DMAChannel),
++        VMSTATE_BOOL(active, IMX21DMAChannel),
++        VMSTATE_UINT32(src, IMX21DMAChannel),
++        VMSTATE_UINT32(dst, IMX21DMAChannel),
++        VMSTATE_UINT32(count, IMX21DMAChannel),
++        VMSTATE_UINT32(done, IMX21DMAChannel),
++        VMSTATE_BOOL(force, IMX21DMAChannel),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static int imx21_dma_post_load(void *opaque, int version_id)
++{
++    IMX21DMAState *s = opaque;
++
++    /* Transfers interrupted by the slice limit carry on. */
++    qemu_bh_schedule(s->bh);
++    return 0;
++}
++
++static const VMStateDescription vmstate_imx21_dma = {
++    .name = TYPE_IMX21_DMA,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = imx21_dma_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(dcr, IMX21DMAState),
++        VMSTATE_UINT32(disr, IMX21DMAState),
++        VMSTATE_UINT32(dimr, IMX21DMAState),
++        VMSTATE_UINT32(dbtosr, IMX21DMAState),
++        VMSTATE_UINT32(drtosr, IMX21DMAState),
++        VMSTATE_UINT32(dsesr, IMX21DMAState),
++        VMSTATE_UINT32(dbosr, IMX21DMAState),
++        VMSTATE_UINT32(dbtocr, IMX21DMAState),
++        VMSTATE_UINT32_ARRAY(wsr, IMX21DMAState, 2),
++        VMSTATE_UINT32_ARRAY(xsr, IMX21DMAState, 2),
++        VMSTATE_UINT32_ARRAY(ysr, IMX21DMAState, 2),
++        VMSTATE_STRUCT_ARRAY(ch, IMX21DMAState, IMX21_DMA_CHANNELS, 1,
++                             vmstate_imx21_dma_channel, IMX21DMAChannel),
++        VMSTATE_UINT32(requests, IMX21DMAState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_dma_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_imx21_dma;
++    device_class_set_legacy_reset(dc, imx21_dma_reset);
++    dc->desc = "i.MX21 DMA controller";
++}
++
++static const TypeInfo imx21_dma_info = {
++    .name = TYPE_IMX21_DMA,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21DMAState),
++    .instance_init = imx21_dma_init,
++    .class_init = imx21_dma_class_init,
++};
++
++static void imx21_dma_register_types(void)
++{
++    type_register_static(&imx21_dma_info);
++}
++
++type_init(imx21_dma_register_types)
+diff --git a/hw/dma/meson.build b/hw/dma/meson.build
+--- a/hw/dma/meson.build
++++ b/hw/dma/meson.build
+@@ -12,3 +12,4 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_dma.c', 'soc_dma.c'))
+ system_ss.add(when: 'CONFIG_RASPI', if_true: files('bcm2835_dma.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_PDMA', if_true: files('sifive_pdma.c'))
+ system_ss.add(when: 'CONFIG_XLNX_CSU_DMA', if_true: files('xlnx_csu_dma.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_dma.c'))
+diff --git a/hw/dma/trace-events b/hw/dma/trace-events
+--- a/hw/dma/trace-events
++++ b/hw/dma/trace-events
+@@ -47,3 +47,9 @@ pl330_iomem_read(uint32_t addr, uint32_t data) "addr: 0x%08"PRIx32" data: 0x%08"
+ 
+ # xilinx_axidma.c
+ xilinx_axidma_loading_desc_fail(uint32_t res) "error:%u"
++
++# imx21_dma.c
++imx21_dma_read(uint64_t offset, uint64_t value) "offset 0x%03" PRIx64 " value 0x%08" PRIx64
++imx21_dma_write(uint64_t offset, uint64_t value) "offset 0x%03" PRIx64 " value 0x%08" PRIx64
++imx21_dma_done(int ch, uint32_t count, bool repeat) "channel %d: %" PRIu32 " bytes, repeat %d"
++imx21_dma_error(int ch, uint64_t addr) "channel %d: bus error at 0x%08" PRIx64
+diff --git a/include/hw/dma/imx21_dma.h b/include/hw/dma/imx21_dma.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/dma/imx21_dma.h
+@@ -0,0 +1,68 @@
++/*
++ * i.MX21 DMA controller (DMAC)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_DMA_H
++#define IMX21_DMA_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_DMA "imx21.dma"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21DMAState, IMX21_DMA)
++
++#define IMX21_DMA_CHANNELS  16
++/*
++ * GPIO inputs: the 32 DMA request lines, active high, numbered as in the
++ * channels' RSSR (1 CSPI3 receive, 13 SSI1 transmit FIFO 0, ...).
++ */
++#define IMX21_DMA_REQUESTS  32
++
++typedef struct IMX21DMAChannel {
++    uint32_t sar;
++    uint32_t dar;
++    uint32_t cntr;
++    uint32_t ccr;
++    uint32_t rssr;
++    uint32_t blr;
++    uint32_t rtor;
++    /* The transfer in progress: addresses and count loaded at its start. */
++    bool active;
++    uint32_t src;
++    uint32_t dst;
++    uint32_t count;
++    uint32_t done;
++    /* A burst forced by CCR.FRC, not yet made. */
++    bool force;
++} IMX21DMAChannel;
++
++struct IMX21DMAState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq[IMX21_DMA_CHANNELS];
++    QEMUBH *bh;
++
++    uint32_t dcr;
++    uint32_t disr;
++    uint32_t dimr;
++    uint32_t dbtosr;
++    uint32_t drtosr;
++    uint32_t dsesr;
++    uint32_t dbosr;
++    uint32_t dbtocr;
++    /* 2D memory geometry: W, X and Y for sets A and B. */
++    uint32_t wsr[2];
++    uint32_t xsr[2];
++    uint32_t ysr[2];
++    IMX21DMAChannel ch[IMX21_DMA_CHANNELS];
++
++    uint32_t requests;
++    bool running;
++};
++
++#endif /* IMX21_DMA_H */

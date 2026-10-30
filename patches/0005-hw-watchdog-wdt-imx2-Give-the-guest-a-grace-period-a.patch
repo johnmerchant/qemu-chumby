@@ -1,0 +1,162 @@
+Description: hw/watchdog/wdt_imx2: Give the guest a grace period after a host stall
+ Without -icount the virtual clock keeps running while the host does not
+ run QEMU at all: the host sleeping, QEMU stopped by SIGSTOP, or a
+ starved process. The Chumby's kernel arms the watchdog for 2.5 s and
+ services it every 10 ms, but after any such stall longer than that the
+ timeout has passed before the guest could run, and the machine resets.
+ .
+ Add a "stall-grace-ms" property, 0 (off) by default so other machines
+ are unchanged. With it, a timeout does not act at once: the guest gets
+ that much more time on the virtual clock, and a service in it cancels
+ the reset. A hung guest is reset that much later. The pending grace
+ timer is migrated in a subsection that only exists when the property
+ is set.
+ .
+ With the i.MX21's 250 ms, stopping QEMU for 5, 10 and 30 s left the
+ stock Chumby firmware running, and unloading chumby_sense1 (which stops
+ the servicing) still reset the machine.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/hw/watchdog/wdt_imx2.c b/hw/watchdog/wdt_imx2.c
+--- a/hw/watchdog/wdt_imx2.c
++++ b/hw/watchdog/wdt_imx2.c
+@@ -29,12 +29,8 @@ static void imx2_wdt_interrupt(void *opaque)
+     qemu_set_irq(s->irq, 1);
+ }
+ 
+-static void imx2_wdt_expired(void *opaque)
++static void imx2_wdt_timeout(IMX2WdtState *s)
+ {
+-    IMX2WdtState *s = IMX2_WDT(opaque);
+-
+-    trace_imx2_wdt_expired();
+-
+     s->wrsr = IMX2_WDT_WRSR_TOUT;
+ 
+     /* Perform watchdog action if watchdog is enabled */
+@@ -44,6 +40,35 @@ static void imx2_wdt_expired(void *opaque)
+     }
+ }
+ 
++static void imx2_wdt_expired(void *opaque)
++{
++    IMX2WdtState *s = IMX2_WDT(opaque);
++
++    trace_imx2_wdt_expired();
++
++    /*
++     * Without -icount the virtual clock keeps running while the host
++     * does not run QEMU at all (the host suspended, QEMU stopped by a
++     * signal, a starved process), so the count can run out before the
++     * guest had a chance to service it. With a stall grace, let the guest
++     * run for that long before giving up on it.
++     */
++    if (s->stall_grace_ms && (s->wcr & IMX2_WDT_WCR_WDE)) {
++        timer_mod(&s->grace_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
++                  s->stall_grace_ms);
++        return;
++    }
++    imx2_wdt_timeout(s);
++}
++
++static void imx2_wdt_grace_expired(void *opaque)
++{
++    IMX2WdtState *s = IMX2_WDT(opaque);
++
++    trace_imx2_wdt_expired();
++    imx2_wdt_timeout(s);
++}
++
+ static void imx2_wdt_reset(DeviceState *dev)
+ {
+     IMX2WdtState *s = IMX2_WDT(dev);
+@@ -51,6 +76,7 @@ static void imx2_wdt_reset(DeviceState *dev)
+     ptimer_transaction_begin(s->timer);
+     ptimer_stop(s->timer);
+     ptimer_transaction_commit(s->timer);
++    timer_del(&s->grace_timer);
+ 
+     if (s->pretimeout_support) {
+         ptimer_transaction_begin(s->itimer);
+@@ -144,6 +170,7 @@ static void imx_wdt2_update_itimer(IMX2WdtState *s, bool start)
+ 
+ static void imx_wdt2_update_timer(IMX2WdtState *s, bool start)
+ {
++    timer_del(&s->grace_timer);
+     ptimer_transaction_begin(s->timer);
+     if (start) {
+         ptimer_stop(s->timer);
+@@ -270,6 +297,24 @@ static const VMStateDescription vmstate_imx2_wdt_reset_source = {
+     }
+ };
+ 
++static bool imx2_wdt_stall_grace_needed(void *opaque)
++{
++    IMX2WdtState *s = IMX2_WDT(opaque);
++
++    return s->stall_grace_ms;
++}
++
++static const VMStateDescription vmstate_imx2_wdt_stall_grace = {
++    .name = "imx2.wdt/stall-grace",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = imx2_wdt_stall_grace_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_TIMER(grace_timer, IMX2WdtState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static const VMStateDescription vmstate_imx2_wdt = {
+     .name = "imx2.wdt",
+     .fields = (const VMStateField[]) {
+@@ -288,6 +333,7 @@ static const VMStateDescription vmstate_imx2_wdt = {
+     },
+     .subsections = (const VMStateDescription * const []) {
+         &vmstate_imx2_wdt_reset_source,
++        &vmstate_imx2_wdt_stall_grace,
+         NULL
+     }
+ };
+@@ -304,6 +350,8 @@ static void imx2_wdt_realize(DeviceState *dev, Error **errp)
+     sysbus_init_mmio(sbd, &s->mmio);
+     sysbus_init_irq(sbd, &s->irq);
+ 
++    timer_init_ms(&s->grace_timer, QEMU_CLOCK_VIRTUAL, imx2_wdt_grace_expired,
++                  s);
+     s->timer = ptimer_init(imx2_wdt_expired, s,
+                            PTIMER_POLICY_NO_IMMEDIATE_TRIGGER |
+                            PTIMER_POLICY_NO_IMMEDIATE_RELOAD |
+@@ -328,6 +376,7 @@ static const Property imx2_wdt_properties[] = {
+     DEFINE_PROP_BOOL("pretimeout-support", IMX2WdtState, pretimeout_support,
+                      false),
+     DEFINE_PROP_BOOL("reset-source", IMX2WdtState, reset_source, false),
++    DEFINE_PROP_UINT32("stall-grace-ms", IMX2WdtState, stall_grace_ms, 0),
+ };
+ 
+ static void imx2_wdt_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/watchdog/wdt_imx2.h b/include/hw/watchdog/wdt_imx2.h
+--- a/include/hw/watchdog/wdt_imx2.h
++++ b/include/hw/watchdog/wdt_imx2.h
+@@ -16,6 +16,7 @@
+ #include "hw/core/sysbus.h"
+ #include "hw/core/irq.h"
+ #include "hw/core/ptimer.h"
++#include "qemu/timer.h"
+ #include "qom/object.h"
+ 
+ #define TYPE_IMX2_WDT "imx2.wdt"
+@@ -92,6 +93,9 @@ struct IMX2WdtState {
+     bool reset_source;          /* WRSR reports the last reset's source */
+     bool powered_on;
+     uint16_t wrsr_next;         /* source of the reset being performed */
++
++    uint32_t stall_grace_ms;    /* time the guest gets after a timeout */
++    QEMUTimer grace_timer;
+ };
+ 
+ #endif /* WDT_IMX2_H */

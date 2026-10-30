@@ -1,0 +1,557 @@
+Description: hw/rtc: Add the i.MX21 real-time clock
+ The i.MX1/21/27 RTC keeps a 16-bit day counter and the hour, minute
+ and second of the day, with an alarm on all four, a minute stopwatch,
+ and interrupts every day, hour, minute, second and half second and at
+ 4 to 512 Hz. Linux's rtc-mxc drives it as fsl,imx21-rtc; the Chumby
+ Classic's own 2.6.16 kernel has no driver for it.
+ .
+ Model the count on QEMU's RTC clock, starting from -rtc base= and
+ counting days since 1970 as rtc-mxc does, so that the guest reads the
+ host's date by default. Status flags are latched lazily from the count
+ on every access, and a timer runs only for the next enabled event.
+ Setting the time sends RTC_CHANGE. Disabling the RTC freezes the count;
+ a software reset clears it. The block is in its own power domain, so a
+ system reset leaves it running.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -879,6 +879,7 @@ F: hw/gpio/imx21_gpio.c
+ F: hw/input/imx21_kpp.c
+ F: hw/intc/imx21_aitc.c
+ F: hw/misc/imx21_*.c
++F: hw/rtc/imx21_rtc.c
+ F: hw/ssi/imx21_cspi.c
+ F: hw/timer/imx21_gpt.c
+ F: include/hw/*/imx21_*.h
+diff --git a/hw/rtc/imx21_rtc.c b/hw/rtc/imx21_rtc.c
+new file mode 100644
+--- /dev/null
++++ b/hw/rtc/imx21_rtc.c
+@@ -0,0 +1,454 @@
++/*
++ * i.MX21 real-time clock (RTC)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The i.MX1/21/27 RTC: a day counter and an hour, minute and second time
++ * of day, clocked from the 32 kHz crystal, with an alarm on all four, a
++ * minute stopwatch, and interrupts every day, hour, minute, second, half
++ * second and at 4 to 512 Hz (the "sampling timer"). Linux's rtc-mxc
++ * drives it (fsl,imx21-rtc); the Chumby's own 2.6.16 kernel does not.
++ *
++ * The count follows QEMU's RTC clock (-rtc clock=, default the host's)
++ * and starts at -rtc base= (default the host's time of day), counting
++ * days since 1970, as rtc-mxc reads it. The RTC is in its own power
++ * domain, so a system reset leaves it alone. When the stopwatch has
++ * counted down past 0 it reads 0x3f (-1) and stays there until written.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/rtc/imx21_rtc.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qapi/qapi-events-misc.h"
++#include "qemu/cutils.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "system/rtc.h"
++#include "system/system.h"
++#include "trace.h"
++
++#define HOURMIN     0x00
++#define SECONDS     0x04
++#define ALRM_HM     0x08
++#define ALRM_SEC    0x0c
++#define RTCCTL      0x10
++#define RTCISR      0x14
++#define RTCIENR     0x18
++#define STPWCH      0x1c
++#define DAYR        0x20
++#define DAYALARM    0x24
++
++#define RTCCTL_SWR  (1 << 0)
++#define RTCCTL_GEN  (1 << 1)
++#define RTCCTL_XTL  (3 << 5)
++#define RTCCTL_EN   (1 << 7)
++
++#define RTC_INT_SW      (1 << 0)
++#define RTC_INT_MIN     (1 << 1)
++#define RTC_INT_ALM     (1 << 2)
++#define RTC_INT_DAY     (1 << 3)
++#define RTC_INT_1HZ     (1 << 4)
++#define RTC_INT_HR      (1 << 5)
++#define RTC_INT_2HZ     (1 << 7)
++#define RTC_INT_SAM(n)  (1 << (8 + (n)))
++#define RTC_INT_MASK    0xffbf
++
++#define STPWCH_IDLE 0x3f
++
++#define NS          NANOSECONDS_PER_SECOND
++#define DAY_S       86400
++/* The day counter is 16 bits. */
++#define WRAP_NS     ((int64_t)0x10000 * DAY_S * NS)
++
++/* The periodic interrupts and their periods in ns. */
++static const struct {
++    uint32_t bit;
++    int64_t period;
++} imx21_rtc_periodic[] = {
++    { RTC_INT_DAY, (int64_t)DAY_S * NS },
++    { RTC_INT_HR, 3600 * NS },
++    { RTC_INT_MIN, 60 * NS },
++    { RTC_INT_1HZ, NS },
++    { RTC_INT_2HZ, NS / 2 },
++    { RTC_INT_SAM(0), NS / 4 },
++    { RTC_INT_SAM(1), NS / 8 },
++    { RTC_INT_SAM(2), NS / 16 },
++    { RTC_INT_SAM(3), NS / 32 },
++    { RTC_INT_SAM(4), NS / 64 },
++    { RTC_INT_SAM(5), NS / 128 },
++    { RTC_INT_SAM(6), NS / 256 },
++    { RTC_INT_SAM(7), NS / 512 },
++};
++
++static int64_t imx21_rtc_now(IMX21RTCState *s)
++{
++    if (!(s->rtcctl & RTCCTL_EN)) {
++        return s->frozen_ns;
++    }
++    return qemu_clock_get_ns(rtc_clock) + s->offset_ns;
++}
++
++static int64_t imx21_rtc_alarm_ns(IMX21RTCState *s)
++{
++    return ((int64_t)(s->dayalarm & 0xffff) * DAY_S +
++            ((s->alrm_hm >> 8) & 0x1f) * 3600 + (s->alrm_hm & 0x3f) * 60 +
++            (s->alrm_sec & 0x3f)) * NS;
++}
++
++/* The minute at which the stopwatch passes 0, or -1 if it is idle. */
++static int64_t imx21_rtc_stpwch_end(IMX21RTCState *s)
++{
++    if (s->stpwch_base == STPWCH_IDLE) {
++        return -1;
++    }
++    return s->stpwch_min0 + s->stpwch_base + 1;
++}
++
++static uint32_t imx21_rtc_stpwch(IMX21RTCState *s, int64_t now)
++{
++    int64_t end = imx21_rtc_stpwch_end(s);
++    int64_t min = now / (60 * NS);
++
++    if (end < 0 || min >= end) {
++        return STPWCH_IDLE;
++    }
++    return s->stpwch_base - (min - s->stpwch_min0);
++}
++
++static void imx21_rtc_update_irq(IMX21RTCState *s)
++{
++    int level = !!(s->rtcisr & s->rtcienr);
++
++    trace_imx21_rtc_irq(level);
++    qemu_set_irq(s->irq, level);
++}
++
++/* Latches every event between the last call and now. */
++static void imx21_rtc_catch_up(IMX21RTCState *s)
++{
++    int64_t now = imx21_rtc_now(s);
++    int64_t last = s->last_ns;
++    int64_t alarm, end;
++    int i;
++
++    if (now <= last) {
++        /* Stopped, or the host clock stepped back. */
++        s->last_ns = now;
++        return;
++    }
++    for (i = 0; i < ARRAY_SIZE(imx21_rtc_periodic); i++) {
++        int64_t p = imx21_rtc_periodic[i].period;
++
++        if (now / p != last / p) {
++            s->rtcisr |= imx21_rtc_periodic[i].bit;
++        }
++    }
++    alarm = imx21_rtc_alarm_ns(s);
++    if (last < alarm && alarm <= now) {
++        s->rtcisr |= RTC_INT_ALM;
++    }
++    end = imx21_rtc_stpwch_end(s);
++    if (end >= 0 && last < end * 60 * NS && end * 60 * NS <= now) {
++        s->rtcisr |= RTC_INT_SW;
++        s->stpwch_base = STPWCH_IDLE;
++    }
++    s->last_ns = now;
++}
++
++/* Arms the timer for the next event that can interrupt. */
++static void imx21_rtc_schedule(IMX21RTCState *s)
++{
++    int64_t now = s->last_ns;
++    int64_t next = INT64_MAX;
++    int i;
++
++    if (!(s->rtcctl & RTCCTL_EN)) {
++        timer_del(s->timer);
++        return;
++    }
++    for (i = 0; i < ARRAY_SIZE(imx21_rtc_periodic); i++) {
++        int64_t p = imx21_rtc_periodic[i].period;
++
++        if (s->rtcienr & imx21_rtc_periodic[i].bit) {
++            next = MIN(next, (now / p + 1) * p);
++        }
++    }
++    if (s->rtcienr & RTC_INT_ALM) {
++        int64_t alarm = imx21_rtc_alarm_ns(s);
++
++        if (alarm > now) {
++            next = MIN(next, alarm);
++        }
++    }
++    if (s->rtcienr & RTC_INT_SW) {
++        int64_t end = imx21_rtc_stpwch_end(s);
++
++        if (end >= 0) {
++            next = MIN(next, end * 60 * NS);
++        }
++    }
++    if (next == INT64_MAX) {
++        timer_del(s->timer);
++    } else {
++        timer_mod(s->timer, next - s->offset_ns);
++    }
++}
++
++static void imx21_rtc_tick(void *opaque)
++{
++    IMX21RTCState *s = opaque;
++
++    imx21_rtc_catch_up(s);
++    imx21_rtc_schedule(s);
++    imx21_rtc_update_irq(s);
++}
++
++/* Sets the count without latching events, keeping the stopwatch. */
++static void imx21_rtc_set(IMX21RTCState *s, int64_t ns)
++{
++    uint32_t sw = imx21_rtc_stpwch(s, s->last_ns);
++
++    ns = ((ns % WRAP_NS) + WRAP_NS) % WRAP_NS;
++    if (s->rtcctl & RTCCTL_EN) {
++        s->offset_ns = ns - qemu_clock_get_ns(rtc_clock);
++    } else {
++        s->frozen_ns = ns;
++    }
++    s->last_ns = ns;
++    s->stpwch_base = sw;
++    s->stpwch_min0 = ns / (60 * NS);
++}
++
++static void imx21_rtc_report(IMX21RTCState *s)
++{
++    struct tm tm;
++    time_t t = s->last_ns / NS;
++    g_autofree char *qom_path = object_get_canonical_path(OBJECT(s));
++
++    gmtime_r(&t, &tm);
++    qapi_event_send_rtc_change(qemu_timedate_diff(&tm), qom_path);
++}
++
++static uint64_t imx21_rtc_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21RTCState *s = opaque;
++    int64_t sec;
++    uint32_t val;
++
++    imx21_rtc_catch_up(s);
++    sec = s->last_ns / NS;
++    switch (offset) {
++    case HOURMIN:
++        val = ((sec / 3600) % 24) << 8 | (sec / 60) % 60;
++        break;
++    case SECONDS:
++        val = sec % 60;
++        break;
++    case ALRM_HM:
++        val = s->alrm_hm;
++        break;
++    case ALRM_SEC:
++        val = s->alrm_sec;
++        break;
++    case RTCCTL:
++        val = s->rtcctl;
++        break;
++    case RTCISR:
++        val = s->rtcisr;
++        break;
++    case RTCIENR:
++        val = s->rtcienr;
++        break;
++    case STPWCH:
++        val = imx21_rtc_stpwch(s, s->last_ns);
++        break;
++    case DAYR:
++        val = (sec / DAY_S) & 0xffff;
++        break;
++    case DAYALARM:
++        val = s->dayalarm;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        val = 0;
++        break;
++    }
++    trace_imx21_rtc_read(offset, val);
++    imx21_rtc_update_irq(s);
++    return val;
++}
++
++static void imx21_rtc_do_reset(IMX21RTCState *s)
++{
++    s->alrm_hm = 0;
++    s->alrm_sec = 0;
++    s->rtcisr = 0;
++    s->rtcienr = 0;
++    s->dayalarm = 0;
++    s->stpwch_base = STPWCH_IDLE;
++    s->stpwch_min0 = 0;
++}
++
++static void imx21_rtc_write(void *opaque, hwaddr offset, uint64_t val,
++                            unsigned size)
++{
++    IMX21RTCState *s = opaque;
++    int64_t now, sec, sub;
++
++    trace_imx21_rtc_write(offset, val);
++    imx21_rtc_catch_up(s);
++    now = s->last_ns;
++    sec = now / NS;
++    sub = now % NS;
++    switch (offset) {
++    case HOURMIN:
++        sec = sec - sec % DAY_S + ((val >> 8) & 0x1f) * 3600 +
++              (val & 0x3f) * 60 + sec % 60;
++        imx21_rtc_set(s, sec * NS + sub);
++        imx21_rtc_report(s);
++        break;
++    case SECONDS:
++        sec = sec - sec % 60 + (val & 0x3f);
++        imx21_rtc_set(s, sec * NS + sub);
++        imx21_rtc_report(s);
++        break;
++    case DAYR:
++        sec = (val & 0xffff) * (int64_t)DAY_S + sec % DAY_S;
++        imx21_rtc_set(s, sec * NS + sub);
++        imx21_rtc_report(s);
++        break;
++    case ALRM_HM:
++        s->alrm_hm = val & 0x1f3f;
++        break;
++    case ALRM_SEC:
++        s->alrm_sec = val & 0x3f;
++        break;
++    case DAYALARM:
++        s->dayalarm = val & 0xffff;
++        break;
++    case RTCCTL:
++        if (val & RTCCTL_SWR) {
++            /* Software reset: everything to zero, the count included. */
++            imx21_rtc_do_reset(s);
++            imx21_rtc_set(s, 0);
++        }
++        if ((val ^ s->rtcctl) & RTCCTL_EN) {
++            /* Freeze or restart the count where it is. */
++            s->rtcctl ^= RTCCTL_EN;
++            imx21_rtc_set(s, now);
++        }
++        s->rtcctl = val & (RTCCTL_GEN | RTCCTL_XTL | RTCCTL_EN);
++        break;
++    case RTCISR:
++        s->rtcisr &= ~val;
++        break;
++    case RTCIENR:
++        s->rtcienr = val & RTC_INT_MASK;
++        break;
++    case STPWCH:
++        s->stpwch_base = val & 0x3f;
++        s->stpwch_min0 = now / (60 * NS);
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return;
++    }
++    imx21_rtc_schedule(s);
++    imx21_rtc_update_irq(s);
++}
++
++static const MemoryRegionOps imx21_rtc_ops = {
++    .read = imx21_rtc_read,
++    .write = imx21_rtc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_rtc_init(Object *obj)
++{
++    IMX21RTCState *s = IMX21_RTC(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx21_rtc_ops, s,
++                          TYPE_IMX21_RTC, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static void imx21_rtc_realize(DeviceState *dev, Error **errp)
++{
++    IMX21RTCState *s = IMX21_RTC(dev);
++    struct tm tm;
++
++    s->timer = timer_new_ns(rtc_clock, imx21_rtc_tick, s);
++    /* Power on: running, from -rtc base=. */
++    imx21_rtc_do_reset(s);
++    s->rtcctl = RTCCTL_EN;
++    qemu_get_timedate(&tm, 0);
++    imx21_rtc_set(s, mktimegm(&tm) * NS);
++}
++
++static int imx21_rtc_post_load(void *opaque, int version_id)
++{
++    IMX21RTCState *s = opaque;
++
++    imx21_rtc_schedule(s);
++    return 0;
++}
++
++static const VMStateDescription vmstate_imx21_rtc = {
++    .name = TYPE_IMX21_RTC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = imx21_rtc_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(alrm_hm, IMX21RTCState),
++        VMSTATE_UINT32(alrm_sec, IMX21RTCState),
++        VMSTATE_UINT32(rtcctl, IMX21RTCState),
++        VMSTATE_UINT32(rtcisr, IMX21RTCState),
++        VMSTATE_UINT32(rtcienr, IMX21RTCState),
++        VMSTATE_UINT32(dayalarm, IMX21RTCState),
++        VMSTATE_UINT32(stpwch_base, IMX21RTCState),
++        VMSTATE_INT64(stpwch_min0, IMX21RTCState),
++        VMSTATE_INT64(offset_ns, IMX21RTCState),
++        VMSTATE_INT64(frozen_ns, IMX21RTCState),
++        VMSTATE_INT64(last_ns, IMX21RTCState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_rtc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = imx21_rtc_realize;
++    dc->vmsd = &vmstate_imx21_rtc;
++    dc->desc = "i.MX21 real-time clock";
++}
++
++static const TypeInfo imx21_rtc_info = {
++    .name = TYPE_IMX21_RTC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21RTCState),
++    .instance_init = imx21_rtc_init,
++    .class_init = imx21_rtc_class_init,
++};
++
++static void imx21_rtc_register_types(void)
++{
++    type_register_static(&imx21_rtc_info);
++}
++
++type_init(imx21_rtc_register_types)
+diff --git a/hw/rtc/meson.build b/hw/rtc/meson.build
+--- a/hw/rtc/meson.build
++++ b/hw/rtc/meson.build
+@@ -14,3 +14,4 @@ system_ss.add(when: 'CONFIG_LS7A_RTC', if_true: files('ls7a_rtc.c'))
+ system_ss.add(when: 'CONFIG_ALLWINNER_H3', if_true: files('allwinner-rtc.c'))
+ system_ss.add(when: 'CONFIG_MC146818RTC', if_true: files('mc146818rtc.c'))
+ system_ss.add(when: 'CONFIG_RS5C372_RTC', if_true: files('rs5c372.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_rtc.c'))
+diff --git a/hw/rtc/trace-events b/hw/rtc/trace-events
+--- a/hw/rtc/trace-events
++++ b/hw/rtc/trace-events
+@@ -43,3 +43,8 @@ goldfish_rtc_write(uint64_t addr, uint64_t value) "addr 0x%02" PRIx64 " value 0x
+ # rs5c372.c
+ rs5c372_recv(uint32_t addr, uint8_t value) "[0x%" PRIx32 "] -> 0x%02" PRIx8
+ rs5c372_send(uint32_t addr, uint8_t value) "[0x%" PRIx32 "] <- 0x%02" PRIx8
++
++# imx21_rtc.c
++imx21_rtc_read(uint64_t addr, uint32_t value) "addr 0x%02" PRIx64 " value 0x%04" PRIx32
++imx21_rtc_write(uint64_t addr, uint64_t value) "addr 0x%02" PRIx64 " value 0x%04" PRIx64
++imx21_rtc_irq(int level) "irq %d"
+diff --git a/include/hw/rtc/imx21_rtc.h b/include/hw/rtc/imx21_rtc.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/rtc/imx21_rtc.h
+@@ -0,0 +1,43 @@
++/*
++ * i.MX21 real-time clock (RTC)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_RTC_H
++#define IMX21_RTC_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_RTC "imx21.rtc"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21RTCState, IMX21_RTC)
++
++struct IMX21RTCState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    QEMUTimer *timer;
++    qemu_irq irq;
++
++    uint32_t alrm_hm;
++    uint32_t alrm_sec;
++    uint32_t rtcctl;
++    uint32_t rtcisr;
++    uint32_t rtcienr;
++    uint32_t dayalarm;
++    /* The stopwatch counts down from stpwch_base at minute stpwch_min0. */
++    uint32_t stpwch_base;
++    int64_t stpwch_min0;
++    /* While enabled, the count in ns is rtc_clock + offset_ns. */
++    int64_t offset_ns;
++    /* While disabled, the count in ns. */
++    int64_t frozen_ns;
++    /* The count up to which events have been latched. */
++    int64_t last_ns;
++};
++
++#endif /* IMX21_RTC_H */
