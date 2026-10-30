@@ -57,6 +57,12 @@ modules:
       - type: archive
         url: https://download.qemu.org/qemu-11.1.2.tar.xz
         sha256: 731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016
+      # libfdt, which the tarball's subprojects/dtc.wrap would fetch at
+      # configure time: the same commit, fetched beforehand.
+      - type: git
+        url: https://gitlab.com/qemu-project/dtc.git
+        commit: b6910bec11614980a21e46fbccc35934b671bd81
+        dest: subprojects/dtc
       - type: dir
         path: ../patches
         dest: chumby-patches

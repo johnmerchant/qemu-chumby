@@ -21,7 +21,9 @@ case $pkg in
         dpkg -L qemu-chumby
         ;;
     *.rpm)
-        dnf install -yq "$pkg"
+        # Weak dependencies too, as a Fedora install has them (the
+        # container image turns them off): python3.
+        dnf install -yq --setopt=install_weak_deps=True "$pkg"
         rpm -q --requires qemu-chumby
         rpm -ql qemu-chumby
         ;;

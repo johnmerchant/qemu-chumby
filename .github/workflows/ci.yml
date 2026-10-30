@@ -442,12 +442,15 @@ jobs:
           q -audiodev help | tee "$RUNNER_TEMP/audio"
           grep -qx pa "$RUNNER_TEMP/audio"
           grep -qx pipewire "$RUNNER_TEMP/audio"
-          # The app, headless, on the smoke kernel: its test hook waits
-          # for the console, grabs the window and quits.
+          # The app, headless, on the smoke kernel: its test hook resets
+          # the machine once the app is on its console (the kernel says
+          # its line once, at boot), waits for the line, grabs the window
+          # and quits.
           t=$RUNNER_TEMP/app
           mkdir -p "$t"
           python3 tests/smoke/run --kernel "$t/smoke.bin"
-          printf '%s\n' 'waitfor smoke kernel up 60' "grab $t/window.png" "log $t/console.log" quit > "$t/test"
+          printf '%s\n' 'wait 2000' 'call reset' 'waitfor smoke kernel up 60' \
+            "grab $t/window.png" "log $t/console.log" quit > "$t/test"
           export XDG_RUNTIME_DIR=$t/run
           mkdir -m 700 "$XDG_RUNTIME_DIR"
           timeout 180 flatpak run --filesystem="$t" --env=QT_QPA_PLATFORM=offscreen \
