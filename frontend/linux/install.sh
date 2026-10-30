@@ -8,6 +8,17 @@
 # if built, goes in PREFIX/libexec/chumby-desktop, where the app looks
 # first; otherwise it uses the qemu-system-arm on $PATH, or --qemu.
 # Uninstall with: install.sh --uninstall [PREFIX]
+#
+# Needs Qt 6.5 or later, Rust 1.85 or later and a linker that copes with
+# CXX-Qt's static libraries (lld or mold; GNU ld fails):
+#   Fedora: cargo rust gcc-c++ lld qt6-qtbase-devel qt6-qtdeclarative-devel
+#     qt6-qtsvg
+#   Debian 13, Ubuntu 25.04 or later: cargo rustc g++ lld qt6-base-dev
+#     qt6-declarative-dev qmake6 qml6-module-qtquick
+#     qml6-module-qtquick-controls qml6-module-qtquick-layouts
+#     qml6-module-qtquick-dialogs qml6-module-qtquick-templates
+#     qml6-module-qtqml-workerscript qml6-module-qtcore qt6-svg-plugins
+#   Arch: rust lld qt6-base qt6-declarative qt6-svg
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)

@@ -77,7 +77,7 @@ class Console(QtCore.QObject):
 
     def _write(self):
         # The UART's receive FIFO holds 32 characters: pieces of 16, a few
-        # milliseconds apart (README.md, "Console").
+        # milliseconds apart (chumby_machine.py's header, "Console").
         while True:
             data = self.outq.get()
             for i in range(0, len(data), 16):

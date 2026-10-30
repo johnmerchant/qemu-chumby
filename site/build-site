@@ -5,16 +5,16 @@ web page, one short static page for developers, and its stylesheet.
 
 It says only what a newcomer needs to get running, and links the README
 for the rest. What it takes from README.md and qemu-release (the command,
-the QEMU release, the platforms, neochumby's link and the README's
-sections it links) and what it says in its own words (the summary, the
-legal sentence, the licence) are looked up or checked there. The README is read with a small
+the QEMU release, neochumby's link and the README's sections it links)
+and what it says in its own words (the summary, the legal sentence, the
+licence) are looked up or checked there. The README is read with a small
 parser for the Markdown it uses, which refuses anything else, and each
-piece is looked up by its heading or its first words, so that a README
-that no longer has what the page shows fails the build rather than
-leaving the page to drift.
+piece is looked up by its heading or its words, so that a README that no
+longer has what the page shows fails the build rather than leaving the
+page to drift.
 
 Its downloads are COMMIT's builds on the `prebuilt` release, one for each
-platform in the README's table of prebuilt binaries, with the SHA-256s in
+platform CI's build job builds (.github/workflows/ci.yml), with the SHA-256s in
 DIR's qemu-chumby-COMMIT-PLATFORM.tar.xz.sha256 (CI's build artifacts; the
 tarballs beside them, if there, give their sizes). It writes OUT (default
 _site): index.html, style.css and downloads.json, the downloads as
@@ -32,8 +32,8 @@ import sys
 
 REPO = "https://github.com/johnmerchant/qemu-chumby"
 RELEASE = REPO + "/releases/download/prebuilt"
-# Each platform's name, and what it can do in a few words: the README's
-# table of prebuilt binaries says it at length, and names the platforms.
+# Each platform's name, and what it can do in a few words, as the README's
+# table of prebuilt binaries says it.
 PLATFORMS = {
     "linux-x86_64": ("Linux x86_64", "Static; headless, no audio."),
     "linux-aarch64": ("Linux aarch64", "Static; headless, no audio."),
@@ -123,35 +123,6 @@ def md_cells(row):
     return [c.strip().replace("\\|", "|") for c in cells]
 
 
-def md_inline(text, commit):
-    """A line of the README's Markdown as HTML: code, links and bold. Its
-    links to its own anchors go to the README on GitHub, relative ones to
-    the files at COMMIT."""
-    codes = []
-
-    def code(m):
-        codes.append("<code>%s</code>" % esc(m.group(1)))
-        return "\0%d\0" % (len(codes) - 1)
-
-    def href(url):
-        if url.startswith("#"):
-            return REPO + url
-        if re.match(r"[a-z]+:", url):
-            return url
-        return "%s/blob/%s/%s" % (REPO, commit, url)
-
-    text = re.sub(r"`([^`]+)`", code, text)
-    if "`" in text or "![" in text:
-        raise Error("README.md: inline Markdown this script doesn't know: %r" % text)
-    text = esc(text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
-                  lambda m: '<a href="%s">%s</a>' % (esc(href(html.unescape(m.group(2)))), m.group(1)), text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
-    if re.search(r"\*\S|\S\*|\[[^\]]*\]\(", text):
-        raise Error("README.md: inline Markdown this script doesn't know: %r" % text)
-    return re.sub(r"\0(\d+)\0", lambda m: codes[int(m.group(1))], text)
-
-
 class Readme:
     def __init__(self, text):
         self.blocks = md_blocks(text)
@@ -170,17 +141,15 @@ class Readme:
         self.section(title)
         return "%s#%s" % (REPO, slug(title))
 
-    def para(self, title, start):
+    def text(self, title):
+        """A section's paragraphs and list items, as one string."""
+        out = []
         for b in self.section(title):
-            if b.kind == "para" and b.text.startswith(start):
-                return b.text
-        raise Error("README.md, %r: no paragraph begins %r" % (title, start))
-
-    def table(self, title, first_col):
-        for b in self.section(title):
-            if b.kind == "table" and b.head[0] == first_col:
-                return b
-        raise Error("README.md, %r: no table headed %r" % (title, first_col))
+            if b.kind == "para":
+                out.append(b.text)
+            elif b.kind == "list":
+                out += b.items
+        return " ".join(out)
 
 
 def need(text, *words):
@@ -222,8 +191,7 @@ def code_html(text, label):
 def page(readme, commit, qemu_version, dls):
     title = readme.blocks[0].text
 
-    # The README's opening: the command, neochumby's link (a badge) and the
-    # no-affiliation notice, which the page's one sentence shortens.
+    # The README's opening: the command and neochumby's link (a badge).
     opening = []
     for b in readme.blocks[1:]:
         if b.kind == "heading":
@@ -239,18 +207,15 @@ def page(readme, commit, qemu_version, dls):
     if not m:
         raise Error("README.md: no summary naming qemu-system-arm -M chumby-classic")
     command = m.group(1)
-    need(" ".join(b.text for b in opening if b.kind == "para"),
-         "i.MX21", "ARM926EJ-S", "not affiliated with or endorsed by Chumby Industries",
-         "anyone holding rights in Chumby")
-    need(" ".join(i for b in readme.section("Legal") if b.kind == "list" for i in b.items),
-         "It contains no Chumby software", "comes from your own device")
-    need(readme.para("Licence", "QEMU is GPL-2.0-or-later"), "GPL-2.0-or-later")
-    need(" ".join(b.text for b in readme.section("Control surface") if b.kind == "para"),
-         "QMP", "query-chumby-state")
+    need(summary, "i.MX21", "ARM926EJ-S")
+    # The page's legal sentence and licence line shorten these.
+    need(readme.text("Legal"), "not affiliated with or endorsed by Chumby Industries",
+         "anyone holding rights in Chumby", "No Chumby software", "never go in this repository")
+    need(readme.text("Licence"), "GPL-2.0-or-later")
 
     for d in dls:
         if d["platform"] not in PLATFORMS:
-            raise Error("README.md: a platform this page doesn't describe: %s" % d["platform"])
+            raise Error("ci.yml builds a platform this page doesn't describe: %s" % d["platform"])
 
     cards = []
     for d in dls:
@@ -274,12 +239,9 @@ def page(readme, commit, qemu_version, dls):
     ])
 
     more = [
-        (readme.anchor("Building"), "Build from source"),
-        (readme.anchor("What is modelled"), "What&rsquo;s emulated"),
-        (readme.anchor("Control surface"), "Drive it from code (QMP)"),
-        (readme.anchor("Scripts and tests: chumby-machine"), "chumby-machine (scripts, tests)"),
-        (readme.anchor("The Mac app: Chumby.app"), "Chumby.app (macOS)"),
-        (readme.anchor("The Linux app: chumby-desktop"), "chumby-desktop (Linux)"),
+        (readme.anchor("Quick start"), "Build from source"),
+        (readme.anchor("What it emulates"), "What&rsquo;s emulated"),
+        (readme.anchor("Tools"), "The apps, and driving it from code"),
         (readme.anchor("Images"), "Images from your own Chumby"),
     ]
     short = commit[:12]
@@ -367,11 +329,12 @@ def main():
         m = re.search(r"^version=([\w.]+)$", f.read(), re.M)
     if not m:
         raise Error("qemu-release: no version")
-    platforms = []
-    for r in readme.table("Prebuilt binaries", "Platform").rows:
-        platforms += re.findall(r"`([^`]+)`", r[0])
+    # The platforms: the build job's matrix.
+    with open(os.path.join(a.root, ".github", "workflows", "ci.yml"), encoding="utf-8") as f:
+        m2 = re.search(r"^  build:\n(.*?)^  \w", f.read(), re.M | re.S)
+    platforms = re.findall(r"^\s+- platform: (\S+)$", m2.group(1), re.M) if m2 else []
     if not platforms:
-        raise Error("README.md: no platforms in the prebuilt binaries' table")
+        raise Error("ci.yml: no platforms in the build job's matrix")
     dls = downloads(a.commit, a.sha256, platforms)
     text = page(readme, a.commit, m.group(1), dls)
     os.makedirs(a.out, exist_ok=True)
