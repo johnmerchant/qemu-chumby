@@ -1,0 +1,131 @@
+Description: hw/watchdog/wdt_imx2: Optionally report the reset source in WRSR
+ WRSR holds the source of the last reset. The model clears its timeout
+ and software reset flags on every reset, so a guest can never see why it
+ was reset. The i.MX21's Chumby kernel reads WRSR at start-up and shows it
+ in /proc/resetReason (power-on, software, watchdog or external reset).
+ .
+ Add a "reset-source" property, off by default so existing machines are
+ unchanged. With it, the reset this block performs (a timeout, or a
+ software reset through WCR) is latched into WRSR across the reset; any
+ other reset reads as power-on the first time and as an external reset
+ after that. The latch is migrated in a subsection that only exists when
+ the property is set.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/hw/watchdog/wdt_imx2.c b/hw/watchdog/wdt_imx2.c
+--- a/hw/watchdog/wdt_imx2.c
++++ b/hw/watchdog/wdt_imx2.c
+@@ -39,6 +39,7 @@ static void imx2_wdt_expired(void *opaque)
+ 
+     /* Perform watchdog action if watchdog is enabled */
+     if (s->wcr & IMX2_WDT_WCR_WDE) {
++        s->wrsr_next = IMX2_WDT_WRSR_TOUT;
+         watchdog_perform_action();
+     }
+ }
+@@ -63,7 +64,24 @@ static void imx2_wdt_reset(DeviceState *dev)
+ 
+     s->wcr = IMX2_WDT_WCR_WDA | IMX2_WDT_WCR_SRS;
+     s->wsr = 0;
+-    s->wrsr &= ~(IMX2_WDT_WRSR_TOUT | IMX2_WDT_WRSR_SFTW);
++    if (s->reset_source) {
++        /*
++         * WRSR holds the source of the last reset: a watchdog timeout or
++         * software reset this block asserted, else power-on the first
++         * time and an external reset after that.
++         */
++        if (s->wrsr_next) {
++            s->wrsr = s->wrsr_next;
++        } else if (s->powered_on) {
++            s->wrsr = IMX2_WDT_WRSR_EXT;
++        } else {
++            s->wrsr = IMX2_WDT_WRSR_POR;
++        }
++        s->wrsr_next = 0;
++        s->powered_on = true;
++    } else {
++        s->wrsr &= ~(IMX2_WDT_WRSR_TOUT | IMX2_WDT_WRSR_SFTW);
++    }
+     s->wicr = IMX2_WDT_WICR_WICT_DEF;
+     s->wmcr = IMX2_WDT_WMCR_PDE;
+ }
+@@ -178,6 +196,8 @@ static void imx2_wdt_write(void *opaque, hwaddr addr,
+         }
+         if (!(value & (IMX2_WDT_WCR_WDA | IMX2_WDT_WCR_SRS)) ||
+             (!(value & IMX2_WDT_WCR_WT) && (value & IMX2_WDT_WCR_WDE))) {
++            s->wrsr_next = (value & IMX2_WDT_WCR_SRS) ? IMX2_WDT_WRSR_TOUT
++                                                      : IMX2_WDT_WRSR_SFTW;
+             watchdog_perform_action();
+         }
+         s->wcr |= IMX2_WDT_WCR_SRS;
+@@ -231,6 +251,25 @@ static const MemoryRegionOps imx2_wdt_ops = {
+     },
+ };
+ 
++static bool imx2_wdt_reset_source_needed(void *opaque)
++{
++    IMX2WdtState *s = IMX2_WDT(opaque);
++
++    return s->reset_source;
++}
++
++static const VMStateDescription vmstate_imx2_wdt_reset_source = {
++    .name = "imx2.wdt/reset-source",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = imx2_wdt_reset_source_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT16(wrsr_next, IMX2WdtState),
++        VMSTATE_BOOL(powered_on, IMX2WdtState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static const VMStateDescription vmstate_imx2_wdt = {
+     .name = "imx2.wdt",
+     .fields = (const VMStateField[]) {
+@@ -246,6 +285,10 @@ static const VMStateDescription vmstate_imx2_wdt = {
+         VMSTATE_UINT16(wmcr, IMX2WdtState),
+         VMSTATE_UINT16(wicr, IMX2WdtState),
+         VMSTATE_END_OF_LIST()
++    },
++    .subsections = (const VMStateDescription * const []) {
++        &vmstate_imx2_wdt_reset_source,
++        NULL
+     }
+ };
+ 
+@@ -284,6 +327,7 @@ static void imx2_wdt_realize(DeviceState *dev, Error **errp)
+ static const Property imx2_wdt_properties[] = {
+     DEFINE_PROP_BOOL("pretimeout-support", IMX2WdtState, pretimeout_support,
+                      false),
++    DEFINE_PROP_BOOL("reset-source", IMX2WdtState, reset_source, false),
+ };
+ 
+ static void imx2_wdt_class_init(ObjectClass *klass, const void *data)
+diff --git a/include/hw/watchdog/wdt_imx2.h b/include/hw/watchdog/wdt_imx2.h
+--- a/include/hw/watchdog/wdt_imx2.h
++++ b/include/hw/watchdog/wdt_imx2.h
+@@ -51,6 +51,8 @@ enum IMX2WdtRegisters {
+ /* Reset Status Register definitions */
+ #define IMX2_WDT_WRSR_TOUT      BIT(1)      /* Reset due to Timeout */
+ #define IMX2_WDT_WRSR_SFTW      BIT(0)      /* Reset due to software reset */
++#define IMX2_WDT_WRSR_EXT       BIT(3)      /* External reset (i.MX21) */
++#define IMX2_WDT_WRSR_POR       BIT(4)      /* Power-on reset */
+ 
+ /* Interrupt Control Register definitions */
+ #define IMX2_WDT_WICR_WIE       BIT(15)     /* Interrupt Enable */
+@@ -86,6 +88,10 @@ struct IMX2WdtState {
+     bool wcr_locked;            /* affects WDZST, WDBG, and WDW */
+     bool wcr_wde_locked;        /* affects WDE */
+     bool wcr_wdt_locked;        /* affects WDT (never cleared) */
++
++    bool reset_source;          /* WRSR reports the last reset's source */
++    bool powered_on;
++    uint16_t wrsr_next;         /* source of the reset being performed */
+ };
+ 
+ #endif /* WDT_IMX2_H */

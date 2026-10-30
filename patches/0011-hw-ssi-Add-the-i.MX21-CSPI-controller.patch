@@ -1,0 +1,387 @@
+Description: hw/ssi: Add the i.MX21 CSPI controller
+ The i.MX21's CSPI1-3, an SPI master with 8-word FIFOs. An exchange
+ shifts out the whole transmit FIFO as one chip-select frame.
+ .
+ Each word of a burst goes to the SSI bus as one transfer, which suits a
+ word-oriented peripheral like the TSC2100. The parts on the Chumby
+ Classic's sensor card are byte-oriented, and the stock driver
+ (chumby_accel.c) talks to them with 8, 16 and 32-bit words: a 16-bit
+ word is a command byte and a data byte, a 32-bit EEPROM read is the
+ opcode, two address bytes and the data byte. On the wire that is a
+ stream of bytes, most significant first. So a "bytewise" property, off
+ by default, sends each word to the bus as its bytes, MSB first, and
+ makes up the word read back from the bytes received. Its width is the
+ control register's bit count, rounded up to whole bytes.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -874,6 +874,7 @@ S: Maintained
+ F: hw/gpio/imx21_gpio.c
+ F: hw/intc/imx21_aitc.c
+ F: hw/misc/imx21_*.c
++F: hw/ssi/imx21_cspi.c
+ F: hw/timer/imx21_gpt.c
+ F: include/hw/*/imx21_*.h
+ F: qapi/chumby.json
+diff --git a/hw/ssi/imx21_cspi.c b/hw/ssi/imx21_cspi.c
+new file mode 100644
+--- /dev/null
++++ b/hw/ssi/imx21_cspi.c
+@@ -0,0 +1,297 @@
++/*
++ * i.MX21 CSPI SPI controller
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The i.MX21's CSPI1-3: an SPI master with 8-word transmit and receive
++ * FIFOs. Starting an exchange (XCH) shifts out every word in the transmit
++ * FIFO at once, as one chip-select frame, and the replies land in the
++ * receive FIFO. This is the older CSPI, not the i.MX6 ECSPI; only one
++ * chip select is wired, and DMA is not modelled.
++ *
++ * Each word goes to the bus as one transfer, unless "bytewise" is set:
++ * then it goes as its bytes, most significant first, which is what a
++ * byte-oriented peripheral sees on the wire.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/ssi/imx21_cspi.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define RXDATA  0x00
++#define TXDATA  0x04
++#define CONTROL 0x08
++#define INT     0x0c
++#define TEST    0x10
++#define PERIOD  0x14
++#define DMA     0x18
++#define RESET   0x1c
++
++#define CONTROL_BITCOUNT    0x1f
++#define CONTROL_XCH         (1 << 9)
++#define CONTROL_SPIEN       (1 << 10)
++
++#define INT_TE      (1 << 0)
++#define INT_TH      (1 << 1)
++#define INT_TF      (1 << 2)
++#define INT_TSHFE   (1 << 3)
++#define INT_RR      (1 << 4)
++#define INT_RH      (1 << 5)
++#define INT_RF      (1 << 6)
++#define INT_RO      (1 << 7)
++#define INT_EN_SHIFT 9
++#define INT_EN_MASK (0x1ff << INT_EN_SHIFT)
++
++static uint32_t imx21_cspi_status(IMX21CSPIState *s)
++{
++    uint32_t st = INT_TSHFE;
++    uint32_t tx = fifo32_num_used(&s->tx_fifo);
++    uint32_t rx = fifo32_num_used(&s->rx_fifo);
++
++    if (tx == 0) {
++        st |= INT_TE;
++    }
++    if (tx <= IMX21_CSPI_FIFO_SIZE / 2) {
++        st |= INT_TH;
++    }
++    if (tx >= IMX21_CSPI_FIFO_SIZE) {
++        st |= INT_TF;
++    }
++    if (rx) {
++        st |= INT_RR;
++    }
++    if (rx >= IMX21_CSPI_FIFO_SIZE / 2) {
++        st |= INT_RH;
++    }
++    if (rx >= IMX21_CSPI_FIFO_SIZE) {
++        st |= INT_RF;
++    }
++    if (s->overflow) {
++        st |= INT_RO;
++    }
++    return st;
++}
++
++static void imx21_cspi_update_irq(IMX21CSPIState *s)
++{
++    qemu_set_irq(s->irq,
++                 !!(imx21_cspi_status(s) & (s->int_en >> INT_EN_SHIFT)));
++}
++
++static uint32_t imx21_cspi_transfer(IMX21CSPIState *s, uint32_t tx,
++                                    uint32_t bits)
++{
++    uint32_t rx = 0;
++    int i;
++
++    if (!s->bytewise) {
++        return ssi_transfer(s->bus, tx);
++    }
++    for (i = DIV_ROUND_UP(bits, 8) - 1; i >= 0; i--) {
++        rx = (rx << 8) | (ssi_transfer(s->bus, (tx >> (i * 8)) & 0xff) & 0xff);
++    }
++    return rx;
++}
++
++static void imx21_cspi_exchange(IMX21CSPIState *s)
++{
++    uint32_t bits = (s->ctrl & CONTROL_BITCOUNT) + 1;
++    uint32_t mask = bits >= 32 ? 0xffffffff : (1u << bits) - 1;
++
++    qemu_set_irq(s->cs_lines[0], 0);
++    while (!fifo32_is_empty(&s->tx_fifo)) {
++        uint32_t rx = imx21_cspi_transfer(s, fifo32_pop(&s->tx_fifo) & mask,
++                                          bits);
++
++        if (fifo32_is_full(&s->rx_fifo)) {
++            s->overflow = true;
++        } else {
++            fifo32_push(&s->rx_fifo, rx & mask);
++        }
++    }
++    qemu_set_irq(s->cs_lines[0], 1);
++}
++
++static uint64_t imx21_cspi_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21CSPIState *s = opaque;
++    uint32_t val;
++
++    switch (offset) {
++    case RXDATA:
++        val = fifo32_is_empty(&s->rx_fifo) ? 0 : fifo32_pop(&s->rx_fifo);
++        imx21_cspi_update_irq(s);
++        return val;
++    case TXDATA:
++        return 0;
++    case CONTROL:
++        return s->ctrl;
++    case INT:
++        return s->int_en | imx21_cspi_status(s);
++    case TEST:
++        /*
++         * The first word written moves straight into the shift register,
++         * so the TX count is one less than the words queued.
++         */
++        val = fifo32_num_used(&s->tx_fifo);
++        return s->test | (fifo32_num_used(&s->rx_fifo) << 4) |
++               (val ? val - 1 : 0);
++    case PERIOD:
++        return s->period;
++    case DMA:
++        return s->dma;
++    case RESET:
++        return 0;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return 0;
++    }
++}
++
++static void imx21_cspi_do_reset(IMX21CSPIState *s)
++{
++    fifo32_reset(&s->tx_fifo);
++    fifo32_reset(&s->rx_fifo);
++    s->ctrl = 0;
++    s->int_en = 0;
++    s->test = 0;
++    s->period = 0;
++    s->dma = 0;
++    s->overflow = false;
++}
++
++static void imx21_cspi_write(void *opaque, hwaddr offset, uint64_t val,
++                             unsigned size)
++{
++    IMX21CSPIState *s = opaque;
++
++    switch (offset) {
++    case TXDATA:
++        if (!fifo32_is_full(&s->tx_fifo)) {
++            fifo32_push(&s->tx_fifo, val);
++        }
++        break;
++    case CONTROL:
++        s->ctrl = val & ~CONTROL_XCH;
++        if ((val & CONTROL_XCH) && (val & CONTROL_SPIEN)) {
++            imx21_cspi_exchange(s);
++        }
++        break;
++    case INT:
++        s->int_en = val & INT_EN_MASK;
++        if (val & INT_RO) {
++            s->overflow = false;
++        }
++        break;
++    case TEST:
++        s->test = val;
++        break;
++    case PERIOD:
++        s->period = val;
++        break;
++    case DMA:
++        s->dma = val;
++        break;
++    case RESET:
++        if (val & 1) {
++            imx21_cspi_do_reset(s);
++        }
++        break;
++    case RXDATA:
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return;
++    }
++    imx21_cspi_update_irq(s);
++}
++
++static const MemoryRegionOps imx21_cspi_ops = {
++    .read = imx21_cspi_read,
++    .write = imx21_cspi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_cspi_reset(DeviceState *dev)
++{
++    IMX21CSPIState *s = IMX21_CSPI(dev);
++
++    imx21_cspi_do_reset(s);
++    imx21_cspi_update_irq(s);
++}
++
++static void imx21_cspi_realize(DeviceState *dev, Error **errp)
++{
++    IMX21CSPIState *s = IMX21_CSPI(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++    int i;
++
++    s->bus = ssi_create_bus(dev, "spi");
++    memory_region_init_io(&s->iomem, OBJECT(dev), &imx21_cspi_ops, s,
++                          TYPE_IMX21_CSPI, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    for (i = 0; i < IMX21_CSPI_NUM_CS; i++) {
++        sysbus_init_irq(sbd, &s->cs_lines[i]);
++    }
++    fifo32_create(&s->tx_fifo, IMX21_CSPI_FIFO_SIZE);
++    fifo32_create(&s->rx_fifo, IMX21_CSPI_FIFO_SIZE);
++}
++
++static const VMStateDescription vmstate_imx21_cspi = {
++    .name = TYPE_IMX21_CSPI,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_FIFO32(tx_fifo, IMX21CSPIState),
++        VMSTATE_FIFO32(rx_fifo, IMX21CSPIState),
++        VMSTATE_UINT32(ctrl, IMX21CSPIState),
++        VMSTATE_UINT32(int_en, IMX21CSPIState),
++        VMSTATE_UINT32(test, IMX21CSPIState),
++        VMSTATE_UINT32(period, IMX21CSPIState),
++        VMSTATE_UINT32(dma, IMX21CSPIState),
++        VMSTATE_BOOL(overflow, IMX21CSPIState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static const Property imx21_cspi_properties[] = {
++    DEFINE_PROP_BOOL("bytewise", IMX21CSPIState, bytewise, false),
++};
++
++static void imx21_cspi_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = imx21_cspi_realize;
++    device_class_set_props(dc, imx21_cspi_properties);
++    dc->vmsd = &vmstate_imx21_cspi;
++    device_class_set_legacy_reset(dc, imx21_cspi_reset);
++    dc->desc = "i.MX21 CSPI";
++}
++
++static const TypeInfo imx21_cspi_info = {
++    .name = TYPE_IMX21_CSPI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21CSPIState),
++    .class_init = imx21_cspi_class_init,
++};
++
++static void imx21_cspi_register_types(void)
++{
++    type_register_static(&imx21_cspi_info);
++}
++
++type_init(imx21_cspi_register_types)
+diff --git a/hw/ssi/meson.build b/hw/ssi/meson.build
+--- a/hw/ssi/meson.build
++++ b/hw/ssi/meson.build
+@@ -13,3 +13,4 @@ system_ss.add(when: 'CONFIG_IMX', if_true: files('imx_spi.c'))
+ system_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_spi_host.c'))
+ system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
+ system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_cspi.c'))
+diff --git a/include/hw/ssi/imx21_cspi.h b/include/hw/ssi/imx21_cspi.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/ssi/imx21_cspi.h
+@@ -0,0 +1,42 @@
++/*
++ * i.MX21 CSPI SPI controller
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_CSPI_H
++#define IMX21_CSPI_H
++
++#include "hw/core/sysbus.h"
++#include "hw/ssi/ssi.h"
++#include "qemu/fifo32.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_CSPI "imx21.cspi"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21CSPIState, IMX21_CSPI)
++
++#define IMX21_CSPI_FIFO_SIZE 8
++#define IMX21_CSPI_NUM_CS 3
++
++struct IMX21CSPIState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    qemu_irq cs_lines[IMX21_CSPI_NUM_CS];
++    SSIBus *bus;
++    bool bytewise;
++
++    Fifo32 tx_fifo;
++    Fifo32 rx_fifo;
++    uint32_t ctrl;
++    uint32_t int_en;
++    uint32_t test;
++    uint32_t period;
++    uint32_t dma;
++    bool overflow;
++};
++
++#endif /* IMX21_CSPI_H */

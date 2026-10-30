@@ -1,0 +1,938 @@
+Description: hw/audio: Add the i.MX21 SSI and audio multiplexer
+ The stock Chumby kernel's TSC2100 driver plays and records through
+ SSI1: it routes SSI1 through the AUDMUX to the codec's pins (receive
+ data from peripheral port 1, transmit data out on ports 1 and 2), runs
+ SSI1 as an I2S slave in network mode with four 16-bit slots per frame,
+ two of them unmasked, and moves the data with the DMA controller on
+ SSI1's FIFO 0 requests (transmit watermark 4, receive watermark 6).
+ .
+ Model SSI1 and SSI2 as slaves of whatever codec sits behind the AUDMUX:
+ their FIFOs, watermark and status flags, underrun and overrun, the
+ interrupt and the four DMA requests, normal, network and two-channel
+ modes, word lengths and bit 0 or bit 31 alignment, and the slot masks.
+ A codec clocks frames out of and into the SSI as 16-bit stereo through
+ imx21_audmux_transmit() and imx21_audmux_receive(), which follow the
+ AUDMUX's data routing. The SSI's clock generator, frame sync flags,
+ AC97 mode and the AUDMUX's clock routing are not modelled.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -871,6 +871,7 @@ Chumby Classic (i.MX21)
+ M: John Merchant <john@johnmerchant.dev>
+ L: qemu-arm@nongnu.org
+ S: Maintained
++F: hw/audio/imx21_*.c
+ F: hw/block/imx21_nfc.c
+ F: hw/display/imx21_lcdc.c
+ F: hw/dma/imx21_dma.c
+diff --git a/hw/audio/imx21_audmux.c b/hw/audio/imx21_audmux.c
+new file mode 100644
+--- /dev/null
++++ b/hw/audio/imx21_audmux.c
+@@ -0,0 +1,168 @@
++/*
++ * i.MX21 digital audio multiplexer (AUDMUX)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The AUDMUX connects the SSIs (host ports 1 and 2; host port 3 has
++ * nothing behind it here) to the pins (peripheral ports 1-3). Each
++ * port's control register selects, in RXDSEL, the port whose transmit
++ * data it receives: 0-2 host ports 1-3, 3-5 peripheral ports 1-3.
++ *
++ * Only that data routing is modelled. The clock and frame sync routing
++ * and directions, internal network mode and the transmit/receive swap
++ * keep what was written: the codec on a peripheral port always clocks
++ * the SSI its data is routed to. The reset values, each host port
++ * connected to the peripheral port of the same number, are a guess.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/audio/imx21_audmux.h"
++#include "hw/core/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "trace.h"
++
++#define HPCR(n)     ((n) * 4)
++#define PPCR(n)     (0x10 + (n) * 4)
++
++#define RXDSEL(v)   (((v) >> 13) & 7)
++#define SEL_PPORT   3
++
++bool imx21_audmux_transmit(IMX21AudmuxState *s, int pport,
++                           int16_t *samples, int frames)
++{
++    unsigned src = RXDSEL(s->ppcr[pport]);
++
++    if (src < ARRAY_SIZE(s->ssi) && s->ssi[src]) {
++        return imx21_ssi_transmit(s->ssi[src], samples, frames);
++    }
++    memset(samples, 0, frames * 2 * sizeof(*samples));
++    return false;
++}
++
++bool imx21_audmux_receive(IMX21AudmuxState *s, int pport,
++                          const int16_t *samples, int frames)
++{
++    bool active = false;
++    int i;
++
++    for (i = 0; i < ARRAY_SIZE(s->ssi); i++) {
++        if (s->ssi[i] && RXDSEL(s->hpcr[i]) == SEL_PPORT + pport) {
++            active |= imx21_ssi_receive(s->ssi[i], samples, frames);
++        }
++    }
++    return active;
++}
++
++static uint64_t imx21_audmux_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21AudmuxState *s = opaque;
++
++    switch (offset) {
++    case HPCR(0) ... HPCR(IMX21_AUDMUX_PORTS - 1):
++        return s->hpcr[offset / 4];
++    case PPCR(0) ... PPCR(IMX21_AUDMUX_PORTS - 1):
++        return s->ppcr[(offset - PPCR(0)) / 4];
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return 0;
++    }
++}
++
++static void imx21_audmux_write(void *opaque, hwaddr offset, uint64_t val,
++                               unsigned size)
++{
++    IMX21AudmuxState *s = opaque;
++
++    trace_imx21_audmux_write(offset, val);
++
++    switch (offset) {
++    case HPCR(0) ... HPCR(IMX21_AUDMUX_PORTS - 1):
++        s->hpcr[offset / 4] = val;
++        break;
++    case PPCR(0) ... PPCR(IMX21_AUDMUX_PORTS - 1):
++        s->ppcr[(offset - PPCR(0)) / 4] = val;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        break;
++    }
++}
++
++static const MemoryRegionOps imx21_audmux_ops = {
++    .read = imx21_audmux_read,
++    .write = imx21_audmux_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_audmux_reset(DeviceState *dev)
++{
++    IMX21AudmuxState *s = IMX21_AUDMUX(dev);
++    int i;
++
++    for (i = 0; i < IMX21_AUDMUX_PORTS; i++) {
++        s->hpcr[i] = (SEL_PPORT + i) << 13;
++        s->ppcr[i] = i << 13;
++    }
++}
++
++static void imx21_audmux_init(Object *obj)
++{
++    IMX21AudmuxState *s = IMX21_AUDMUX(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx21_audmux_ops, s,
++                          TYPE_IMX21_AUDMUX, 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++}
++
++static const Property imx21_audmux_properties[] = {
++    DEFINE_PROP_LINK("ssi1", IMX21AudmuxState, ssi[0], TYPE_IMX21_SSI,
++                     IMX21SSIState *),
++    DEFINE_PROP_LINK("ssi2", IMX21AudmuxState, ssi[1], TYPE_IMX21_SSI,
++                     IMX21SSIState *),
++};
++
++static const VMStateDescription vmstate_imx21_audmux = {
++    .name = TYPE_IMX21_AUDMUX,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(hpcr, IMX21AudmuxState, IMX21_AUDMUX_PORTS),
++        VMSTATE_UINT32_ARRAY(ppcr, IMX21AudmuxState, IMX21_AUDMUX_PORTS),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_audmux_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_imx21_audmux;
++    device_class_set_legacy_reset(dc, imx21_audmux_reset);
++    device_class_set_props(dc, imx21_audmux_properties);
++    dc->desc = "i.MX21 digital audio multiplexer";
++}
++
++static const TypeInfo imx21_audmux_info = {
++    .name = TYPE_IMX21_AUDMUX,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21AudmuxState),
++    .instance_init = imx21_audmux_init,
++    .class_init = imx21_audmux_class_init,
++};
++
++static void imx21_audmux_register_types(void)
++{
++    type_register_static(&imx21_audmux_info);
++}
++
++type_init(imx21_audmux_register_types)
+diff --git a/hw/audio/imx21_ssi.c b/hw/audio/imx21_ssi.c
+new file mode 100644
+--- /dev/null
++++ b/hw/audio/imx21_ssi.c
+@@ -0,0 +1,586 @@
++/*
++ * i.MX21 synchronous serial interface (SSI)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The i.MX21's SSI1 and SSI2: an audio serial port with two 8-word
++ * transmit FIFOs and two receive FIFOs, interrupts and DMA requests on
++ * their watermarks. Only the SSI's slave role is modelled: the codec
++ * behind the audio multiplexer clocks frames out of and into it (see
++ * imx21_ssi_transmit()), so the SSI's own clock generator, the frame
++ * sync and frame start flags and AC97 mode are not. The AC97 registers
++ * keep what was written.
++ *
++ * A frame is one word in normal mode, or DC + 1 time slots in network
++ * mode (which the I2S modes imply), where the masked slots carry no
++ * data. Words are WL bits, aligned on bit 0 (TXBIT0, RXBIT0) or bit 31.
++ * In two-channel mode (TCH_EN) the unmasked slots alternate between
++ * FIFO 0 and FIFO 1. An empty transmit FIFO sends silence and sets TUE;
++ * a full receive FIFO drops the word and sets ROE, both cleared by
++ * writing them back as ones.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/audio/imx21_ssi.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "trace.h"
++
++#define STX0    0x00
++#define STX1    0x04
++#define SRX0    0x08
++#define SRX1    0x0c
++#define SCR     0x10
++#define SISR    0x14
++#define SIER    0x18
++#define STCR    0x1c
++#define SRCR    0x20
++#define STCCR   0x24
++#define SRCCR   0x28
++#define SFCSR   0x2c
++#define STR     0x30
++#define SOR     0x34
++#define SACNT   0x38
++#define SACADD  0x3c
++#define SACDAT  0x40
++#define SATAG   0x44
++#define STMSK   0x48
++#define SRMSK   0x4c
++
++#define SCR_SSIEN       (1 << 0)
++#define SCR_TE          (1 << 1)
++#define SCR_RE          (1 << 2)
++#define SCR_NET         (1 << 3)
++#define SCR_I2S_SHIFT   5
++#define SCR_TCH_EN      (1 << 8)
++
++#define SISR_TFE0       (1 << 0)
++#define SISR_TFE1       (1 << 1)
++#define SISR_RFF0       (1 << 2)
++#define SISR_RFF1       (1 << 3)
++#define SISR_TUE0       (1 << 8)
++#define SISR_TUE1       (1 << 9)
++#define SISR_ROE0       (1 << 10)
++#define SISR_ROE1       (1 << 11)
++#define SISR_TDE0       (1 << 12)
++#define SISR_TDE1       (1 << 13)
++#define SISR_RDR0       (1 << 14)
++#define SISR_RDR1       (1 << 15)
++#define SISR_STICKY     (SISR_TUE0 | SISR_TUE1 | SISR_ROE0 | SISR_ROE1)
++#define SISR_TX_BITS    0x0223a3    /* TFE, TLS, TFS, TUE, TDE, CMDDU */
++#define SISR_RX_BITS    0x05dc5c    /* RFF, RLS, RFS, ROE, RDR, RXT, CMDAU */
++
++#define SIER_TIE        (1 << 19)
++#define SIER_TDMAE      (1 << 20)
++#define SIER_RIE        (1 << 21)
++#define SIER_RDMAE      (1 << 22)
++
++/* STCR and SRCR */
++#define XCR_FEN0        (1 << 7)
++#define XCR_FEN1        (1 << 8)
++#define XCR_BIT0        (1 << 9)
++
++/* STCCR and SRCCR */
++#define XCCR_WL(v)      ((((v) >> 13) & 0xf) * 2 + 2)
++#define XCCR_DC(v)      (((v) >> 8) & 0x1f)
++
++#define SOR_INIT        (1 << 3)
++#define SOR_TX_CLR      (1 << 4)
++#define SOR_RX_CLR      (1 << 5)
++
++static bool imx21_ssi_network(IMX21SSIState *s)
++{
++    return (s->scr & SCR_NET) || ((s->scr >> SCR_I2S_SHIFT) & 3);
++}
++
++/* Words a FIFO holds: eight, or one when it is disabled. */
++static unsigned imx21_ssi_depth(uint32_t xcr, int fifo)
++{
++    return (xcr & (fifo ? XCR_FEN1 : XCR_FEN0)) ? IMX21_SSI_FIFO_SIZE : 1;
++}
++
++static unsigned imx21_ssi_watermark(IMX21SSIState *s, bool rx, int fifo)
++{
++    uint32_t xcr = rx ? s->srcr : s->stcr;
++    unsigned wm = (s->sfcsr >> (fifo * 16 + rx * 4)) & 0xf;
++
++    if (!(xcr & (fifo ? XCR_FEN1 : XCR_FEN0))) {
++        return 1;
++    }
++    return wm ? wm : IMX21_SSI_FIFO_SIZE;
++}
++
++static uint32_t imx21_ssi_status(IMX21SSIState *s)
++{
++    uint32_t st = s->sisr & SISR_STICKY;
++    unsigned used;
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        used = fifo32_num_used(&s->tx[i]);
++        if (imx21_ssi_depth(s->stcr, i) - MIN(used, imx21_ssi_depth(s->stcr,
++                                                                     i)) >=
++            imx21_ssi_watermark(s, false, i)) {
++            st |= SISR_TFE0 << i;
++        }
++        if (used < imx21_ssi_depth(s->stcr, i)) {
++            st |= SISR_TDE0 << i;
++        }
++        used = fifo32_num_used(&s->rx[i]);
++        if (used >= imx21_ssi_watermark(s, true, i)) {
++            st |= SISR_RFF0 << i;
++        }
++        if (used) {
++            st |= SISR_RDR0 << i;
++        }
++    }
++    return st;
++}
++
++static void imx21_ssi_update(IMX21SSIState *s)
++{
++    uint32_t st = imx21_ssi_status(s);
++    uint32_t pending = st & s->sier;
++    bool on = s->scr & SCR_SSIEN;
++    bool two = s->scr & SCR_TCH_EN;
++    uint32_t level = 0;
++    int i;
++
++    qemu_set_irq(s->irq, on && (((pending & SISR_TX_BITS) &&
++                                 (s->sier & SIER_TIE)) ||
++                                ((pending & SISR_RX_BITS) &&
++                                 (s->sier & SIER_RIE))));
++
++    if (on && (s->sier & SIER_TDMAE)) {
++        level |= !!(st & SISR_TFE0) << IMX21_SSI_DMA_TX0;
++        level |= (two && (st & SISR_TFE1)) << IMX21_SSI_DMA_TX1;
++    }
++    if (on && (s->sier & SIER_RDMAE)) {
++        level |= !!(st & SISR_RFF0) << IMX21_SSI_DMA_RX0;
++        level |= (two && (st & SISR_RFF1)) << IMX21_SSI_DMA_RX1;
++    }
++    /*
++     * Raising a request may run a DMA burst into this device at once,
++     * which comes back here: record the levels before signalling them.
++     */
++    for (i = 0; i < IMX21_SSI_NUM_DMA; i++) {
++        bool l = (level >> i) & 1;
++
++        if (l != ((s->dma_level >> i) & 1)) {
++            s->dma_level = deposit32(s->dma_level, i, 1, l);
++            trace_imx21_ssi_dma(i, l);
++            qemu_set_irq(s->dma[i], l);
++        }
++    }
++}
++
++static void imx21_ssi_clear_tx(IMX21SSIState *s)
++{
++    fifo32_reset(&s->tx[0]);
++    fifo32_reset(&s->tx[1]);
++}
++
++static void imx21_ssi_clear_rx(IMX21SSIState *s)
++{
++    fifo32_reset(&s->rx[0]);
++    fifo32_reset(&s->rx[1]);
++}
++
++/* A WL-bit word, aligned as configured, to a 16-bit sample, and back. */
++static int16_t imx21_ssi_word_to_sample(uint32_t word, uint32_t xcr,
++                                        uint32_t xccr)
++{
++    unsigned wl = MIN(XCCR_WL(xccr), 24);
++    uint32_t v = (xcr & XCR_BIT0) ? extract32(word, 0, wl) : word >> (32 - wl);
++
++    return wl >= 16 ? v >> (wl - 16) : v << (16 - wl);
++}
++
++static uint32_t imx21_ssi_sample_to_word(int16_t sample, uint32_t xcr,
++                                         uint32_t xccr)
++{
++    unsigned wl = MIN(XCCR_WL(xccr), 24);
++    uint32_t v = (uint16_t)sample;
++
++    v = wl >= 16 ? v << (wl - 16) : v >> (16 - wl);
++    return (xcr & XCR_BIT0) ? v : v << (32 - wl);
++}
++
++static unsigned imx21_ssi_slots(IMX21SSIState *s, uint32_t xccr)
++{
++    return imx21_ssi_network(s) ? XCCR_DC(xccr) + 1 : 1;
++}
++
++bool imx21_ssi_transmit(IMX21SSIState *s, int16_t *samples, int frames)
++{
++    unsigned slots = imx21_ssi_slots(s, s->stccr);
++    bool two = s->scr & SCR_TCH_EN;
++    int16_t out[2];
++    unsigned slot, n;
++    uint32_t word;
++    int f, fifo;
++
++    if ((s->scr & (SCR_SSIEN | SCR_TE)) != (SCR_SSIEN | SCR_TE)) {
++        memset(samples, 0, frames * 2 * sizeof(*samples));
++        return false;
++    }
++
++    for (f = 0; f < frames; f++) {
++        n = 0;
++        out[0] = out[1] = 0;
++        for (slot = 0; slot < slots; slot++) {
++            if (imx21_ssi_network(s) && slot < 32 &&
++                ((s->stmsk >> slot) & 1)) {
++                continue;
++            }
++            fifo = two ? n & 1 : 0;
++            if (fifo32_is_empty(&s->tx[fifo])) {
++                s->sisr |= SISR_TUE0 << fifo;
++                word = 0;
++            } else {
++                word = fifo32_pop(&s->tx[fifo]);
++            }
++            if (n < 2) {
++                out[n] = imx21_ssi_word_to_sample(word, s->stcr, s->stccr);
++            }
++            n++;
++        }
++        samples[f * 2] = out[0];
++        samples[f * 2 + 1] = n == 1 ? out[0] : out[1];
++        imx21_ssi_update(s);
++    }
++    return true;
++}
++
++bool imx21_ssi_receive(IMX21SSIState *s, const int16_t *samples, int frames)
++{
++    unsigned slots = imx21_ssi_slots(s, s->srccr);
++    bool two = s->scr & SCR_TCH_EN;
++    unsigned slot, n;
++    int16_t sample;
++    int f, fifo;
++
++    if ((s->scr & (SCR_SSIEN | SCR_RE)) != (SCR_SSIEN | SCR_RE)) {
++        return false;
++    }
++
++    for (f = 0; f < frames; f++) {
++        n = 0;
++        for (slot = 0; slot < slots; slot++) {
++            if (imx21_ssi_network(s) && slot < 32 &&
++                ((s->srmsk >> slot) & 1)) {
++                continue;
++            }
++            fifo = two ? n & 1 : 0;
++            sample = n < 2 ? samples[f * 2 + n] : 0;
++            if (fifo32_num_used(&s->rx[fifo]) >=
++                imx21_ssi_depth(s->srcr, fifo)) {
++                s->sisr |= SISR_ROE0 << fifo;
++            } else {
++                fifo32_push(&s->rx[fifo],
++                            imx21_ssi_sample_to_word(sample, s->srcr,
++                                                     s->srccr));
++            }
++            n++;
++        }
++        imx21_ssi_update(s);
++    }
++    return true;
++}
++
++static uint32_t imx21_ssi_read_rx(IMX21SSIState *s, int fifo)
++{
++    if (!fifo32_is_empty(&s->rx[fifo])) {
++        s->last_rx[fifo] = fifo32_pop(&s->rx[fifo]);
++    }
++    return s->last_rx[fifo];
++}
++
++static void imx21_ssi_write_tx(IMX21SSIState *s, int fifo, uint32_t val)
++{
++    if (fifo32_num_used(&s->tx[fifo]) < imx21_ssi_depth(s->stcr, fifo)) {
++        fifo32_push(&s->tx[fifo], val);
++    }
++}
++
++static uint64_t imx21_ssi_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21SSIState *s = opaque;
++    uint64_t r = 0;
++
++    switch (offset) {
++    case STX0:
++    case STX1:
++        /* The transmit registers read as zero. */
++        break;
++    case SRX0:
++    case SRX1:
++        r = imx21_ssi_read_rx(s, offset == SRX1);
++        imx21_ssi_update(s);
++        break;
++    case SCR:
++        r = s->scr;
++        break;
++    case SISR:
++        r = imx21_ssi_status(s);
++        break;
++    case SIER:
++        r = s->sier;
++        break;
++    case STCR:
++        r = s->stcr;
++        break;
++    case SRCR:
++        r = s->srcr;
++        break;
++    case STCCR:
++        r = s->stccr;
++        break;
++    case SRCCR:
++        r = s->srccr;
++        break;
++    case SFCSR:
++        r = (s->sfcsr & 0x00ff00ff) |
++            (fifo32_num_used(&s->rx[1]) & 0xf) << 28 |
++            (fifo32_num_used(&s->tx[1]) & 0xf) << 24 |
++            (fifo32_num_used(&s->rx[0]) & 0xf) << 12 |
++            (fifo32_num_used(&s->tx[0]) & 0xf) << 8;
++        break;
++    case STR:
++        r = s->str;
++        break;
++    case SOR:
++        r = s->sor;
++        break;
++    case SACNT:
++        r = s->sacnt;
++        break;
++    case SACADD:
++        r = s->sacadd;
++        break;
++    case SACDAT:
++        r = s->sacdat;
++        break;
++    case SATAG:
++        r = s->satag;
++        break;
++    case STMSK:
++        r = s->stmsk;
++        break;
++    case SRMSK:
++        r = s->srmsk;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        break;
++    }
++    trace_imx21_ssi_read(offset, r);
++    return r;
++}
++
++static void imx21_ssi_write(void *opaque, hwaddr offset, uint64_t val,
++                            unsigned size)
++{
++    IMX21SSIState *s = opaque;
++
++    trace_imx21_ssi_write(offset, val);
++
++    switch (offset) {
++    case STX0:
++    case STX1:
++        imx21_ssi_write_tx(s, offset == STX1, val);
++        break;
++    case SRX0:
++    case SRX1:
++        /* read-only */
++        break;
++    case SCR:
++        if ((s->scr & SCR_SSIEN) && !(val & SCR_SSIEN)) {
++            /* Disabling the SSI empties its FIFOs and clears its status. */
++            imx21_ssi_clear_tx(s);
++            imx21_ssi_clear_rx(s);
++            s->sisr = 0;
++        }
++        s->scr = val & 0x3ff;
++        break;
++    case SISR:
++        s->sisr &= ~(val & SISR_STICKY);
++        break;
++    case SIER:
++        s->sier = val & 0x7fffff;
++        break;
++    case STCR:
++        s->stcr = val & 0x3ff;
++        break;
++    case SRCR:
++        s->srcr = val & 0x3ff;
++        break;
++    case STCCR:
++        s->stccr = val & 0x3ffff;
++        break;
++    case SRCCR:
++        s->srccr = val & 0x3ffff;
++        break;
++    case SFCSR:
++        s->sfcsr = val & 0x00ff00ff;
++        break;
++    case STR:
++        s->str = val;
++        break;
++    case SOR:
++        if (val & (SOR_INIT | SOR_TX_CLR)) {
++            imx21_ssi_clear_tx(s);
++        }
++        if (val & (SOR_INIT | SOR_RX_CLR)) {
++            imx21_ssi_clear_rx(s);
++        }
++        if (val & SOR_INIT) {
++            s->sisr = 0;
++        }
++        s->sor = val & 0x4f;
++        break;
++    case SACNT:
++        s->sacnt = val;
++        break;
++    case SACADD:
++        s->sacadd = val;
++        break;
++    case SACDAT:
++        s->sacdat = val;
++        break;
++    case SATAG:
++        s->satag = val;
++        break;
++    case STMSK:
++        s->stmsk = val;
++        break;
++    case SRMSK:
++        s->srmsk = val;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return;
++    }
++    imx21_ssi_update(s);
++}
++
++static const MemoryRegionOps imx21_ssi_ops = {
++    .read = imx21_ssi_read,
++    .write = imx21_ssi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_ssi_reset(DeviceState *dev)
++{
++    IMX21SSIState *s = IMX21_SSI(dev);
++
++    s->scr = 0;
++    s->sier = 0;
++    s->stcr = 0;
++    s->srcr = 0;
++    s->stccr = 0;
++    s->srccr = 0;
++    s->sfcsr = 0x00810081;
++    s->str = 0;
++    s->sor = 0;
++    s->sacnt = 0;
++    s->sacadd = 0;
++    s->sacdat = 0;
++    s->satag = 0;
++    s->stmsk = 0;
++    s->srmsk = 0;
++    s->sisr = 0;
++    s->last_rx[0] = 0;
++    s->last_rx[1] = 0;
++    imx21_ssi_clear_tx(s);
++    imx21_ssi_clear_rx(s);
++    imx21_ssi_update(s);
++}
++
++static void imx21_ssi_init(Object *obj)
++{
++    IMX21SSIState *s = IMX21_SSI(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    int i;
++
++    memory_region_init_io(&s->iomem, obj, &imx21_ssi_ops, s,
++                          TYPE_IMX21_SSI, 0x1000);
++    /*
++     * A register write may raise a DMA request that the DMA controller
++     * serves at once, writing the FIFO through these registers.
++     */
++    s->iomem.disable_reentrancy_guard = true;
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_out_named(DEVICE(obj), s->dma, IMX21_SSI_DMA,
++                             IMX21_SSI_NUM_DMA);
++    for (i = 0; i < 2; i++) {
++        fifo32_create(&s->tx[i], IMX21_SSI_FIFO_SIZE);
++        fifo32_create(&s->rx[i], IMX21_SSI_FIFO_SIZE);
++    }
++}
++
++static const VMStateDescription vmstate_imx21_ssi = {
++    .name = TYPE_IMX21_SSI,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(scr, IMX21SSIState),
++        VMSTATE_UINT32(sier, IMX21SSIState),
++        VMSTATE_UINT32(stcr, IMX21SSIState),
++        VMSTATE_UINT32(srcr, IMX21SSIState),
++        VMSTATE_UINT32(stccr, IMX21SSIState),
++        VMSTATE_UINT32(srccr, IMX21SSIState),
++        VMSTATE_UINT32(sfcsr, IMX21SSIState),
++        VMSTATE_UINT32(str, IMX21SSIState),
++        VMSTATE_UINT32(sor, IMX21SSIState),
++        VMSTATE_UINT32(sacnt, IMX21SSIState),
++        VMSTATE_UINT32(sacadd, IMX21SSIState),
++        VMSTATE_UINT32(sacdat, IMX21SSIState),
++        VMSTATE_UINT32(satag, IMX21SSIState),
++        VMSTATE_UINT32(stmsk, IMX21SSIState),
++        VMSTATE_UINT32(srmsk, IMX21SSIState),
++        VMSTATE_UINT32(sisr, IMX21SSIState),
++        VMSTATE_FIFO32(tx[0], IMX21SSIState),
++        VMSTATE_FIFO32(tx[1], IMX21SSIState),
++        VMSTATE_FIFO32(rx[0], IMX21SSIState),
++        VMSTATE_FIFO32(rx[1], IMX21SSIState),
++        VMSTATE_UINT32_ARRAY(last_rx, IMX21SSIState, 2),
++        VMSTATE_UINT32(dma_level, IMX21SSIState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_ssi_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_imx21_ssi;
++    device_class_set_legacy_reset(dc, imx21_ssi_reset);
++    dc->desc = "i.MX21 synchronous serial interface";
++}
++
++static const TypeInfo imx21_ssi_info = {
++    .name = TYPE_IMX21_SSI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21SSIState),
++    .instance_init = imx21_ssi_init,
++    .class_init = imx21_ssi_class_init,
++};
++
++static void imx21_ssi_register_types(void)
++{
++    type_register_static(&imx21_ssi_info);
++}
++
++type_init(imx21_ssi_register_types)
+diff --git a/hw/audio/meson.build b/hw/audio/meson.build
+--- a/hw/audio/meson.build
++++ b/hw/audio/meson.build
+@@ -15,3 +15,4 @@ system_ss.add(when: 'CONFIG_VT82C686', if_true: files('via-ac97.c'))
+ system_ss.add(when: 'CONFIG_WM8750', if_true: files('wm8750.c'))
+ system_ss.add(when: ['CONFIG_VIRTIO_SND', 'CONFIG_VIRTIO'], if_true: files('virtio-snd.c'))
+ system_ss.add(when: ['CONFIG_VIRTIO_SND', 'CONFIG_VIRTIO', 'CONFIG_VIRTIO_PCI'], if_true: files('virtio-snd-pci.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_ssi.c', 'imx21_audmux.c'))
+diff --git a/hw/audio/trace-events b/hw/audio/trace-events
+--- a/hw/audio/trace-events
++++ b/hw/audio/trace-events
+@@ -61,3 +61,11 @@ virtio_snd_handle_event(void) "event queue callback called"
+ virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
+ virtio_snd_handle_tx_xfer(void) "tx queue callback called"
+ virtio_snd_handle_rx_xfer(void) "rx queue callback called"
++
++# imx21_ssi.c
++imx21_ssi_read(uint64_t offset, uint64_t value) "offset 0x%02" PRIx64 " value 0x%08" PRIx64
++imx21_ssi_write(uint64_t offset, uint64_t value) "offset 0x%02" PRIx64 " value 0x%08" PRIx64
++imx21_ssi_dma(int line, bool level) "request %d level %d"
++
++# imx21_audmux.c
++imx21_audmux_write(uint64_t offset, uint64_t value) "offset 0x%02" PRIx64 " value 0x%08" PRIx64
+diff --git a/include/hw/audio/imx21_audmux.h b/include/hw/audio/imx21_audmux.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/audio/imx21_audmux.h
+@@ -0,0 +1,40 @@
++/*
++ * i.MX21 digital audio multiplexer (AUDMUX)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_AUDMUX_H
++#define IMX21_AUDMUX_H
++
++#include "hw/audio/imx21_ssi.h"
++
++#define TYPE_IMX21_AUDMUX "imx21.audmux"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21AudmuxState, IMX21_AUDMUX)
++
++/* Host ports 1-3 (1 and 2 are SSI1 and SSI2) and peripheral ports 1-3 */
++#define IMX21_AUDMUX_PORTS  3
++
++struct IMX21AudmuxState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    IMX21SSIState *ssi[2];
++
++    uint32_t hpcr[IMX21_AUDMUX_PORTS];
++    uint32_t ppcr[IMX21_AUDMUX_PORTS];
++};
++
++/*
++ * A device on peripheral port @pport (0 for port 1) taking (giving)
++ * audio from (to) whichever host port the multiplexer routes there.
++ * Same conventions as imx21_ssi_transmit() and imx21_ssi_receive().
++ */
++bool imx21_audmux_transmit(IMX21AudmuxState *s, int pport,
++                           int16_t *samples, int frames);
++bool imx21_audmux_receive(IMX21AudmuxState *s, int pport,
++                          const int16_t *samples, int frames);
++
++#endif /* IMX21_AUDMUX_H */
+diff --git a/include/hw/audio/imx21_ssi.h b/include/hw/audio/imx21_ssi.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/audio/imx21_ssi.h
+@@ -0,0 +1,69 @@
++/*
++ * i.MX21 synchronous serial interface (SSI)
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_SSI_H
++#define IMX21_SSI_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/fifo32.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_SSI "imx21.ssi"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21SSIState, IMX21_SSI)
++
++#define IMX21_SSI_FIFO_SIZE 8
++
++/* Named GPIO outputs "dma": the DMA requests, active high. */
++#define IMX21_SSI_DMA       "dma"
++#define IMX21_SSI_DMA_TX0   0
++#define IMX21_SSI_DMA_RX0   1
++#define IMX21_SSI_DMA_TX1   2
++#define IMX21_SSI_DMA_RX1   3
++#define IMX21_SSI_NUM_DMA   4
++
++struct IMX21SSIState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    qemu_irq dma[IMX21_SSI_NUM_DMA];
++
++    uint32_t scr;
++    uint32_t sier;
++    uint32_t stcr;
++    uint32_t srcr;
++    uint32_t stccr;
++    uint32_t srccr;
++    uint32_t sfcsr;
++    uint32_t str;
++    uint32_t sor;
++    uint32_t sacnt;
++    uint32_t sacadd;
++    uint32_t sacdat;
++    uint32_t satag;
++    uint32_t stmsk;
++    uint32_t srmsk;
++    /* Sticky status: underrun and overrun. */
++    uint32_t sisr;
++    Fifo32 tx[2];
++    Fifo32 rx[2];
++    uint32_t last_rx[2];
++    uint32_t dma_level;
++};
++
++/*
++ * The serial side, for the audio multiplexer: the codec clocks @frames
++ * frames out of or into the SSI, as 16-bit stereo samples. Each frame
++ * carries the frame's first two unmasked slots as left and right.
++ * Returns whether the transmitter (receiver) is enabled; a disabled
++ * transmitter gives silence.
++ */
++bool imx21_ssi_transmit(IMX21SSIState *s, int16_t *samples, int frames);
++bool imx21_ssi_receive(IMX21SSIState *s, const int16_t *samples, int frames);
++
++#endif /* IMX21_SSI_H */

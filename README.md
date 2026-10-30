@@ -58,31 +58,23 @@ The patches:
 
 | Patch | Adds |
 | --- | --- |
-| `0001` | `hw/intc/imx21_aitc.c` |
-| `0002` | `hw/timer/imx21_gpt.c` |
-| `0003` | `hw/misc/imx21_crm.c`, `imx21_pwm.c`, `imx21_usbotg.c` |
-| `0004` | `hw/gpio/imx21_gpio.c` |
-| `0005` | `hw/ssi/imx21_cspi.c` |
-| `0006` | `hw/display/imx21_lcdc.c` |
-| `0007` | `hw/block/imx21_nfc.c` |
-| `0008` | `hw/input/tsc2100.c` |
-| `0009` | `hw/char/chumby_cp.c` |
-| `0010` | `hw/arm/fsl-imx21.c`, the SoC |
-| `0011` | `hw/arm/chumby_classic.c`, the machine, and `docs/system/arm/chumby-classic.rst` |
-| `0012` | `hw/input/imx21_kpp.c`, the keypad port, and the machine's top button |
-| `0013`-`0015` | `hw/dma/imx21_dma.c`, `hw/audio/imx21_ssi.c` and `imx21_audmux.c`, and the TSC2100's sound |
-| `0016`-`0021` | The PWM's output, the keypad port's outputs, LCD dimming, `qapi/chumby.json` and `hw/misc/chumby_io.c`: backlight, LCD power, speaker mute, headphones, the button's key |
-| `0022` | The codec's clock from MCLK and its PLL |
-| `0023`-`0024` | `hw/usb/hcd-imx21.c`, the USB host's transfers (replacing `imx21_usbotg.c`) |
-| `0025`-`0031` | GPIO outputs, CSPI byte transfers, `hw/sensor/kxp74.c`, `hw/nvram/at25080a.c`, the settable identity and the sensor card on CSPI1 |
-| `0032` | Recording opened only when the guest records |
-| `0033` | A `scale` option for the Cocoa window |
-| `0034`-`0035` | USB host fixes for Linux 5.9's `imx21-hcd` |
-| `0036`-`0041` | The watchdog's reset source and grace period, `hw/rtc/imx21_rtc.c`, the I2C controller, and the interactive command line |
-| `0042` | The codec clocking steadily when its timer runs late |
-| `0043`-`0045` | A USB keyboard plugged in when a key goes unheard, and a USB host fix |
-| `0046`-`0052` | Saved state: the crypto processor's exchange, the sensor card's chip select, the flash read back after a restore, the keyboard plugged in on demand, USB packets in flight, and checks on loaded indexes |
-| `0053` | The accelerometer and identity in `query-chumby-state`, and the documentation's "Frontend interface" section |
+| `0001` | `ui/input`: a handler passes on the events it doesn't take |
+| `0002` | `ui/cocoa`: a `scale` option for the window |
+| `0003` | `qapi/chumby.json`: `query-chumby-state` and the `CHUMBY_*` events |
+| `0004`-`0005` | `hw/watchdog/wdt_imx2`: the reset source in WRSR and a grace period after a host stall |
+| `0006`-`0018` | The i.MX21's devices: `hw/intc/imx21_aitc.c`, `hw/timer/imx21_gpt.c`, `hw/misc/imx21_crm.c` and `imx21_pwm.c`, `hw/gpio/imx21_gpio.c`, `hw/ssi/imx21_cspi.c`, `hw/display/imx21_lcdc.c`, `hw/block/imx21_nfc.c`, `hw/input/imx21_kpp.c`, `hw/dma/imx21_dma.c`, `hw/audio/imx21_ssi.c` and `imx21_audmux.c`, `hw/rtc/imx21_rtc.c`, `hw/usb/hcd-imx21.c` |
+| `0019` | `hw/arm/fsl-imx21.c`, the SoC |
+| `0020`-`0024` | The board's devices: `hw/input/tsc2100.c`, `hw/char/chumby_cp.c`, `hw/sensor/kxp74.c`, `hw/nvram/at25080a.c`, `hw/misc/chumby_io.c` |
+| `0025` | `hw/arm/chumby_classic.c`, the machine |
+| `0026` | `docs/system/arm/chumby-classic.rst` |
+
+Each patch is a DEP-3 header (`Description:`, `Author:`, then the
+trailers: `Upstream-Status: Inappropriate [AI generated code]`,
+`Signed-off-by:`, `Claude-Session:`), a line `---` and the diff, without
+index lines; new patches carry the same header. `./dev-series import
+DIR` turns a QEMU 11.1.2 source tree into a git tree with one commit per
+patch, and `./dev-series export DIR` writes the commits back as
+`patches/`, byte for byte (CI checks the round trip).
 
 ## Building
 
@@ -485,8 +477,8 @@ of your own) relies on. All of it is standard QEMU; nothing here is
 specific to a client. The stable names (the machine properties,
 `query-chumby-state` and its fields, the `CHUMBY_*` events, the pen and
 key conventions and `screendump`) are listed in the "Frontend interface"
-section of `docs/system/arm/chumby-classic.rst` (patch 0011, extended by
-0053), which is their reference: they won't change incompatibly without
+section of `docs/system/arm/chumby-classic.rst`, which is their
+reference: they won't change incompatibly without
 a note there. This section shows them in use.
 
 **Kernel.** `-kernel FILE`: a zImage, entered with ATAGs (memory 64 MiB
@@ -618,8 +610,8 @@ Start the restoring QEMU with the same machine options and devices. A
 state carries the whole machine: the crypto processor's exchange in
 progress, the sensor card's chip select, and the keyboard the board
 plugged in, which is plugged in again on load; the flash is read back
-from the restored drive. A state saved by a build before patch 0046
-still loads, with the crypto processor idle and the chip select
+from the restored drive. A state saved by an older build, without
+these, still loads, with the crypto processor idle and the chip select
 deselected, unless that keyboard was plugged in.
 
 **Screen.** QMP `screendump` with an absolute `filename` and `"format":
