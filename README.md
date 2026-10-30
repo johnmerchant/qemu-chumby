@@ -82,6 +82,7 @@ The patches:
 | `0042` | The codec clocking steadily when its timer runs late |
 | `0043`-`0045` | A USB keyboard plugged in when a key goes unheard, and a USB host fix |
 | `0046`-`0052` | Saved state: the crypto processor's exchange, the sensor card's chip select, the flash read back after a restore, the keyboard plugged in on demand, USB packets in flight, and checks on loaded indexes |
+| `0053` | The accelerometer and identity in `query-chumby-state`, and the documentation's "Frontend interface" section |
 
 ## Building
 
@@ -481,7 +482,12 @@ stock software maps it with the calibration in the settings partition
 
 What a harness driving the machine (`chumby-machine`, or a test runner
 of your own) relies on. All of it is standard QEMU; nothing here is
-specific to a client.
+specific to a client. The stable names (the machine properties,
+`query-chumby-state` and its fields, the `CHUMBY_*` events, the pen and
+key conventions and `screendump`) are listed in the "Frontend interface"
+section of `docs/system/arm/chumby-classic.rst` (patch 0011, extended by
+0053), which is their reference: they won't change incompatibly without
+a note there. This section shows them in use.
 
 **Kernel.** `-kernel FILE`: a zImage, entered with ATAGs (memory 64 MiB
 at 0xC0000000, the command line) as machine type 851, MX21ADS. `-append
@@ -555,11 +561,15 @@ accelerometer's (`/machine/accel`, whose `x-mg`, `y-mg` and `z-mg` are
 the same values), read by the guest through `/dev/accel`.
 
 **The board's outputs.** `query-chumby-state` returns the lines the guest
-drives and the inputs above:
+drives, the inputs above and the identity (below), so one command
+resynchronises a frontend:
 
     {"execute": "query-chumby-state"}
     {"return": {"backlight": 65535, "lcd-on": true, "speaker-mute": false,
-                "headphones": false, "button": false}}
+                "headphones": false, "button": false,
+                "accel-x": 0, "accel-y": 0, "accel-z": 1000,
+                "guid": "C40BB1E0-0000-4000-8000-0E4000000001",
+                "serial": "0000000000000000", "hwversion": "3.8"}}
 
 `backlight` is the PWM's duty cycle, 0 to 65535, which also dims the
 displayed screen (0 is black); `lcd-on` false blanks it. Changes come as
@@ -586,7 +596,9 @@ anything that reaches the host's network unless you mean to.
 **Identity.** The machine's `guid` (XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX),
 `serial` (16 letters or digits) and `hwversion` (MAJOR.MINOR) properties
 set what the crypto processor reports and the DC ID EEPROM holds; the
-defaults are a made-up identity. Give each emulated Chumby its own GUID.
+defaults are a made-up identity. They are set with `-M` and fixed once
+the machine is created (`qom-get` and `query-chumby-state` read them).
+Give each emulated Chumby its own GUID.
 
 **Watchdog and reset.** The stock kernel arms the watchdog for 2.5 s and
 services it every tick; a missed service performs QEMU's watchdog action

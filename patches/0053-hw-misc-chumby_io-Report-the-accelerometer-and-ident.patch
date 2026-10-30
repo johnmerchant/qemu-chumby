@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 13:15:27 +0000
+Subject: [PATCH 53/53] hw/misc/chumby_io: Report the accelerometer and identity in
+ the state query
+
+A frontend resynchronising with the machine got the board's lines from
+query-chumby-state, but the accelerometer's input and the identity only
+from six qom-get calls. ChumbyState now also has accel-x, accel-y and
+accel-z (milli-g) and guid, serial and hwversion, read from the
+machine's properties of the same names; the acceleration comes from
+the accelerometer itself, so a value set on /machine/accel shows too.
+
+The identity is what the crypto processor and the DC ID EEPROM were
+given when the machine was created. Setting it afterwards changed only
+the machine's copy, so that is now refused, and the query cannot
+report an identity the guest does not see.
+
+The documentation gains a "Frontend interface" section: the machine
+properties, the state query, the events, the input conventions and
+screendump that frontends rely on, which will not change incompatibly
+without a note there.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ docs/system/arm/chumby-classic.rst | 65 +++++++++++++++++++++++++++++-
+ hw/arm/chumby_classic.c            | 20 +++++++++
+ hw/misc/chumby_io.c                | 26 ++++++++++++
+ qapi/chumby.json                   | 35 +++++++++++++---
+ 4 files changed, 139 insertions(+), 7 deletions(-)
+
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+index f888b7a14..1159f9e01 100644
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -122,8 +122,9 @@ displayed screen, and turning the LCD's power off blanks it. Until the
+ guest first programs the PWM the backlight is full.
+ 
+ The board's lines are reported over QMP: ``query-chumby-state`` returns
+-the backlight level, LCD power, speaker mute, headphones and button, and
+-the ``CHUMBY_BACKLIGHT`` (at most one each 100 ms), ``CHUMBY_LCD``,
++the backlight level, LCD power, speaker mute, headphones and button (and
++the accelerometer's input and the identity, below), and the
++``CHUMBY_BACKLIGHT`` (at most one each 100 ms), ``CHUMBY_LCD``,
+ ``CHUMBY_SPEAKER_MUTE`` and ``CHUMBY_HEADPHONES`` events report changes.
+ 
+ Sound goes to the audio backend given with ``-audiodev`` and the
+@@ -198,3 +199,63 @@ The GUID is 32 hex digits as ``XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX``,
+ the serial number 16 letters or digits, and the hardware version
+ ``MAJOR.MINOR``; anything else is refused at startup. Give each emulated
+ Chumby its own GUID so that it pairs with a server as a separate device.
++
++Frontend interface
++------------------
++
++A frontend (a window, a test harness, a script) controls and watches
++the machine with the names below. They are stable: they will not be
++renamed, removed or changed in meaning without a note in this section.
++New ones may be added, and a client should ignore fields it does not
++know.
++
++Machine properties, given with ``-M chumby-classic,NAME=VALUE``; all but
++the identity can also be read and set at any time with ``qom-get`` and
++``qom-set`` on ``/machine``:
++
++- ``button`` (bool): the top button, true while held
++- ``headphones`` (bool): true while headphones are plugged in
++- ``button-key`` (string): the QKeyCode that holds the top button,
++  ``f12`` by default, or ``none``
++- ``usb-keyboard`` (bool): whether an unheard key plugs in a USB
++  keyboard; on by default
++- ``accel-x``, ``accel-y``, ``accel-z`` (int): the acceleration along
++  each of the accelerometer's axes in milli-g, -16000 to 16000; 0, 0
++  and 1000 by default
++- ``guid``, ``serial``, ``hwversion`` (string): the identity,
++  ``XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX``, 16 letters or digits and
++  ``MAJOR.MINOR``; fixed once the machine is created
++
++``query-chumby-state`` returns the button, headphones, acceleration and
++identity together with the board's outputs, so that a frontend can
++resynchronise with one command:
++
++.. code-block:: json
++
++  { "backlight": 65535, "lcd-on": true, "speaker-mute": false,
++    "headphones": false, "button": false,
++    "accel-x": 0, "accel-y": 0, "accel-z": 1000,
++    "guid": "C40BB1E0-0000-4000-8000-0E4000000001",
++    "serial": "0000000000000000", "hwversion": "3.8" }
++
++``backlight`` is the PWM's duty cycle, 0 to 65535; ``lcd-on`` and
++``speaker-mute`` are the lines the guest drives. The events
++``CHUMBY_BACKLIGHT`` (``level``, at most one each 100 ms, the last
++being the final level), ``CHUMBY_LCD`` (``on``),
++``CHUMBY_SPEAKER_MUTE`` (``muted``) and ``CHUMBY_HEADPHONES``
++(``inserted``) report changes as they happen.
++
++Input:
++
++- The pen is QMP's ``input-send-event`` with ``abs`` events on the
++  ``x`` and ``y`` axes, 0 to 32767 across the screen left to right and
++  top to bottom, and the ``left`` button, down while the pen touches.
++  A tap is a press of 100 to 200 ms. Any display's absolute pointer
++  sends the same events.
++- Keys are QKeyCodes, from ``send-key``, ``input-send-event`` or a
++  display's keyboard. F12 (``button-key``) holds the top button; the
++  others go to the guest's USB keyboard.
++
++Output: ``screendump`` with ``"format": "png"`` (or the default PPM)
++writes the 320x240 screen as the LCD controller composes it, dimmed by
++the backlight.
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+index b36a79fd8..a1a5552a6 100644
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -179,6 +179,17 @@ static bool chumby_classic_codec_adc(void *opaque, int16_t *samples,
+                                 frames);
+ }
+ 
++/* The identity is fixed once the machine is created. */
++static bool chumby_classic_identity_settable(const char *name, Error **errp)
++{
++    if (phase_check(PHASE_MACHINE_INITIALIZED)) {
++        error_setg(errp, "%s can only be set when the machine is created",
++                   name);
++        return false;
++    }
++    return true;
++}
++
+ static char *chumby_classic_get_guid(Object *obj, Error **errp)
+ {
+     return g_strdup(CHUMBY_CLASSIC_MACHINE(obj)->guid);
+@@ -189,6 +200,9 @@ static void chumby_classic_set_guid(Object *obj, const char *value,
+ {
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
+ 
++    if (!chumby_classic_identity_settable("guid", errp)) {
++        return;
++    }
+     if (qemu_uuid_parse(value, &s->guid_bytes) < 0) {
+         error_setg(errp, "invalid GUID '%s': expected 32 hex digits as "
+                    "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX", value);
+@@ -209,6 +223,9 @@ static void chumby_classic_set_serial(Object *obj, const char *value,
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
+     const char *p;
+ 
++    if (!chumby_classic_identity_settable("serial", errp)) {
++        return;
++    }
+     for (p = value; *p && g_ascii_isalnum(*p); p++) {
+         /* letters and digits only */
+     }
+@@ -233,6 +250,9 @@ static void chumby_classic_set_hwversion(Object *obj, const char *value,
+     unsigned int major, minor;
+     char end;
+ 
++    if (!chumby_classic_identity_settable("hwversion", errp)) {
++        return;
++    }
+     if (!g_ascii_isdigit(value[0]) ||
+         sscanf(value, "%3u.%3u%c", &major, &minor, &end) != 2 ||
+         major > 255 || minor > 255) {
+diff --git a/hw/misc/chumby_io.c b/hw/misc/chumby_io.c
+index c99bc0819..b4651a70e 100644
+--- a/hw/misc/chumby_io.c
++++ b/hw/misc/chumby_io.c
+@@ -332,6 +332,8 @@ ChumbyState *qmp_query_chumby_state(Error **errp)
+ {
+     ChumbyIOState *s;
+     ChumbyState *info;
++    Object *machine;
++    Error *err = NULL;
+ 
+     s = CHUMBY_IO(object_resolve_path_type("", TYPE_CHUMBY_IO, NULL));
+     if (!s) {
+@@ -344,6 +346,30 @@ ChumbyState *qmp_query_chumby_state(Error **errp)
+     info->speaker_mute = s->speaker_mute;
+     info->headphones = s->headphones;
+     info->button = s->button;
++
++    /* The rest is the machine's, which reads the acceleration from the part */
++    machine = qdev_get_machine();
++    info->accel_x = object_property_get_int(machine, "accel-x", &err);
++    if (!err) {
++        info->accel_y = object_property_get_int(machine, "accel-y", &err);
++    }
++    if (!err) {
++        info->accel_z = object_property_get_int(machine, "accel-z", &err);
++    }
++    if (!err) {
++        info->guid = object_property_get_str(machine, "guid", &err);
++    }
++    if (!err) {
++        info->serial = object_property_get_str(machine, "serial", &err);
++    }
++    if (!err) {
++        info->hwversion = object_property_get_str(machine, "hwversion", &err);
++    }
++    if (err) {
++        error_propagate(errp, err);
++        qapi_free_ChumbyState(info);
++        return NULL;
++    }
+     return info;
+ }
+ 
+diff --git a/qapi/chumby.json b/qapi/chumby.json
+index eb341c1c3..30c663189 100644
+--- a/qapi/chumby.json
++++ b/qapi/chumby.json
+@@ -18,7 +18,8 @@
+ ##
+ # @ChumbyState:
+ #
+-# The state of the Chumby's board-level lines.
++# The state of the Chumby's board-level lines, the acceleration its
++# accelerometer senses, and its identity.
+ #
+ # @backlight: the backlight's duty cycle, 0 (off) to 65535 (fully on),
+ #     as the guest's PWM drives it
+@@ -31,6 +32,19 @@
+ #
+ # @button: whether the top button is held
+ #
++# @accel-x: the acceleration along the accelerometer's X axis, in
++#     milli-g (the machine's ``accel-x`` property)
++#
++# @accel-y: the same along its Y axis (``accel-y``)
++#
++# @accel-z: the same along its Z axis (``accel-z``)
++#
++# @guid: the device GUID the crypto processor reports (``guid``)
++#
++# @serial: the serial number, 16 letters or digits (``serial``)
++#
++# @hwversion: the hardware version, MAJOR.MINOR (``hwversion``)
++#
+ # Since: 11.2
+ ##
+ { 'struct': 'ChumbyState',
+@@ -38,13 +52,20 @@
+             'lcd-on': 'bool',
+             'speaker-mute': 'bool',
+             'headphones': 'bool',
+-            'button': 'bool' } }
++            'button': 'bool',
++            'accel-x': 'int',
++            'accel-y': 'int',
++            'accel-z': 'int',
++            'guid': 'str',
++            'serial': 'str',
++            'hwversion': 'str' } }
+ 
+ ##
+ # @query-chumby-state:
+ #
+-# Return the state of the Chumby's board-level lines.  Only the
+-# ``chumby-classic`` machine has them; other machines report an error.
++# Return the state of the Chumby's board-level lines, its
++# accelerometer's input and its identity.  Only the ``chumby-classic``
++# machine has them; other machines report an error.
+ #
+ # Since: 11.2
+ #
+@@ -53,7 +74,11 @@
+ #     -> { "execute": "query-chumby-state" }
+ #     <- { "return": { "backlight": 65535, "lcd-on": true,
+ #                      "speaker-mute": false, "headphones": false,
+-#                      "button": false } }
++#                      "button": false,
++#                      "accel-x": 0, "accel-y": 0, "accel-z": 1000,
++#                      "guid": "C40BB1E0-0000-4000-8000-0E4000000001",
++#                      "serial": "0000000000000000",
++#                      "hwversion": "3.8" } }
+ ##
+ { 'command': 'query-chumby-state', 'returns': 'ChumbyState' }
+ 
