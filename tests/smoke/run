@@ -124,6 +124,11 @@ def main():
             with m.qmp() as q:
                 got = [q.qom_get(f"accel-{a}") for a in "xyz"]
             check("the accelerometer", got == [10, -20, 980], got)
+            s = m.chumby_state()
+            got = [s.get(f"accel-{a}") for a in "xyz"] + [s.get(k) for k in ("guid", "serial", "hwversion")]
+            check("the accelerometer and identity in query-chumby-state",
+                  got == [10, -20, 980, "C40BB1E0-0000-4000-8000-0E4000000001", "0000000000000000", "3.8"],
+                  got)
         finally:
             m.stop()
         check("QEMU quits", not m.running())

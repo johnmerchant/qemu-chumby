@@ -12,7 +12,8 @@ over its QMP socket (-qmp unix:SOCKET,server=on,wait=off). Python 3 only.
                       (/dev/switch); tap holds it MS milliseconds (default 300)
   headphones in|out   plug headphones in or take them out
   accel X Y Z         set the accelerometer, in milli-g along each axis
-  state               the board's lines as JSON (query-chumby-state)
+  state               the board's lines, the accelerometer and the identity
+                      as JSON (query-chumby-state)
   events [SECONDS]    print QMP events as JSON lines, until SECONDS have
                       passed (default: until the machine quits). A QMP
                       socket serves one client at a time: watch events on
