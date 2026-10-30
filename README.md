@@ -267,8 +267,6 @@ to a shell such as a sideload zImage), it also boots the machine and
 checks that the screen over VNC matches `screendump`, that keys typed
 with the Mac's key codes run in the screen's shell, and the top button.
 
-### Testing on Linux
-
 ## Scripts and tests: chumby-machine
 
 `chumby-machine` runs the machine headless and drives it, for test
