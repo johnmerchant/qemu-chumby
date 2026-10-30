@@ -81,6 +81,7 @@ class QMP:
         connect(self.sock, path)
         self.buf = b""
         self.events = []
+        self.serial = 0
         self.message()  # the greeting
         self.cmd("qmp_capabilities")
 
@@ -103,11 +104,19 @@ class QMP:
         return json.loads(line)
 
     def send(self, msg):
+        """Sends a command and returns its reply's `return`. Each command
+        carries an `id`, which QEMU echoes in its reply: a reply with
+        another id, or none, answers something else (one left over from an
+        earlier client, say) and is passed over."""
+        self.serial += 1
+        msg = dict(msg, id=f"chumby-machine-{self.serial}")
         self.sock.sendall(json.dumps(msg).encode() + b"\n")
         while True:
             r = self.message()
             if "event" in r:
                 self.events.append(r)
+            elif r.get("id") != msg["id"]:
+                continue
             elif "error" in r:
                 raise Error(f"{msg.get('execute')}: {r['error'].get('desc', r['error'])}")
             else:
@@ -118,6 +127,13 @@ class QMP:
         if args:
             msg["arguments"] = args
         return self.send(msg)
+
+    def hmp(self, line):
+        """A human monitor command; its output, a string."""
+        out = self.cmd("human-monitor-command", **{"command-line": line})
+        if not isinstance(out, str):
+            raise Error(f"human-monitor-command {line!r}: not a string: {out!r}")
+        return out
 
     def qom_set(self, prop, value, path="/machine"):
         return self.cmd("qom-set", path=path, property=prop, value=value)
