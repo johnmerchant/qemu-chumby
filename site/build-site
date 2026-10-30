@@ -16,8 +16,11 @@ leaving the page to drift.
 Its downloads are COMMIT's builds on the `prebuilt` release, one for each
 platform in the README's table of prebuilt binaries, with the SHA-256s in
 DIR's qemu-chumby-COMMIT-PLATFORM.tar.xz.sha256 (CI's build artifacts; the
-tarballs beside them, if there, give their sizes). It writes OUT (default
-_site): index.html, style.css and downloads.json, the downloads as
+tarballs beside them, if there, give their sizes); and, for the Linux
+desktop, the Flatpaks (qemu-chumby-COMMIT-ARCH.flatpak) and distro
+packages (qemu-chumby-COMMIT-DISTRO-VERSION-ARCH.deb or .rpm) whose
+.sha256 files are in DIR. It writes OUT (default _site): index.html,
+style.css and downloads.json, the downloads as
 [{platform, name, url, sha256, sha256_url, size}].
 
 Python 3's standard library only.
@@ -39,6 +42,7 @@ PLATFORMS = {
     "linux-aarch64": ("Linux aarch64", "Static; headless, no audio."),
     "macos-arm64": ("macOS, Apple silicon", "macOS 15+; window and audio."),
 }
+DISTROS = {"debian": "Debian", "ubuntu": "Ubuntu", "fedora": "Fedora"}
 
 
 class Error(Exception):
@@ -191,10 +195,27 @@ def need(text, *words):
 
 # The page.
 
+def desktop(commit, sha_dir):
+    """The Flatpaks' and distro packages' platforms (x86_64,
+    debian-13-x86_64...) with a .sha256 in SHA_DIR, and their suffixes."""
+    found = []
+    for f in sorted(os.listdir(sha_dir)):
+        m = re.fullmatch(r"qemu-chumby-%s-(.+)\.(flatpak|deb|rpm)\.sha256" % commit, f)
+        if m:
+            found.append((m.group(1), m.group(2)))
+    # The Flatpaks first, then the distros as DISTROS has them.
+    order = list(DISTROS)
+    return sorted(found, key=lambda pe: (pe[1] != "flatpak", order.index(pe[0].split("-")[0])
+                                         if pe[1] != "flatpak" else 0, pe[0]))
+
+
 def downloads(commit, sha_dir, platforms):
     out = []
     for p in platforms:
-        name = "qemu-chumby-%s-%s.tar.xz" % (commit, p)
+        ext = "tar.xz"
+        if isinstance(p, tuple):
+            p, ext = p
+        name = "qemu-chumby-%s-%s.%s" % (commit, p, ext)
         path = os.path.join(sha_dir, name + ".sha256")
         try:
             with open(path, encoding="ascii") as f:
@@ -248,12 +269,44 @@ def page(readme, commit, qemu_version, dls):
     need(" ".join(b.text for b in readme.section("Control surface") if b.kind == "para"),
          "QMP", "query-chumby-state")
 
-    for d in dls:
+    static = [d for d in dls if d["name"].endswith(".tar.xz")]
+    for d in static:
         if d["platform"] not in PLATFORMS:
             raise Error("README.md: a platform this page doesn't describe: %s" % d["platform"])
 
-    cards = []
+    # The Linux desktop's: the Flatpaks, then one line per distro package.
+    linux = []
     for d in dls:
+        if d["name"].endswith(".tar.xz"):
+            continue
+        ext = d["name"].rsplit(".", 1)[1]
+        size = " (%.1f MiB)" % (d["size"] / 1048576) if d["size"] else ""
+        if ext == "flatpak":
+            what = "Flatpak (desktop app with sound), %s" % d["platform"]
+        else:
+            distro, version, arch = d["platform"].rsplit("-", 2)
+            what = "%s %s, %s" % (DISTROS.get(distro, distro), version, arch)
+        linux.append('<li><a href="{url}">{what} .{ext}</a>{size} &middot; <a href="{sha_url}">SHA-256'
+                     '<span class="vh"> file for {what}</span></a></li>'.format(
+                         url=esc(d["url"]), what=esc(what), ext=esc(ext), size=esc(size),
+                         sha_url=esc(d["sha256_url"])))
+    linux_html = ""
+    if linux:
+        linux_html = """<h3 id="linux-desktop">Linux desktop</h3>
+<p>The Flatpak is chumby-desktop, the app, with its QEMU and sound. The distro packages
+install <code>qemu-chumby-system-arm</code> (GTK or SDL window, sound) beside the
+distro&rsquo;s own QEMU, with <code>chumby-machine</code> and <code>chumby-ctl</code>.</p>
+<ul class="pkgs">
+%s
+</ul>
+%s""" % ("\n".join(linux), code_html("\n".join([
+            "flatpak install --user ./qemu-chumby-*-x86_64.flatpak",
+            "sudo apt install ./qemu-chumby-*-debian-13-x86_64.deb",
+            "sudo dnf install ./qemu-chumby-*-fedora-44-x86_64.rpm",
+        ]), "Install"))
+
+    cards = []
+    for d in static:
         label, note = PLATFORMS[d["platform"]]
         size = " (%.1f MiB)" % (d["size"] / 1048576) if d["size"] else ""
         cards.append("""<li class="card">
@@ -264,7 +317,7 @@ def page(readme, commit, qemu_version, dls):
 </li>""".format(label=esc(label), note=esc(note), url=esc(d["url"]), sha_url=esc(d["sha256_url"]),
                 sha=esc(d["sha256"]), size=esc(size)))
 
-    d0 = next((d for d in dls if d["platform"] == "linux-x86_64"), dls[0])
+    d0 = next((d for d in static if d["platform"] == "linux-x86_64"), static[0])
     run = "\n".join([
         "tar xJf qemu-chumby-*-%s.tar.xz" % d0["platform"],
         "cd qemu-chumby-*-%s" % d0["platform"],
@@ -313,6 +366,7 @@ installed.</p>
 <ul class="cards">
 {cards}
 </ul>
+{linux}
 </section>
 
 <section aria-labelledby="run">
@@ -346,6 +400,7 @@ in Chumby; it contains none of the Chumby&rsquo;s software, so bring your own fi
 """.format(
         title=esc(title), command=esc(command), qemu=esc(qemu_version), repo=REPO,
         neochumby=esc(neochumby), commit=esc(commit), short=esc(short), cards="\n".join(cards),
+        linux=linux_html,
         run=code_html(run, "Unpack and boot"),
         more="\n".join('<li><a href="%s">%s</a></li>' % (esc(h), t) for h, t in more),
         legal_href=readme.anchor("Legal"))
@@ -372,7 +427,7 @@ def main():
         platforms += re.findall(r"`([^`]+)`", r[0])
     if not platforms:
         raise Error("README.md: no platforms in the prebuilt binaries' table")
-    dls = downloads(a.commit, a.sha256, platforms)
+    dls = downloads(a.commit, a.sha256, platforms + desktop(a.commit, a.sha256))
     text = page(readme, a.commit, m.group(1), dls)
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "index.html"), "w", encoding="utf-8") as f:

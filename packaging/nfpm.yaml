@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# The distro packages, .deb and .rpm, from ./build --package out's tree
+# (packaging/build-package runs both). PKG_VERSION, PKG_RELEASE and
+# PKG_ARCH come from it, and it also appends the runtime dependencies it
+# derives from the binary (dpkg-shlibdeps, rpm's elfdeps).
+#
+# Named so that they install beside the distro's own QEMU: the package is
+# qemu-chumby, QEMU is /usr/bin/qemu-chumby-system-arm and its data
+# /usr/share/qemu-chumby, so no file is in any other package.
+name: qemu-chumby
+version: ${PKG_VERSION}
+version_schema: none
+release: ${PKG_RELEASE}
+arch: ${PKG_ARCH}
+platform: linux
+section: otherosfs
+priority: optional
+maintainer: John Merchant <john@johnmerchant.dev>
+vendor: qemu-chumby
+homepage: https://github.com/johnmerchant/qemu-chumby
+license: GPL-2.0-or-later
+description: |-
+  QEMU with the Chumby Classic machine (Freescale i.MX21)
+  qemu-chumby-system-arm is QEMU's qemu-system-arm with qemu-chumby's
+  chumby-classic machine, with VNC, the GTK and SDL windows and sound
+  through PipeWire, PulseAudio or ALSA. chumby-machine runs the machine
+  headless for scripts and tests, and chumby-ctl drives a running one.
+  It installs beside the distro's own QEMU and shares no files with it.
+
+# chumby-machine and chumby-ctl are Python 3 scripts.
+recommends:
+  - python3
+
+contents:
+  - src: out/package/usr/bin/qemu-chumby-system-arm
+    dst: /usr/bin/qemu-chumby-system-arm
+    file_info:
+      mode: 0755
+  - dst: /usr/share/qemu-chumby
+    type: dir
+  - dst: /usr/share/qemu-chumby/keymaps
+    type: dir
+  - src: out/package/usr/share/qemu-chumby/keymaps/*
+    dst: /usr/share/qemu-chumby/keymaps/
+    file_info:
+      mode: 0644
+  - dst: /usr/lib/qemu-chumby
+    type: dir
+  - src: out/package/usr/lib/qemu-chumby/chumby-machine
+    dst: /usr/lib/qemu-chumby/chumby-machine
+    file_info:
+      mode: 0755
+  - src: out/package/usr/lib/qemu-chumby/chumby-ctl
+    dst: /usr/lib/qemu-chumby/chumby-ctl
+    file_info:
+      mode: 0755
+  - src: out/package/usr/lib/qemu-chumby/chumby_machine.py
+    dst: /usr/lib/qemu-chumby/chumby_machine.py
+    file_info:
+      mode: 0644
+  - src: /usr/lib/qemu-chumby/chumby-machine
+    dst: /usr/bin/chumby-machine
+    type: symlink
+  - src: /usr/lib/qemu-chumby/chumby-ctl
+    dst: /usr/bin/chumby-ctl
+    type: symlink
+  - dst: /usr/share/doc/qemu-chumby
+    type: dir
+  - src: out/package/usr/share/doc/qemu-chumby/README.md
+    dst: /usr/share/doc/qemu-chumby/README.md
+    type: doc
+    file_info:
+      mode: 0644
+  # The licence: Debian's copyright file, Fedora's %license.
+  - src: packaging/copyright
+    dst: /usr/share/doc/qemu-chumby/copyright
+    packager: deb
+    file_info:
+      mode: 0644
+  - dst: /usr/share/licenses/qemu-chumby
+    type: dir
+    packager: rpm
+  - src: COPYING
+    dst: /usr/share/licenses/qemu-chumby/COPYING
+    type: license
+    packager: rpm
+    file_info:
+      mode: 0644
+
+rpm:
+  summary: QEMU with the Chumby Classic machine (Freescale i.MX21)
+  group: Applications/Emulators

@@ -132,6 +132,27 @@ On macOS the Cocoa window and CoreAudio are built in. VNC always is.
 
 ### Prebuilt binaries
 
+Each commit on main publishes these, from
+[`prebuilt`](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
+(each with its `.sha256`; ARCH is `x86_64` or `aarch64`):
+
+| Download | What it's for | Install |
+| --- | --- | --- |
+| `qemu-chumby-COMMIT-PLATFORM.tar.xz` | Headless QEMU that needs nothing installed (static on Linux): CI, servers, scripts. No window or sound on Linux. | Unpack; run `qemu-system-arm` where it is. |
+| `qemu-chumby-COMMIT-ARCH.flatpak` | Flatpak (desktop app with sound): chumby-desktop with its QEMU, sandboxed, with no network. | `flatpak install --user ./qemu-chumby-*.flatpak`, then `flatpak run io.github.johnmerchant.QemuChumby` |
+| `qemu-chumby-COMMIT-DISTRO-VERSION-ARCH.deb` or `.rpm` | QEMU with its GTK and SDL windows and sound, on the distro's own libraries, as `qemu-chumby-system-arm` beside the distro's QEMU, with `chumby-machine` and `chumby-ctl`. For `debian-13`, `ubuntu-26.04`, `ubuntu-26.10`, `fedora-44` and `fedora-43`. | `sudo apt install ./qemu-chumby-*.deb` or `sudo dnf install ./qemu-chumby-*.rpm` |
+
+The packages are `qemu-chumby`, version QEMU's plus the commit's
+date and ID (`11.1.2+chumby.20261030131130.g3673860`), so each newer
+commit upgrades the one before; they install
+`/usr/bin/qemu-chumby-system-arm`, its keymaps in
+`/usr/share/qemu-chumby` and nothing any other package has. Their
+dependencies are what the binary links, as `dpkg-shlibdeps` and RPM's
+`elfdeps` find them. `packaging/build-package` builds one on the distro
+it is for, and `flatpak/build` the Flatpak; the Flatpak gets the
+display, the sound server and the GPU, and opens your images only
+through the file chooser.
+
 CI (`.github/workflows/ci.yml`) builds `qemu-system-arm` with
 `./build --portable` for Linux x86_64 and aarch64 and macOS on Apple
 silicon, and boots each on `tests/smoke/run`. Each commit on main
@@ -151,7 +172,7 @@ They need nothing installed: unpack and run.
 
 | Platform | What it is | What it can't do |
 | --- | --- | --- |
-| `linux-x86_64`, `linux-aarch64` | A static executable, built on Alpine: musl, glib, pixman, libpng and zlib linked in, no dynamic loader and no shared libraries. It runs on any Linux of its architecture, glibc or musl, NixOS included. | No window and no sound (`-display none`, VNC, `-audiodev none` or `wav`). For those, `./build` with your desktop's packages, or Nix. |
+| `linux-x86_64`, `linux-aarch64` | A static executable, built on Alpine: musl, glib, pixman, libpng and zlib linked in, no dynamic loader and no shared libraries. It runs on any Linux of its architecture, glibc or musl, NixOS included. | No window and no sound (`-display none`, VNC, `-audiodev none` or `wav`). For those, the Flatpak or a distro package (above), `./build` with your desktop's packages, or Nix. |
 | `macos-arm64` | glib, pixman and libpng linked in; it links only the system's libraries (`/usr/lib`) and frameworks (`/System/Library`), so it needs no Homebrew. macOS 15 or later. Signed ad hoc. | |
 
 Both have VNC (on a unix socket, as Chumby.app reads the screen, or
