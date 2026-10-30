@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "chumby-desktop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-2.0-or-later"
+description = "The Chumby Classic as a Linux desktop app: QEMU's chumby-classic machine in a Qt Quick window"
+publish = false
+
+[dependencies]
+cxx = "1.0"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", default-features = false, features = ["qt_gui", "qt_qml"] }
+# The console's pseudo-terminal, raw mode and poll(): the system calls
+# std doesn't wrap.
+libc = "0.2"
+
+[build-dependencies]
+cxx-qt-build = { version = "0.10", features = ["link_qt_object_files"] }
+
+[profile.release]
+debug = false
+strip = true
+lto = "thin"

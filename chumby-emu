@@ -17,6 +17,11 @@ it instead: one native window with the screen, the controls and the
 console. --display, --no-panel or CHUMBY_EMU_QT=1 keep QEMU's window and
 the Qt panel.
 
+On Linux, once the native app is built (frontend/linux: cargo build
+--release, or chumby-desktop on $PATH), chumby-emu runs that instead:
+one window with the screen and the controls, the same options. --display,
+--no-panel or CHUMBY_EMU_QT=1 keep QEMU's window and the Qt panel.
+
 The emulated Chumby never has a network: QEMU runs with -nic none.
 
 Options:
@@ -267,6 +272,21 @@ class QMP:
         return self.cmd("qom-set", path=path, property=prop, value=value)
 
 
+def linux_app(a, argv):
+    """On Linux, the native app (frontend/linux, built with cargo, or
+    chumby-desktop on $PATH) takes over when it is built: one window with
+    the screen and the controls. --display, --no-panel or CHUMBY_EMU_QT=1
+    keep QEMU's own window and the Qt panel."""
+    app = os.path.join(HERE, "frontend", "linux", "target", "release", "chumby-desktop")
+    if not os.access(app, os.X_OK):
+        app = shutil.which("chumby-desktop")
+    if not app:
+        return
+    if not a.qemu:
+        argv = ["--qemu", find_qemu(None)] + argv
+    os.execv(app, [app] + argv)
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("images", nargs="?")
@@ -290,6 +310,12 @@ def main():
     if a.help:
         print(__doc__.strip())
         return 0
+    for bad in ("-netdev", "-nic", "-net"):
+        if bad in extra or "-" + bad in extra:
+            sys.exit(f"chumby-emu: {bad} isn't allowed: the emulated Chumby has no network")
+    if (not IS_MAC and not a.no_panel and not a.display
+            and not os.environ.get("CHUMBY_EMU_QT")):
+        linux_app(a, sys.argv[1:])
     kernel = a.kernel or (a.images and os.path.join(a.images, "zImage"))
     nand = a.nand or (a.images and os.path.join(a.images, "nand.img"))
     if not kernel:
@@ -297,9 +323,6 @@ def main():
         return 2
 
     qemu = find_qemu(a.qemu)
-    for bad in ("-netdev", "-nic", "-net"):
-        if bad in extra or "-" + bad in extra:
-            sys.exit(f"chumby-emu: {bad} isn't allowed: the emulated Chumby has no network")
     if (IS_MAC and not a.no_panel and not a.display
             and not os.environ.get("CHUMBY_EMU_QT")):
         exe = mac_app()

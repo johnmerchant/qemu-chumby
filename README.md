@@ -293,6 +293,72 @@ to a shell such as a sideload zImage), it also boots the machine and
 checks that the screen over VNC matches `screendump`, that keys typed
 with the Mac's key codes run in the screen's shell, and the top button.
 
+### The Linux app: chumby-desktop
+
+On Linux, `frontend/linux` is a native app, `chumby-desktop`: one
+window with the Chumby's screen, drawn by the app (resizable, keeping its
+shape, sharp pixels, HiDPI and fractional scaling handled), a toolbar
+(pause, the top button, screenshot) and the controls in a side panel
+(a drawer when the window is narrow), in the desktop's light or dark
+theme. It is Qt Quick (QML) with a Rust core, through
+[CXX-Qt](https://github.com/KDAB/cxx-qt): on KDE Plasma it takes
+Plasma's own Qt Quick style, elsewhere (GNOME...) Qt's Fusion with the
+system's palette. It runs on Wayland and X11.
+
+The app starts QEMU itself, with `-display none` and the screen on a
+private VNC socket (`-vnc unix:...`), which a small RFB client in the
+app reads; the pen and the keyboard go over QMP (`input-send-event`).
+With the screen focused (click it), every key goes to the Chumby by its
+position on the keyboard, whatever your layout, as QEMU's own windows
+send them, except the app's shortcuts, which all use Ctrl+Shift:
+
+| Keys | |
+| --- | --- |
+| F12 | the top button (the machine's `button-key`) |
+| Ctrl+Shift+P | pause, resume |
+| Ctrl+Shift+S | screenshot |
+| Ctrl+Shift+T | the console in your terminal app |
+| Ctrl+Shift+B | show or hide the controls |
+| Ctrl+Shift+F | full screen |
+| Ctrl+Q | quit |
+
+It takes the same options as chumby-emu (`chumby-desktop --help`), and
+without any it offers to open an images folder or a kernel (with an
+optional NAND image and state folder), and the ones opened before.
+Sound is QEMU's, from the sound server that is running (PipeWire,
+PulseAudio, ALSA). When it is built, `./chumby-emu` on Linux runs it
+instead of QEMU's window and the Python panel; `--display gtk` or
+`--no-panel` still give those.
+
+It needs Qt 6.5 or later, Rust 1.85 or later and a linker that copes
+with CXX-Qt's static libraries (lld or mold; GNU ld fails), with these
+packages:
+
+| System | Packages |
+| --- | --- |
+| Fedora | `cargo rust gcc-c++ lld qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtsvg` |
+| Debian 13, Ubuntu 25.04 or later | `cargo rustc g++ lld qt6-base-dev qt6-declarative-dev qmake6 qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-dialogs qml6-module-qtquick-templates qml6-module-qtqml-workerscript qml6-module-qtcore qt6-svg-plugins` |
+| Arch | `rust lld qt6-base qt6-declarative qt6-svg` |
+
+Then, after `./build` for the machine:
+
+    cd frontend/linux
+    cargo build --release          # target/release/chumby-desktop
+    ./install.sh                   # or: ./install.sh /usr/local, as root
+
+`install.sh` builds the app and installs it in `~/.local` with its
+`.desktop` file and icon, so it is in the app menu (KDE's and GNOME's),
+together with the checkout's `build/obj/qemu-system-arm`. Without that
+QEMU it uses the `qemu-system-arm` on `$PATH`, or `--qemu`.
+`install.sh --uninstall` removes it again. Its only Rust dependencies are
+CXX-Qt's crates and `libc` (for the console's pseudo-terminal).
+
+The app has a test hook: `CHUMBY_DESKTOP_TEST=FILE` runs FILE's steps
+(typing, taps, waiting for console output, window grabs; see
+`frontend/linux/src/test.rs`) against its own window, which works
+headless with `QT_QPA_PLATFORM=offscreen`; `CHUMBY_DESKTOP_DEBUG_KEYS=1`
+prints each key and the QKeyCode it sends.
+
 ## Scripts and tests: chumby-machine
 
 `chumby-machine` runs the machine headless and drives it, for test
