@@ -12,6 +12,11 @@ button, tilting and shaking, headphones, the outputs the Chumby drives
 (backlight, speaker mute, LCD), screenshots, snapshots and the console.
 The mouse in the window is the pen.
 
+On macOS, once Chumby.app is built (frontend/mac/build-app), this runs
+it instead: one native window with the screen, the controls and the
+console. --display, --no-panel or CHUMBY_EMU_QT=1 keep QEMU's window and
+the Qt panel.
+
 The emulated Chumby never has a network: QEMU runs with -nic none.
 
 Options:
@@ -52,6 +57,41 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IS_MAC = platform.system() == "Darwin"
+
+
+def mac_app():
+    """Chumby.app's executable, if it is built: $CHUMBY_APP (the .app), or
+    frontend/mac/build/Chumby.app beside this script."""
+    for app in (os.environ.get("CHUMBY_APP"),
+                os.path.join(HERE, "frontend", "mac", "build", "Chumby.app")):
+        if app:
+            exe = os.path.join(app, "Contents", "MacOS", "Chumby")
+            if os.access(exe, os.X_OK):
+                return exe
+    return None
+
+
+def exec_mac_app(exe, a, qemu, extra):
+    """Runs Chumby.app with these options, in place of this process: it
+    starts QEMU and draws its screen itself."""
+    args = [exe]
+    if a.images:
+        args.append(a.images)
+    for opt in ("kernel", "nand", "audio", "state"):
+        v = getattr(a, opt)
+        if v:
+            args += ["--" + opt, v]
+    args += ["--qemu", qemu]
+    if a.write:
+        args.append("--write")
+    if a.fast:
+        args.append("--fast")
+    if a.scale:
+        args += ["--scale", "%g" % a.scale]
+    if extra:
+        args += ["--"] + extra
+    sys.stdout.flush()
+    os.execv(exe, args)
 
 
 def find_qemu(given):
@@ -257,6 +297,14 @@ def main():
         return 2
 
     qemu = find_qemu(a.qemu)
+    for bad in ("-netdev", "-nic", "-net"):
+        if bad in extra or "-" + bad in extra:
+            sys.exit(f"chumby-emu: {bad} isn't allowed: the emulated Chumby has no network")
+    if (IS_MAC and not a.no_panel and not a.display
+            and not os.environ.get("CHUMBY_EMU_QT")):
+        exe = mac_app()
+        if exe:
+            exec_mac_app(exe, a, os.path.abspath(qemu) if os.sep in qemu else qemu, extra)
     display = pick_display(qemu, a.display)
     audio = pick_audio(qemu, a.audio)
 
@@ -292,9 +340,6 @@ def main():
     if a.fast:
         args += ["-icount", "shift=auto,sleep=off"]
     args = args[:1] + ["-M", machine] + args[1:] + extra
-    for bad in ("-netdev", "-nic", "-net"):
-        if bad in extra:
-            sys.exit(f"chumby-emu: {bad} isn't allowed: the emulated Chumby has no network")
 
     print("chumby-emu:", " ".join(args), flush=True)
     proc = subprocess.Popen(args)
