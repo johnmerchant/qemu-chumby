@@ -424,7 +424,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: flatpak/.build/state
-          key: flatpak-${{ matrix.arch }}-${{ hashFiles('flatpak/*', 'patches/*.patch', 'frontend/linux/**') }}
+          key: flatpak-${{ matrix.arch }}-${{ hashFiles('flatpak/build', 'flatpak/*.yml', 'flatpak/*.json', 'flatpak/*.xml', 'patches/*.patch', 'frontend/linux/**') }}
           restore-keys: flatpak-${{ matrix.arch }}-
       - name: Build
         run: |

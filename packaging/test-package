@@ -46,7 +46,7 @@ test -f /usr/share/qemu-chumby/keymaps/en-us
 # The installed chumby-machine finds the installed QEMU by itself.
 chumby-machine --help >/dev/null
 chumby-ctl --help 2>&1 | grep -q "over its QMP socket"
-python3 -c 'import sys; sys.path.insert(0, "/usr/lib/qemu-chumby"); import chumby_machine as cm; print(cm.find_qemu())' |
+python3 -c 'import sys; sys.path.insert(0, "/usr/lib/qemu-chumby"); import os, chumby_machine as cm; print(os.path.realpath(cm.find_qemu()))' |
     grep -qx "$q"
 
 python3 "$here/tests/smoke/run" "$q"
