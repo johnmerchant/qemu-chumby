@@ -1,0 +1,662 @@
+Description: hw/block: Add the i.MX21 NAND flash controller
+ The NFC with its four page buffers and a small-page NAND chip behind it
+ (64 MiB, ID 0xAD 0x76 by default). The chip's contents come from a block
+ backend in nanddump's layout, 528-byte records of page data then spare
+ bytes; programs and erases are written back unless the drive is
+ read-only.
+ .
+ The contents are a copy of the drive, read at realize, and are not in
+ the migration stream. loadvm and -loadvm restore the drive (with
+ -loadvm, after the copy was read), so after a restore the contents are
+ read again from a writable drive when the machine next runs: during the
+ load the drive is drained (loadvm) or not yet active (an incoming
+ migration). Without a writable drive the contents are only in memory
+ and are kept as they are. The load refuses a page, column, area or
+ address count out of range; each indexes the chip's contents or its
+ address bytes.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -871,6 +871,7 @@ Chumby Classic (i.MX21)
+ M: John Merchant <john@johnmerchant.dev>
+ L: qemu-arm@nongnu.org
+ S: Maintained
++F: hw/block/imx21_nfc.c
+ F: hw/display/imx21_lcdc.c
+ F: hw/gpio/imx21_gpio.c
+ F: hw/intc/imx21_aitc.c
+diff --git a/hw/block/imx21_nfc.c b/hw/block/imx21_nfc.c
+new file mode 100644
+--- /dev/null
++++ b/hw/block/imx21_nfc.c
+@@ -0,0 +1,547 @@
++/*
++ * i.MX21 NAND flash controller (NFC) with a small-page NAND chip
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * The controller has four 512-byte main buffers and four 16-byte spare
++ * buffers. The driver writes a command or address byte and starts a
++ * cycle through CONFIG2; every cycle completes at once. ECC always
++ * reports no errors.
++ *
++ * Behind it is one small-page chip (512 + 16 bytes a page, 32 pages a
++ * block), by default a 64 MiB part with ID 0xAD 0x76. Its contents come
++ * from the block backend as consecutive 528-byte records, each a page's
++ * data then its spare bytes, the layout nanddump writes. Programs and
++ * erases are written back unless the drive is read-only.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/block/imx21_nfc.h"
++#include "hw/block/block.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/core/qdev-properties-system.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qemu/error-report.h"
++#include "qemu/log.h"
++#include "qemu/bswap.h"
++#include "qemu/module.h"
++#include "system/block-backend.h"
++#include "system/runstate.h"
++
++#define NFC_BUFSIZE         0xe00
++#define NFC_RBA             0xe04
++#define NFC_ADDR            0xe06
++#define NFC_CMD             0xe08
++#define NFC_CONFIG          0xe0a
++#define NFC_ECC_STATUS      0xe0c
++#define NFC_ECC_RSLT_MAIN   0xe0e
++#define NFC_ECC_RSLT_SPARE  0xe10
++#define NFC_WRPROT          0xe12
++#define NFC_UNLOCK_START    0xe14
++#define NFC_UNLOCK_END      0xe16
++#define NFC_WRPR_STAT       0xe18
++#define NFC_CONFIG1         0xe1a
++#define NFC_CONFIG2         0xe1c
++
++#define CONFIG1_SP_EN       (1 << 2)
++#define CONFIG1_INT_MSK     (1 << 4)
++#define CONFIG1_NF_CE       (1 << 6)
++
++#define CONFIG2_FCMD        (1 << 0)
++#define CONFIG2_FADD        (1 << 1)
++#define CONFIG2_FDI         (1 << 2)
++#define CONFIG2_FDO_SHIFT   3
++#define CONFIG2_START       0x3f
++#define CONFIG2_INT         (1 << 15)
++
++#define FDO_PAGE            1
++#define FDO_ID              2
++#define FDO_STATUS          4
++
++#define WRPR_STAT_UNLOCKED  (1 << 2)
++
++/* NAND status: ready, not write-protected */
++#define NAND_STATUS_READY   0xc0
++
++#define NAND_CMD_READ0      0x00
++#define NAND_CMD_READ1      0x01
++#define NAND_CMD_PAGEPROG   0x10
++#define NAND_CMD_READOOB    0x50
++#define NAND_CMD_ERASE1     0x60
++#define NAND_CMD_STATUS     0x70
++#define NAND_CMD_SEQIN      0x80
++#define NAND_CMD_READID     0x90
++#define NAND_CMD_ERASE2     0xd0
++#define NAND_CMD_RESET      0xff
++
++static uint32_t imx21_nfc_row(IMX21NFCState *s, const uint8_t *bytes, int n)
++{
++    uint32_t row = 0;
++    int i;
++
++    for (i = 0; i < n; i++) {
++        row |= (uint32_t)bytes[i] << (8 * i);
++    }
++    return row % s->pages;
++}
++
++static void imx21_nfc_write_back(IMX21NFCState *s, uint64_t off, uint64_t len)
++{
++    int ret;
++
++    if (!s->blk || !blk_is_writable(s->blk)) {
++        return;
++    }
++    ret = blk_pwrite(s->blk, off, len, s->data + off, 0);
++    if (ret < 0) {
++        error_report("%s: write-back failed: %s", TYPE_IMX21_NFC,
++                     strerror(-ret));
++    }
++}
++
++static void imx21_nfc_chip_command(IMX21NFCState *s, uint8_t cmd)
++{
++    uint64_t base, len;
++    int i;
++
++    switch (cmd) {
++    case NAND_CMD_READ0:
++    case NAND_CMD_READ1:
++    case NAND_CMD_READOOB:
++    case NAND_CMD_SEQIN:
++    case NAND_CMD_ERASE1:
++    case NAND_CMD_READID:
++        s->cmd = cmd;
++        s->naddr = 0;
++        if (cmd == NAND_CMD_SEQIN) {
++            memset(s->prog, 0xff, sizeof(s->prog));
++        } else if (cmd == NAND_CMD_READ0) {
++            s->area = 0;
++        } else if (cmd == NAND_CMD_READ1) {
++            s->area = 256;
++        } else if (cmd == NAND_CMD_READOOB) {
++            s->area = IMX21_NAND_PAGE;
++        }
++        break;
++    case NAND_CMD_PAGEPROG:
++        /* Programming can only clear bits. */
++        base = (uint64_t)s->page * IMX21_NAND_RECORD;
++        for (i = 0; i < IMX21_NAND_RECORD; i++) {
++            s->data[base + i] &= s->prog[i];
++        }
++        imx21_nfc_write_back(s, base, IMX21_NAND_RECORD);
++        s->cmd = 0;
++        break;
++    case NAND_CMD_ERASE2:
++        base = (uint64_t)(s->page - s->page % s->pages_per_block) *
++               IMX21_NAND_RECORD;
++        len = (uint64_t)s->pages_per_block * IMX21_NAND_RECORD;
++        memset(s->data + base, 0xff, len);
++        imx21_nfc_write_back(s, base, len);
++        s->cmd = 0;
++        break;
++    case NAND_CMD_STATUS:
++        s->cmd = cmd;
++        break;
++    case NAND_CMD_RESET:
++        s->cmd = 0;
++        s->naddr = 0;
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "%s: unknown NAND command 0x%02x\n",
++                      __func__, cmd);
++        break;
++    }
++}
++
++static void imx21_nfc_chip_address(IMX21NFCState *s, uint8_t a)
++{
++    uint32_t span;
++
++    if (s->naddr < sizeof(s->addr)) {
++        s->addr[s->naddr++] = a;
++    }
++    switch (s->cmd) {
++    case NAND_CMD_READ0:
++    case NAND_CMD_READ1:
++    case NAND_CMD_READOOB:
++    case NAND_CMD_SEQIN:
++        if (s->naddr >= 2) {
++            s->page = imx21_nfc_row(s, s->addr + 1, s->naddr - 1);
++        }
++        span = s->area == IMX21_NAND_PAGE ? IMX21_NAND_SPARE : 256;
++        s->col = s->area + s->addr[0] % span;
++        s->prog_col = s->col;
++        break;
++    case NAND_CMD_ERASE1:
++        s->page = imx21_nfc_row(s, s->addr, s->naddr);
++        break;
++    }
++}
++
++/* Reads n bytes from the chip, running on through the page and the next. */
++static void imx21_nfc_chip_output(IMX21NFCState *s, uint8_t *out, int n)
++{
++    int i;
++
++    for (i = 0; i < n; i++) {
++        out[i] = s->data[(uint64_t)s->page * IMX21_NAND_RECORD + s->col];
++        if (++s->col == IMX21_NAND_RECORD) {
++            s->col = 0;
++            s->page = (s->page + 1) % s->pages;
++        }
++    }
++}
++
++static void imx21_nfc_chip_input(IMX21NFCState *s, const uint8_t *in, int n)
++{
++    int i;
++
++    for (i = 0; i < n && s->prog_col < IMX21_NAND_RECORD; i++) {
++        s->prog[s->prog_col++] = in[i];
++    }
++}
++
++static void imx21_nfc_update_irq(IMX21NFCState *s)
++{
++    qemu_set_irq(s->irq, (s->config2 & CONFIG2_INT) &&
++                         !(s->config1 & CONFIG1_INT_MSK));
++}
++
++static void imx21_nfc_start(IMX21NFCState *s, uint16_t v)
++{
++    bool spare_only = s->config1 & CONFIG1_SP_EN;
++    uint8_t *main_buf = s->buf + (s->rba & 3) * IMX21_NAND_PAGE;
++    uint8_t *spare_buf = s->buf + 0x800 + (s->rba & 3) * IMX21_NAND_SPARE;
++
++    if (v & CONFIG2_FCMD) {
++        imx21_nfc_chip_command(s, s->cmd_reg);
++    } else if (v & CONFIG2_FADD) {
++        imx21_nfc_chip_address(s, s->addr_reg);
++    } else if (v & CONFIG2_FDI) {
++        if (!spare_only) {
++            imx21_nfc_chip_input(s, main_buf, IMX21_NAND_PAGE);
++        }
++        imx21_nfc_chip_input(s, spare_buf, IMX21_NAND_SPARE);
++    } else {
++        switch ((v >> CONFIG2_FDO_SHIFT) & 7) {
++        case FDO_PAGE:
++            if (!spare_only) {
++                imx21_nfc_chip_output(s, main_buf, IMX21_NAND_PAGE);
++            }
++            imx21_nfc_chip_output(s, spare_buf, IMX21_NAND_SPARE);
++            break;
++        case FDO_ID:
++            main_buf[0] = s->manf_id;
++            main_buf[1] = s->chip_id;
++            main_buf[2] = s->manf_id;
++            main_buf[3] = s->chip_id;
++            main_buf[4] = s->manf_id;
++            main_buf[5] = s->chip_id;
++            break;
++        case FDO_STATUS:
++            main_buf[0] = NAND_STATUS_READY;
++            main_buf[1] = NAND_STATUS_READY;
++            break;
++        }
++    }
++    /* The cycle is over: the start bits clear and INT sets. */
++    s->config2 = (v & ~CONFIG2_START) | CONFIG2_INT;
++}
++
++static uint16_t imx21_nfc_read_reg(IMX21NFCState *s, hwaddr offset)
++{
++    switch (offset) {
++    case NFC_BUFSIZE:
++        return s->bufsize;
++    case NFC_RBA:
++        return s->rba;
++    case NFC_ADDR:
++        return s->addr_reg;
++    case NFC_CMD:
++        return s->cmd_reg;
++    case NFC_CONFIG:
++        return s->config;
++    case NFC_ECC_STATUS:
++    case NFC_ECC_RSLT_MAIN:
++    case NFC_ECC_RSLT_SPARE:
++        return 0;
++    case NFC_WRPROT:
++        return s->wr_prot;
++    case NFC_UNLOCK_START:
++        return s->unlock_start;
++    case NFC_UNLOCK_END:
++        return s->unlock_end;
++    case NFC_WRPR_STAT:
++        return WRPR_STAT_UNLOCKED;
++    case NFC_CONFIG1:
++        return s->config1;
++    case NFC_CONFIG2:
++        return s->config2;
++    default:
++        return 0;
++    }
++}
++
++static void imx21_nfc_write_reg(IMX21NFCState *s, hwaddr offset, uint16_t v)
++{
++    switch (offset) {
++    case NFC_BUFSIZE:
++        s->bufsize = v;
++        break;
++    case NFC_RBA:
++        s->rba = v & 3;
++        break;
++    case NFC_ADDR:
++        s->addr_reg = v;
++        break;
++    case NFC_CMD:
++        s->cmd_reg = v;
++        break;
++    case NFC_CONFIG:
++        s->config = v;
++        break;
++    case NFC_WRPROT:
++        s->wr_prot = v;
++        break;
++    case NFC_UNLOCK_START:
++        s->unlock_start = v;
++        break;
++    case NFC_UNLOCK_END:
++        s->unlock_end = v;
++        break;
++    case NFC_CONFIG1:
++        s->config1 = v & ~CONFIG1_NF_CE;
++        break;
++    case NFC_CONFIG2:
++        if (v & CONFIG2_START) {
++            imx21_nfc_start(s, v);
++        } else {
++            /* Writing 0 to INT acknowledges it. */
++            s->config2 = v;
++        }
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%"
++                      HWADDR_PRIx "\n", __func__, offset);
++        break;
++    }
++    imx21_nfc_update_irq(s);
++}
++
++static uint64_t imx21_nfc_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21NFCState *s = opaque;
++
++    if (offset + size <= IMX21_NFC_BUF_SIZE) {
++        return ldn_le_p(s->buf + offset, size);
++    }
++    if (size == 4) {
++        return imx21_nfc_read_reg(s, offset & ~3) |
++               ((uint32_t)imx21_nfc_read_reg(s, (offset & ~3) + 2) << 16);
++    }
++    return imx21_nfc_read_reg(s, offset & ~1);
++}
++
++static void imx21_nfc_write(void *opaque, hwaddr offset, uint64_t val,
++                            unsigned size)
++{
++    IMX21NFCState *s = opaque;
++
++    if (offset + size <= IMX21_NFC_BUF_SIZE) {
++        stn_le_p(s->buf + offset, size, val);
++        return;
++    }
++    if (size == 4) {
++        imx21_nfc_write_reg(s, offset & ~3, val);
++        imx21_nfc_write_reg(s, (offset & ~3) + 2, val >> 16);
++    } else {
++        imx21_nfc_write_reg(s, offset & ~1, val);
++    }
++}
++
++static const MemoryRegionOps imx21_nfc_ops = {
++    .read = imx21_nfc_read,
++    .write = imx21_nfc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 1,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_nfc_reset(DeviceState *dev)
++{
++    IMX21NFCState *s = IMX21_NFC(dev);
++
++    memset(s->buf, 0xff, sizeof(s->buf));
++    s->bufsize = 1;
++    s->rba = 0;
++    s->addr_reg = 0;
++    s->cmd_reg = 0;
++    s->config = 0;
++    s->wr_prot = 0;
++    s->unlock_start = 0;
++    s->unlock_end = 0;
++    s->config1 = 0;
++    s->config2 = 0;
++    s->cmd = 0;
++    s->naddr = 0;
++    s->page = 0;
++    s->col = 0;
++    s->prog_col = 0;
++    s->area = 0;
++    memset(s->prog, 0xff, sizeof(s->prog));
++    imx21_nfc_update_irq(s);
++}
++
++/*
++ * The chip's contents are not in the migration stream: a writable drive
++ * holds them, every program and erase written through, and a snapshot
++ * restores the drive with the machine. After a restore they are read
++ * again, so that the chip matches the restored drive rather than what
++ * it held before. That waits until the machine runs: during the load
++ * the drive is drained (loadvm) or not yet active (an incoming
++ * migration). Without a writable drive the contents are only in memory
++ * and are kept as they are.
++ */
++static void imx21_nfc_vm_state_change(void *opaque, bool running,
++                                      RunState state)
++{
++    IMX21NFCState *s = opaque;
++    int ret;
++
++    if (!running || !s->reload) {
++        return;
++    }
++    s->reload = false;
++    ret = blk_pread(s->blk, 0, (uint64_t)s->pages * IMX21_NAND_RECORD,
++                    s->data, 0);
++    if (ret < 0) {
++        error_report("%s: reading the flash after a restore failed: %s",
++                     TYPE_IMX21_NFC, strerror(-ret));
++    }
++}
++
++static void imx21_nfc_realize(DeviceState *dev, Error **errp)
++{
++    IMX21NFCState *s = IMX21_NFC(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++    uint64_t size;
++
++    if (!s->pages || !s->pages_per_block) {
++        error_setg(errp, "%s: pages and pages-per-block must be set",
++                   TYPE_IMX21_NFC);
++        return;
++    }
++    size = (uint64_t)s->pages * IMX21_NAND_RECORD;
++    s->data = g_malloc(size);
++    memset(s->data, 0xff, size);
++
++    if (s->blk) {
++        bool ro = !blk_supports_write_perm(s->blk);
++        uint64_t perm = BLK_PERM_CONSISTENT_READ | (ro ? 0 : BLK_PERM_WRITE);
++
++        if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
++            return;
++        }
++        if (!blk_check_size_and_read_all(s->blk, dev, s->data, size, errp)) {
++            return;
++        }
++    }
++
++    memory_region_init_io(&s->iomem, OBJECT(dev), &imx21_nfc_ops, s,
++                          TYPE_IMX21_NFC, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    s->vmstate_change = qemu_add_vm_change_state_handler(
++        imx21_nfc_vm_state_change, s);
++}
++
++static void imx21_nfc_unrealize(DeviceState *dev)
++{
++    IMX21NFCState *s = IMX21_NFC(dev);
++
++    qemu_del_vm_change_state_handler(s->vmstate_change);
++    g_free(s->data);
++}
++
++static const Property imx21_nfc_properties[] = {
++    DEFINE_PROP_DRIVE("drive", IMX21NFCState, blk),
++    DEFINE_PROP_UINT8("manufacturer-id", IMX21NFCState, manf_id, 0xad),
++    DEFINE_PROP_UINT8("chip-id", IMX21NFCState, chip_id, 0x76),
++    DEFINE_PROP_UINT32("pages", IMX21NFCState, pages, 131072),
++    DEFINE_PROP_UINT32("pages-per-block", IMX21NFCState, pages_per_block, 32),
++};
++
++static int imx21_nfc_post_load(void *opaque, int version_id)
++{
++    IMX21NFCState *s = opaque;
++
++    if (s->page >= s->pages || s->col >= IMX21_NAND_RECORD ||
++        s->prog_col > IMX21_NAND_RECORD || s->naddr > sizeof(s->addr) ||
++        (s->area != 0 && s->area != 256 && s->area != IMX21_NAND_PAGE)) {
++        return -EINVAL;
++    }
++    s->reload = s->blk && blk_is_writable(s->blk);
++    return 0;
++}
++
++static const VMStateDescription vmstate_imx21_nfc = {
++    .name = TYPE_IMX21_NFC,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = imx21_nfc_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8_ARRAY(buf, IMX21NFCState, IMX21_NFC_BUF_SIZE),
++        VMSTATE_UINT16(bufsize, IMX21NFCState),
++        VMSTATE_UINT16(rba, IMX21NFCState),
++        VMSTATE_UINT16(addr_reg, IMX21NFCState),
++        VMSTATE_UINT16(cmd_reg, IMX21NFCState),
++        VMSTATE_UINT16(config, IMX21NFCState),
++        VMSTATE_UINT16(wr_prot, IMX21NFCState),
++        VMSTATE_UINT16(unlock_start, IMX21NFCState),
++        VMSTATE_UINT16(unlock_end, IMX21NFCState),
++        VMSTATE_UINT16(config1, IMX21NFCState),
++        VMSTATE_UINT16(config2, IMX21NFCState),
++        VMSTATE_UINT8(cmd, IMX21NFCState),
++        VMSTATE_UINT8_ARRAY(addr, IMX21NFCState, 4),
++        VMSTATE_UINT32(naddr, IMX21NFCState),
++        VMSTATE_UINT32(page, IMX21NFCState),
++        VMSTATE_UINT32(col, IMX21NFCState),
++        VMSTATE_UINT8_ARRAY(prog, IMX21NFCState, IMX21_NAND_RECORD),
++        VMSTATE_UINT32(prog_col, IMX21NFCState),
++        VMSTATE_UINT32(area, IMX21NFCState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_nfc_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = imx21_nfc_realize;
++    dc->unrealize = imx21_nfc_unrealize;
++    dc->vmsd = &vmstate_imx21_nfc;
++    device_class_set_legacy_reset(dc, imx21_nfc_reset);
++    device_class_set_props(dc, imx21_nfc_properties);
++    dc->desc = "i.MX21 NAND flash controller";
++}
++
++static const TypeInfo imx21_nfc_info = {
++    .name = TYPE_IMX21_NFC,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21NFCState),
++    .class_init = imx21_nfc_class_init,
++};
++
++static void imx21_nfc_register_types(void)
++{
++    type_register_static(&imx21_nfc_info);
++}
++
++type_init(imx21_nfc_register_types)
+diff --git a/hw/block/meson.build b/hw/block/meson.build
+--- a/hw/block/meson.build
++++ b/hw/block/meson.build
+@@ -19,3 +19,4 @@ system_ss.add(when: 'CONFIG_VHOST_USER_BLK', if_true: files('vhost-user-blk.c'))
+ system_ss.add(when: 'CONFIG_VHOST_USER_BLK', if_true: files('virtio-blk-common.c'))
+ 
+ subdir('dataplane')
++system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_nfc.c'))
+diff --git a/include/hw/block/imx21_nfc.h b/include/hw/block/imx21_nfc.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/block/imx21_nfc.h
+@@ -0,0 +1,65 @@
++/*
++ * i.MX21 NAND flash controller (NFC) with a small-page NAND chip
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_NFC_H
++#define IMX21_NFC_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_NFC "imx21.nfc"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21NFCState, IMX21_NFC)
++
++/* A page is 512 data bytes and 16 spare bytes. */
++#define IMX21_NAND_PAGE         512
++#define IMX21_NAND_SPARE        16
++#define IMX21_NAND_RECORD       (IMX21_NAND_PAGE + IMX21_NAND_SPARE)
++#define IMX21_NFC_BUF_SIZE      0x840
++
++struct IMX21NFCState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    BlockBackend *blk;
++    /* After a restore: read the contents again before the machine runs */
++    struct VMChangeStateEntry *vmstate_change;
++    bool reload;
++
++    /* The chip's identity and size. */
++    uint8_t manf_id;
++    uint8_t chip_id;
++    uint32_t pages;
++    uint32_t pages_per_block;
++
++    /* The controller. */
++    uint8_t buf[IMX21_NFC_BUF_SIZE];
++    uint16_t bufsize;
++    uint16_t rba;
++    uint16_t addr_reg;
++    uint16_t cmd_reg;
++    uint16_t config;
++    uint16_t wr_prot;
++    uint16_t unlock_start;
++    uint16_t unlock_end;
++    uint16_t config1;
++    uint16_t config2;
++
++    /* The chip: its contents as records of data then spare. */
++    uint8_t *data;
++    uint8_t cmd;
++    uint8_t addr[4];
++    uint32_t naddr;
++    uint32_t page;
++    uint32_t col;
++    uint8_t prog[IMX21_NAND_RECORD];
++    uint32_t prog_col;
++    uint32_t area;
++};
++
++#endif /* IMX21_NFC_H */

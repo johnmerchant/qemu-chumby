@@ -529,6 +529,27 @@ jobs:
             fi
           done < "$RUNNER_TEMP/assets"
 
+  # ./dev-series: the patches, imported into the pinned release as commits
+  # and exported again, come back byte for byte.
+  patches:
+    name: Patch series round trip
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import and export
+        run: |
+          . ./qemu-release
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/qemu.tar.xz" "$url"
+          echo "$sha256  $RUNNER_TEMP/qemu.tar.xz" | sha256sum -c
+          mkdir "$RUNNER_TEMP/src" "$RUNNER_TEMP/out"
+          tar -C "$RUNNER_TEMP/src" --strip-components=1 -xf "$RUNNER_TEMP/qemu.tar.xz"
+          git config --global user.name CI
+          git config --global user.email ci@invalid
+          python3 -I ./dev-series import "$RUNNER_TEMP/src"
+          python3 -I ./dev-series export "$RUNNER_TEMP/src" "$RUNNER_TEMP/out"
+          diff -r patches "$RUNNER_TEMP/out"
+
   # The project's page (site/build-site), from this commit's README.md and
   # patches/ and the builds' .sha256 files: built on every run as a check,
   # and uploaded as the Pages artifact that `pages` deploys.

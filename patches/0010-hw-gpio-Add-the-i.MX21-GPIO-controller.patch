@@ -1,0 +1,348 @@
+Description: hw/gpio: Add the i.MX21 GPIO controller
+ Six 32-pin ports sharing one interrupt, with edge and level interrupt
+ sensing and the port interrupt mask. This is the i.MX1-style GPIO block,
+ not the i.MX31 one.
+ .
+ Each pin also has an output line, numbered like its input (port * 32 +
+ pin), carrying the pin's level: the data register for pins configured
+ as outputs, the level driven from outside for inputs. A line changes
+ only when its pin's level does, after a register write, an input change
+ or a reset. The Chumby Classic's sensor card is selected this way: the
+ stock driver (chumby_accel.c) drives PD28 and PD27 by hand through the
+ port's data register, and the card decodes them into its chip selects.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+diff --git a/MAINTAINERS b/MAINTAINERS
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -871,6 +871,7 @@ Chumby Classic (i.MX21)
+ M: John Merchant <john@johnmerchant.dev>
+ L: qemu-arm@nongnu.org
+ S: Maintained
++F: hw/gpio/imx21_gpio.c
+ F: hw/intc/imx21_aitc.c
+ F: hw/misc/imx21_*.c
+ F: hw/timer/imx21_gpt.c
+diff --git a/hw/gpio/imx21_gpio.c b/hw/gpio/imx21_gpio.c
+new file mode 100644
+--- /dev/null
++++ b/hw/gpio/imx21_gpio.c
+@@ -0,0 +1,265 @@
++/*
++ * i.MX21 GPIO ports A-F
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * Six 32-pin ports, 0x100 apart, sharing one interrupt, with a port
++ * interrupt mask (PMASK) at 0x600. This is the i.MX1-style GPIO, not the
++ * i.MX31 one. Pins configured as inputs read the level driven on the
++ * device's GPIO inputs, idling high (pulled up). The GPIO outputs, one per
++ * pin and numbered like the inputs, follow each pin's level.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/gpio/imx21_gpio.h"
++#include "hw/core/irq.h"
++#include "migration/vmstate.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++
++#define DDIR    0x00
++#define DR      0x1c
++#define SSR     0x24
++#define ICR1    0x28
++#define ICR2    0x2c
++#define IMR     0x30
++#define ISR     0x34
++#define PMASK   0x600
++
++enum {
++    SENSE_RISING = 0,
++    SENSE_FALLING = 1,
++    SENSE_HIGH = 2,
++    SENSE_LOW = 3,
++};
++
++static uint32_t imx21_gpio_level(IMX21GPIOState *s, int port)
++{
++    uint32_t dir = s->regs[port][DDIR / 4];
++    uint32_t out = s->regs[port][DR / 4] & dir;
++
++    return out | (s->pins[port] & ~dir);
++}
++
++/* Drives the GPIO outputs of the pins whose level changed from @old. */
++static void imx21_gpio_set_outputs(IMX21GPIOState *s, int port, uint32_t old)
++{
++    uint32_t level = imx21_gpio_level(s, port);
++    uint32_t changed = old ^ level;
++    int pin;
++
++    for (pin = 0; pin < IMX21_GPIO_PINS_PER_PORT; pin++) {
++        if (changed & (1u << pin)) {
++            qemu_set_irq(s->output[port * IMX21_GPIO_PINS_PER_PORT + pin],
++                         !!(level & (1u << pin)));
++        }
++    }
++}
++
++static int imx21_gpio_sense(IMX21GPIOState *s, int port, int pin)
++{
++    return extract32(s->regs[port][ICR1 / 4 + pin / 16], (pin % 16) * 2, 2);
++}
++
++/* Latches level-sensitive interrupts for the current levels. */
++static void imx21_gpio_latch_levels(IMX21GPIOState *s, int port)
++{
++    uint32_t level = imx21_gpio_level(s, port);
++    int pin;
++
++    for (pin = 0; pin < IMX21_GPIO_PINS_PER_PORT; pin++) {
++        bool high = level & (1u << pin);
++
++        switch (imx21_gpio_sense(s, port, pin)) {
++        case SENSE_HIGH:
++            if (high) {
++                s->isr[port] |= 1u << pin;
++            }
++            break;
++        case SENSE_LOW:
++            if (!high) {
++                s->isr[port] |= 1u << pin;
++            }
++            break;
++        }
++    }
++}
++
++static void imx21_gpio_update(IMX21GPIOState *s)
++{
++    bool irq = false;
++    int port;
++
++    for (port = 0; port < IMX21_GPIO_NUM_PORTS; port++) {
++        if ((s->pmask & (1 << port)) &&
++            (s->isr[port] & s->regs[port][IMR / 4])) {
++            irq = true;
++        }
++    }
++    qemu_set_irq(s->irq, irq);
++}
++
++static void imx21_gpio_set(void *opaque, int line, int level)
++{
++    IMX21GPIOState *s = opaque;
++    int port = line / IMX21_GPIO_PINS_PER_PORT;
++    int pin = line % IMX21_GPIO_PINS_PER_PORT;
++    uint32_t bit = 1u << pin;
++    uint32_t old = imx21_gpio_level(s, port), new;
++
++    s->pins[port] = level ? s->pins[port] | bit : s->pins[port] & ~bit;
++    new = imx21_gpio_level(s, port);
++    if ((old ^ new) & bit) {
++        int sense = imx21_gpio_sense(s, port, pin);
++
++        if ((sense == SENSE_RISING && (new & bit)) ||
++            (sense == SENSE_FALLING && !(new & bit))) {
++            s->isr[port] |= bit;
++        }
++    }
++    imx21_gpio_latch_levels(s, port);
++    imx21_gpio_update(s);
++    imx21_gpio_set_outputs(s, port, old);
++}
++
++static uint64_t imx21_gpio_read(void *opaque, hwaddr offset, unsigned size)
++{
++    IMX21GPIOState *s = opaque;
++    int port = offset / 0x100;
++    hwaddr reg = offset % 0x100;
++
++    if (offset == PMASK) {
++        return s->pmask;
++    }
++    if (port >= IMX21_GPIO_NUM_PORTS || reg >= IMX21_GPIO_NUM_REGS * 4) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return 0;
++    }
++    switch (reg) {
++    case SSR:
++        return imx21_gpio_level(s, port);
++    case ISR:
++        return s->isr[port];
++    default:
++        return s->regs[port][reg / 4];
++    }
++}
++
++static void imx21_gpio_write(void *opaque, hwaddr offset, uint64_t val,
++                             unsigned size)
++{
++    IMX21GPIOState *s = opaque;
++    int port = offset / 0x100;
++    hwaddr reg = offset % 0x100;
++    uint32_t old;
++
++    if (offset == PMASK) {
++        s->pmask = val & 0x3f;
++        imx21_gpio_update(s);
++        return;
++    }
++    if (port >= IMX21_GPIO_NUM_PORTS || reg >= IMX21_GPIO_NUM_REGS * 4) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: bad register at 0x%" HWADDR_PRIx
++                      "\n", __func__, offset);
++        return;
++    }
++    old = imx21_gpio_level(s, port);
++    switch (reg) {
++    case ISR:
++        s->isr[port] &= ~val;
++        break;
++    case SSR:
++        return;
++    default:
++        s->regs[port][reg / 4] = val;
++        break;
++    }
++    imx21_gpio_latch_levels(s, port);
++    imx21_gpio_update(s);
++    imx21_gpio_set_outputs(s, port, old);
++}
++
++static const MemoryRegionOps imx21_gpio_ops = {
++    .read = imx21_gpio_read,
++    .write = imx21_gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 4,
++        .max_access_size = 4,
++    },
++};
++
++static void imx21_gpio_reset(DeviceState *dev)
++{
++    IMX21GPIOState *s = IMX21_GPIO(dev);
++    uint32_t old[IMX21_GPIO_NUM_PORTS];
++    int port;
++
++    for (port = 0; port < IMX21_GPIO_NUM_PORTS; port++) {
++        old[port] = imx21_gpio_level(s, port);
++    }
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->isr, 0, sizeof(s->isr));
++    for (port = 0; port < IMX21_GPIO_NUM_PORTS; port++) {
++        s->pins[port] = 0xffffffff;
++    }
++    s->pmask = 0x3f;
++    imx21_gpio_update(s);
++    for (port = 0; port < IMX21_GPIO_NUM_PORTS; port++) {
++        imx21_gpio_set_outputs(s, port, old[port]);
++    }
++}
++
++static void imx21_gpio_init(Object *obj)
++{
++    IMX21GPIOState *s = IMX21_GPIO(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &imx21_gpio_ops, s,
++                          TYPE_IMX21_GPIO, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_in(DEVICE(obj), imx21_gpio_set, IMX21_GPIO_NUM_PINS);
++    qdev_init_gpio_out(DEVICE(obj), s->output, IMX21_GPIO_NUM_PINS);
++}
++
++static const VMStateDescription vmstate_imx21_gpio = {
++    .name = TYPE_IMX21_GPIO,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_2DARRAY(regs, IMX21GPIOState, IMX21_GPIO_NUM_PORTS,
++                               IMX21_GPIO_NUM_REGS),
++        VMSTATE_UINT32_ARRAY(isr, IMX21GPIOState, IMX21_GPIO_NUM_PORTS),
++        VMSTATE_UINT32_ARRAY(pins, IMX21GPIOState, IMX21_GPIO_NUM_PORTS),
++        VMSTATE_UINT32(pmask, IMX21GPIOState),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static void imx21_gpio_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_imx21_gpio;
++    device_class_set_legacy_reset(dc, imx21_gpio_reset);
++    dc->desc = "i.MX21 GPIO";
++}
++
++static const TypeInfo imx21_gpio_info = {
++    .name = TYPE_IMX21_GPIO,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(IMX21GPIOState),
++    .instance_init = imx21_gpio_init,
++    .class_init = imx21_gpio_class_init,
++};
++
++static void imx21_gpio_register_types(void)
++{
++    type_register_static(&imx21_gpio_info);
++}
++
++type_init(imx21_gpio_register_types)
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -19,3 +19,4 @@ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_gpio.c'))
+ system_ss.add(when: 'CONFIG_ASPEED_SOC', if_true: files('aspeed_sgpio.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_GPIO', if_true: files('sifive_gpio.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
++system_ss.add(when: 'CONFIG_FSL_IMX21', if_true: files('imx21_gpio.c'))
+diff --git a/include/hw/gpio/imx21_gpio.h b/include/hw/gpio/imx21_gpio.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/gpio/imx21_gpio.h
+@@ -0,0 +1,37 @@
++/*
++ * i.MX21 GPIO ports A-F
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef IMX21_GPIO_H
++#define IMX21_GPIO_H
++
++#include "hw/core/sysbus.h"
++#include "qom/object.h"
++
++#define TYPE_IMX21_GPIO "imx21.gpio"
++OBJECT_DECLARE_SIMPLE_TYPE(IMX21GPIOState, IMX21_GPIO)
++
++#define IMX21_GPIO_NUM_PORTS 6
++#define IMX21_GPIO_PINS_PER_PORT 32
++#define IMX21_GPIO_NUM_PINS (IMX21_GPIO_NUM_PORTS * IMX21_GPIO_PINS_PER_PORT)
++#define IMX21_GPIO_NUM_REGS (0x44 / 4)
++
++struct IMX21GPIOState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    qemu_irq irq;
++    qemu_irq output[IMX21_GPIO_NUM_PINS];
++
++    uint32_t regs[IMX21_GPIO_NUM_PORTS][IMX21_GPIO_NUM_REGS];
++    uint32_t isr[IMX21_GPIO_NUM_PORTS];
++    /* Levels driven on the pins from outside; inputs idle high. */
++    uint32_t pins[IMX21_GPIO_NUM_PORTS];
++    uint32_t pmask;
++};
++
++#endif /* IMX21_GPIO_H */

@@ -68,6 +68,13 @@ The patches apply to QEMU 11.1.2 (`qemu-release` pins the tarball and its
 SHA-256). CI's daily `qemu-sync` job (`./qemu-sync`) proposes each newer
 release as a pull request, whose CI says whether they still apply.
 
+Each patch is a DEP-3 header (`Description:`, `Author:`, then
+`Upstream-Status: Inappropriate [AI generated code]`, `Signed-off-by:`
+and `Claude-Session:`), a line `---` and the diff; new patches carry the
+same header. `./dev-series import DIR` makes a QEMU 11.1.2 tree a git
+tree with one commit per patch, and `./dev-series export DIR` writes
+them back, byte for byte (CI checks the round trip).
+
 ## Images
 
 The stock firmware boots from two files from your own Chumby's flash
