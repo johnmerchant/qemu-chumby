@@ -98,7 +98,7 @@ jobs:
       - name: Restore the QEMU tarball
         uses: actions/cache@v4
         with:
-          path: build/qemu-*.tar.xz
+          path: out/qemu-*.tar.xz
           key: qemu-tarball-${{ hashFiles('qemu-release') }}
 
       # The binary, keyed by everything it's built from: a hit skips the
@@ -107,15 +107,17 @@ jobs:
         id: cache
         uses: actions/cache@v4
         with:
-          path: build/obj/qemu-system-arm
+          path: out/obj/qemu-system-arm
           key: qemu-${{ matrix.platform }}-${{ matrix.container || matrix.runner }}-${{ hashFiles('build', 'qemu-release', 'patches/*.patch') }}
 
+      # Into out/: ./build's default directory, build/ beside it, is the
+      # script itself.
       - name: Build
         if: steps.cache.outputs.cache-hit != 'true'
-        run: ./build
+        run: ./build out
 
       - name: Smoke test
-        run: python3 .ci/tests/smoke/run build/obj/qemu-system-arm
+        run: python3 .ci/tests/smoke/run out/obj/qemu-system-arm
 
       - name: Package
         id: package
@@ -123,7 +125,7 @@ jobs:
           name=qemu-chumby-$COMMIT-${{ matrix.platform }}
           . ./qemu-release
           mkdir -p "dist/$name"
-          cp build/obj/qemu-system-arm COPYING "dist/$name/"
+          cp out/obj/qemu-system-arm COPYING "dist/$name/"
           {
             echo "qemu-system-arm with the chumby-classic machine"
             echo
@@ -141,14 +143,14 @@ jobs:
               echo "  apt-get install libglib2.0-0t64 libpixman-1-0 libpng16-16t64 zlib1g"
               echo
               echo "Shared libraries (ldd):"
-              ldd build/obj/qemu-system-arm | sed 's/ (0x[0-9a-f]*)$//'
+              ldd out/obj/qemu-system-arm | sed 's/ (0x[0-9a-f]*)$//'
             else
               echo "Needs macOS 15 or later on Apple silicon, and Homebrew's glib,"
               echo "pixman and libpng:"
               echo "  brew install glib pixman libpng"
               echo
               echo "Shared libraries (otool -L):"
-              otool -L build/obj/qemu-system-arm | tail -n +2
+              otool -L out/obj/qemu-system-arm | tail -n +2
             fi
           } > "dist/$name/RUNTIME"
           cat "dist/$name/RUNTIME"
