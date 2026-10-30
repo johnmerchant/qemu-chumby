@@ -7,8 +7,8 @@
 # beside this script); the result is DIR/obj/qemu-system-arm.
 #
 # Needs a C compiler, ninja, python3, pkg-config, glib, pixman, libpng and
-# zlib (see README.md), plus curl or wget, patch, and xz or a tar that
-# reads .tar.xz (as on macOS).
+# zlib, plus curl or wget, patch, and xz or a tar that reads .tar.xz (as
+# on macOS); it checks, and lists each system's packages if any is missing.
 #
 # --portable builds the binary CI publishes, which needs nothing installed
 # to run, and only what the machine uses: no network backends, no TLS or
@@ -37,6 +37,48 @@ if [ "${1:-}" = --portable ]; then
 fi
 
 out=${1:-$here/build}
+
+# What the build needs, checked before anything is fetched; when something
+# is missing, the packages that give it on each system.
+missing=
+for c in cc ninja python3 pkg-config patch; do
+    command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
+done
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || missing="$missing curl"
+# (macOS --portable builds its own libraries.)
+if command -v pkg-config >/dev/null 2>&1 && ! { [ -n "$portable" ] && [ "$(uname -s)" = Darwin ]; }; then
+    for m in glib-2.0 pixman-1 libpng zlib; do
+        pkg-config --exists "$m" || missing="$missing $m"
+    done
+fi
+if [ -n "$missing" ]; then
+    echo "build: missing:$missing" >&2
+    if [ -n "$portable" ]; then
+        cat >&2 <<'EOF'
+--portable needs, on Alpine: build-base python3 ninja pkgconf linux-headers
+  curl xz patch git glib-dev glib-static pcre2-dev pcre2-static pixman-dev
+  pixman-static libpng-dev libpng-static zlib-dev zlib-static
+and on macOS: the Command Line Tools, ninja and pkg-config.
+EOF
+    else
+        cat >&2 <<'EOF'
+Install the build's dependencies:
+  Debian, Ubuntu: build-essential python3 python3-venv ninja-build pkg-config
+    libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev libfdt-dev curl
+    xz-utils
+  Fedora: gcc make python3 ninja-build pkgconf glib2-devel pixman-devel
+    libpng-devel zlib-devel libfdt-devel curl xz patch
+  Arch: base-devel python ninja pkgconf glib2 pixman libpng zlib dtc curl
+  macOS (Homebrew): python ninja pkg-config glib pixman libpng
+For a window and sound on Linux, add GTK or SDL and your sound server's
+development packages (Debian, Ubuntu: libgtk-3-dev libsdl2-dev
+libpipewire-0.3-dev libpulse-dev libasound2-dev); on macOS the Cocoa
+window and CoreAudio are built in. Or, with Nix: nix develop -c ./build
+EOF
+    fi
+    exit 1
+fi
+
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 cd "$out"

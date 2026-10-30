@@ -13,6 +13,23 @@ usage: chumby-image mkpsp DIR OUT        JFFS2 image of a settings directory
                      a full NAND image: the partitions from a backup's
                      nanddumps, PSP (a JFFS2 image) as the settings
                      partition, and the Cache partition erased
+
+BACKUP holds the mtdN-*.nanddump files nanddump writes for each partition
+of your own Chumby's flash. mknand's OUT is the whole 64 MiB chip in
+nanddump's layout: 131072 records of a page's 512 data bytes then its 16
+spare (OOB) bytes, 69206016 bytes in all.
+
+A fresh, factory-like settings DIR for mkpsp:
+  hostname              chumby
+  timezone, localtime   UTC, and the root disk's own UTC zone file
+  ts_settings           0,4095,4095,-4095,0: the ADC's full range, which
+                        the emulated touchscreen reports against
+  firsttime             0, so the boot keeps that calibration
+  volume, mute, pan     50, 0, 0
+
+The kernel is the zImage at the start of the Kernel1 partition; its
+length is the word at offset 0x2c of its header:
+  head -c $((0xLENGTH)) BACKUP/mtd4-Kernel1.bin > zImage
 ";
 
 fn mkpsp(dir: &str, out: &str) -> Result<(), String> {
@@ -38,6 +55,10 @@ fn mknand(backup: &str, psp: &str, out: &str) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let r = match args.first().map(String::as_str) {
+        Some("-h" | "--help") => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Some("mkpsp") if args.len() == 3 => mkpsp(&args[1], &args[2]),
         Some("mknand") if args.len() == 4 => mknand(&args[1], &args[2], &args[3]),
         _ => Err(USAGE.into()),

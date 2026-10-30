@@ -21,6 +21,43 @@ Besides the machine, the images a run needs and a few that it makes:
 `mkfat` (a stick image of a directory), and `jffs2` and `nand_with`
 (a NAND image with a partition's contents replaced, such as the settings
 partition from a directory).
+
+The control surface this relies on is standard QEMU, and the machine's
+docs page (docs/system/arm/chumby-classic.rst, in patches/) describes its
+devices; its "Frontend interface" section is the reference for the stable
+names (properties, query-chumby-state, the CHUMBY_* events). What a
+harness also needs to know:
+
+- Kernel: -kernel takes a zImage, entered with ATAGs (64 MiB at
+  0xC0000000, the command line) as machine type 851, MX21ADS.
+- NAND: -drive if=mtd,format=raw, exactly 69206016 bytes (131072 records
+  of a page's 512 data bytes then its 16 spare bytes; 32 pages to an
+  erase block), or startup fails; without one the chip is blank (0xFF).
+  Programs and erases go to the file as they happen, unless snapshot=on
+  (a temporary overlay) or readonly=on (kept in memory).
+- Console: UART1 (the kernel's ttyS0; the baud rate is ignored) is the
+  first -serial, here a unix socket with a log. Its receive FIFO holds 32
+  characters and the guest sees overruns beyond that, so `type` sends 16
+  at a time a little apart; lines end with CR. UART2 and UART4 are the
+  second and fourth -serial; UART3 is the crypto processor.
+- Touch: input-send-event's abs x and y run 0-32767 across the screen,
+  mapped linearly onto the ADC's 0-4095 (`axis` gives a pixel's centre);
+  with the settings partition's neutral calibration, /psp/ts_settings of
+  0,4095,4095,-4095,0, screen pixels match. A tap is the left button
+  down for 100-200 ms; the stock kernel polls the top button, so a press
+  must last a while to be seen (300 ms).
+- Screen: screendump with an absolute filename, "png" (8-bit RGB) or
+  "ppm": the 320x240 frame as the LCD controller composes it.
+- Sound: -audiodev wav leaves the WAV header's sizes at zero when QEMU
+  exits; the samples start after its 44 bytes.
+- State: savevm NAME saves the running machine into a qcow2 drive (the
+  NAND as a qcow2 overlay of the image: qemu-img create -f qcow2 -b
+  nand.img -F raw nand.qcow2), -loadvm NAME restores it in a fraction of a
+  second. A state saved with -icount loads only with it, and one saved
+  without, only without.
+- Time: by default the emulated clock follows the host's, as for a person
+  at the screen; -icount shift=auto,sleep=off (`fast`) runs it ahead
+  while the guest idles, which boots in seconds but plays sound fast.
 """
 import json
 import os
