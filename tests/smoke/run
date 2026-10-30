@@ -3,14 +3,20 @@
 """tests/smoke/run [QEMU]: boots the chumby-classic machine on a kernel of
 a few instructions, made here, and checks it through chumby-machine: the
 console shows what the kernel writes to UART1, QMP answers with the board's
-lines, the screen can be dumped as a PNG, the top button and the
+lines, the screen can be dumped as a PNG and read over VNC on a unix
+socket, a USB keyboard and stick are plugged in, the top button and the
 accelerometer can be set, and QEMU quits when asked.
 
 No firmware, no network (chumby-machine runs QEMU with -nic none), no
 display: it runs on any CI runner. QEMU is the argument, else $QEMU, else
 build/obj/qemu-system-arm.
+
+tests/smoke/run --kernel FILE writes the kernel to FILE and quits, for a
+boot without Python (qemu-system-arm -M chumby-classic -kernel FILE -nic
+none -display none -serial stdio prints MESSAGE).
 """
 import os
+import socket
 import struct
 import sys
 import tempfile
@@ -47,6 +53,28 @@ def kernel():
     return struct.pack(f"<{len(CODE)}I", *CODE) + MESSAGE + b"\0"
 
 
+def rfb(path):
+    """The framebuffer's size, from an RFB handshake on the unix socket
+    PATH (no authentication, as QEMU's -vnc unix:PATH offers)."""
+    with socket.socket(socket.AF_UNIX) as s:
+        s.settimeout(10)
+        cm.connect(s, path)
+        f = s.makefile("rwb")
+        if f.read(12) != b"RFB 003.008\n":
+            return None
+        f.write(b"RFB 003.008\n")
+        f.flush()
+        if 1 not in f.read(f.read(1)[0]):
+            return None
+        f.write(b"\x01")
+        f.flush()
+        if f.read(4) != b"\0\0\0\0":
+            return None
+        f.write(b"\x01")
+        f.flush()
+        return struct.unpack(">HH", f.read(4))
+
+
 def check(what, ok, detail=""):
     print(f"{'ok' if ok else 'FAIL'}: {what}{': ' + str(detail) if detail else ''}", flush=True)
     if not ok:
@@ -60,9 +88,14 @@ def main():
         zimage = os.path.join(tmp, "smoke.bin")
         with open(zimage, "wb") as f:
             f.write(kernel())
+        stick = os.path.join(tmp, "stick.img")
+        with open(stick, "wb") as f:
+            f.truncate(1 << 20)
         m = cm.Machine(os.path.join(tmp, "m"))
         try:
-            m.start(zimage, qemu=qemu)
+            # The VNC socket in the machine's directory, where QEMU runs.
+            m.start(zimage, qemu=qemu, stick=stick,
+                    extra=("-vnc", "unix:vnc.sock", "-device", "usb-kbd"))
             argv = m.config()["argv"]
             check("QEMU runs with -nic none", "-nic" in argv and argv[argv.index("-nic") + 1] == "none")
             check("the console", m.wait_log(r"smoke kernel up", 30).group(0) == "smoke kernel up")
@@ -76,6 +109,13 @@ def main():
                 head = f.read(24)
             size = struct.unpack(">II", head[16:24]) if head[:8] == b"\x89PNG\r\n\x1a\n" else None
             check("a PNG of the 320x240 screen", size == (cm.W, cm.H), size)
+            size = rfb(os.path.join(tmp, "m", "vnc.sock"))
+            check("the screen over VNC on a unix socket", size == (cm.W, cm.H), size)
+
+            with m.qmp() as q:
+                usb = q.cmd("human-monitor-command", **{"command-line": "info usb"})
+            check("a USB keyboard and stick", "QEMU USB Keyboard" in usb and "QEMU USB MSD" in usb,
+                  "; ".join(x.strip() for x in usb.splitlines() if x.strip()))
 
             m.button("down")
             check("the top button", m.chumby_state().get("button") is True)
@@ -90,6 +130,10 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--kernel":
+        with open(sys.argv[2], "wb") as f:
+            f.write(kernel())
+        sys.exit(0)
     try:
         main()
     except cm.Error as e:

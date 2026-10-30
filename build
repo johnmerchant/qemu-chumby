@@ -1,18 +1,40 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# build [DIR]: fetches the pinned QEMU release, checks its SHA-256, applies
-# the patches and builds qemu-system-arm with the chumby-classic machine.
-# Everything happens in DIR (default: ./build beside this script); the
-# result is DIR/obj/qemu-system-arm.
+# build [--portable] [DIR]: fetches the pinned QEMU release, checks its
+# SHA-256, applies the patches and builds qemu-system-arm with the
+# chumby-classic machine. Everything happens in DIR (default: ./build
+# beside this script); the result is DIR/obj/qemu-system-arm.
 #
 # Needs a C compiler, ninja, python3, pkg-config, glib, pixman, libpng and
 # zlib (see README.md), plus curl or wget, patch, and xz or a tar that
 # reads .tar.xz (as on macOS).
+#
+# --portable builds the binary CI publishes, which needs nothing installed
+# to run, and only what the machine uses: no network backends, no TLS or
+# other optional libraries, VNC (unix sockets too) and PNG screendumps.
+#   Linux: a static binary (-static-pie), linked against static glib,
+#     pixman, libpng and zlib; on Alpine, with build-base python3 ninja
+#     pkgconf linux-headers git, and glib, pcre2, pixman, libpng and
+#     zlib's -dev and -static packages. No window, and no sound
+#     (-audiodev none or wav).
+#   macOS: glib, pixman and libpng (portable-deps) are built here as
+#     static libraries, so the binary links only the system's libraries
+#     and frameworks. The Cocoa window and CoreAudio are kept. Needs only
+#     the Command Line Tools, ninja, python3 and pkg-config; nothing found
+#     under Homebrew or elsewhere is used.
+# Its result is DIR/portable, which can be copied anywhere: qemu-system-arm
+# and, in qemu-bundle/ beside it where QEMU looks, the keymaps VNC loads.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/qemu-release"
+
+portable=
+if [ "${1:-}" = --portable ]; then
+    portable=yes
+    shift
+fi
 
 out=${1:-$here/build}
 mkdir -p "$out"
@@ -27,21 +49,41 @@ sha256() {
     fi
 }
 
-tarball=qemu-$version.tar.xz
-if [ ! -f "$tarball" ]; then
-    echo "fetching $url"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fL -o "$tarball.part" "$url"
-    else
-        wget -O "$tarball.part" "$url"
+# fetch URL SHA256: the tarball at URL, kept in DIR under its own name,
+# fetched unless it's there, and checked.
+fetch() {
+    f=$(basename "$1")
+    if [ ! -f "$out/$f" ]; then
+        echo "fetching $1"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL -o "$out/$f.part" "$1"
+        else
+            wget -O "$out/$f.part" "$1"
+        fi
+        mv "$out/$f.part" "$out/$f"
     fi
-    mv "$tarball.part" "$tarball"
-fi
-got=$(sha256 "$tarball")
-if [ "$got" != "$sha256" ]; then
-    echo "$tarball: SHA-256 is $got, expected $sha256" >&2
-    exit 1
-fi
+    got=$(sha256 "$out/$f")
+    if [ "$got" != "$2" ]; then
+        echo "$f: SHA-256 is $got, expected $2" >&2
+        exit 1
+    fi
+}
+
+# extract TARBALL: into the current directory.
+extract() {
+    case $1 in
+        *.xz)
+            if command -v xz >/dev/null 2>&1; then
+                xz -dc "$1" | tar xf -
+            else
+                tar xJf "$1"
+            fi ;;
+        *) tar xzf "$1" ;;
+    esac
+}
+
+tarball=qemu-$version.tar.xz
+fetch "$url" "$sha256"
 
 # The source tree is extracted and patched again only when the patches
 # change, so that rebuilds are incremental.
@@ -50,11 +92,7 @@ src=qemu-$version
 if [ "$(cat "$src/.chumby-patches" 2>/dev/null || true)" != "$stamp" ]; then
     rm -rf "$src" obj
     echo "extracting $tarball"
-    if command -v xz >/dev/null 2>&1; then
-        xz -dc "$tarball" | tar xf -
-    else
-        tar xJf "$tarball"
-    fi
+    extract "$tarball"
     for p in "$here"/patches/*.patch; do
         echo "applying $(basename "$p")"
         patch -s -p1 -d "$src" < "$p"
@@ -62,11 +100,130 @@ if [ "$(cat "$src/.chumby-patches" 2>/dev/null || true)" != "$stamp" ]; then
     echo "$stamp" > "$src/.chumby-patches"
 fi
 
+# macOS --portable: glib, pixman and libpng as static libraries in
+# DIR/deps/prefix, and pkg-config that sees only them (and, for zlib and
+# libffi, the system's), asked for what a static link needs.
+deps() {
+    . "$here/portable-deps"
+    d=$out/deps
+    p=$d/prefix
+    dstamp=$(sha256 "$here/portable-deps")
+    if [ "$(cat "$p/.chumby-deps" 2>/dev/null || true)" = "$dstamp" ]; then
+        return
+    fi
+    rm -rf "$d"
+    mkdir -p "$d/bin" "$p/lib/pkgconfig"
+    fetch "$glib_url" "$glib_sha256"
+    fetch "$pixman_url" "$pixman_sha256"
+    fetch "$libpng_url" "$libpng_sha256"
+
+    # meson: QEMU's own copy.
+    python3 -m venv "$d/venv"
+    "$d/venv/bin/pip" install -q --no-index "$out/$src"/python/wheels/meson-*.whl
+    meson=$d/venv/bin/meson
+
+    real=$(command -v pkg-config)
+    cat > "$d/bin/pkg-config" <<EOF
+#!/bin/sh
+PKG_CONFIG_LIBDIR='$p/lib/pkgconfig' PKG_CONFIG_PATH= exec '$real' --static "\$@"
+EOF
+    chmod +x "$d/bin/pkg-config"
+
+    sdk=$(xcrun --show-sdk-path)
+    cat > "$p/lib/pkgconfig/zlib.pc" <<EOF
+Name: zlib
+Description: the system's zlib
+Version: 1.2.12
+Libs: -lz
+EOF
+    cat > "$p/lib/pkgconfig/libffi.pc" <<EOF
+Name: libffi
+Description: the system's libffi
+Version: 3.4.0
+Cflags: -I$sdk/usr/include/ffi
+Libs: -lffi
+EOF
+
+    cd "$d"
+    extract "$out/$(basename "$pixman_url")"
+    extract "$out/$(basename "$glib_url")"
+    extract "$out/$(basename "$libpng_url")"
+
+    PKG_CONFIG=$d/bin/pkg-config
+    export PKG_CONFIG
+
+    "$meson" setup "pixman-$pixman_version/b" "pixman-$pixman_version" \
+        --prefix="$p" --libdir=lib --buildtype=release --default-library=static \
+        -Dtests=disabled -Ddemos=disabled -Dgtk=disabled -Dlibpng=disabled \
+        -Dopenmp=disabled
+    "$meson" install -C "pixman-$pixman_version/b"
+
+    # Its subprojects (pcre2, proxy-libintl) static too.
+    "$meson" setup "glib-$glib_version/b" "glib-$glib_version" \
+        --prefix="$p" --libdir=lib --buildtype=release --default-library=static \
+        --wrap-mode=default -Dtests=false -Dinstalled_tests=false \
+        -Dintrospection=disabled -Dnls=disabled -Dman-pages=disabled \
+        -Ddocumentation=false -Dsysprof=disabled -Dlibelf=disabled \
+        -Dlibmount=disabled -Dselinux=disabled -Dxattr=false -Ddtrace=disabled \
+        -Dsystemtap=disabled
+    "$meson" install -C "glib-$glib_version/b"
+
+    (cd "libpng-$libpng_version" &&
+        ./configure --prefix="$p" --disable-shared --enable-static)
+    make -C "libpng-$libpng_version" -j"$(sysctl -n hw.ncpu)" install
+
+    unset PKG_CONFIG
+    cd "$out"
+    echo "$dstamp" > "$p/.chumby-deps"
+}
+
+default="--target-list=arm-softmmu --disable-docs --disable-tools --disable-werror"
+opts=$default
+prefix=/usr/local
+if [ -n "$portable" ]; then
+    # Every optional feature off, then only what the machine uses back on.
+    opts="$opts --prefix=$prefix --without-default-features --disable-plugins
+          --enable-fdt=internal --enable-pixman --enable-png --enable-vnc"
+    case $(uname -s) in
+        Linux) opts="$opts --static" ;;
+        Darwin)
+            deps
+            opts="$opts --enable-cocoa --enable-coreaudio"
+            # Kept by configure for meson's reconfigures.
+            PKG_CONFIG=$out/deps/bin/pkg-config
+            export PKG_CONFIG
+            ;;
+        *) echo "--portable: Linux or macOS only" >&2; exit 1 ;;
+    esac
+fi
+opts=$(echo $opts)
+
+# Configured again when the options change (a build from before they were
+# kept had the default ones).
+if [ -d obj ] && [ "$(cat obj/.chumby-configure 2>/dev/null || echo "$default")" != "$opts" ]; then
+    rm -rf obj
+fi
 mkdir -p obj
 cd obj
 if [ ! -f build.ninja ]; then
-    ../"$src"/configure --target-list=arm-softmmu --disable-docs \
-        --disable-tools --disable-werror
+    # shellcheck disable=SC2086
+    ../"$src"/configure $opts
+    echo "$opts" > .chumby-configure
 fi
 ninja qemu-system-arm
 echo "built $out/obj/qemu-system-arm"
+
+if [ -n "$portable" ]; then
+    cd "$out"
+    rm -rf portable
+    keymaps=portable/qemu-bundle$prefix/share/qemu/keymaps
+    mkdir -p "$keymaps"
+    cp obj/qemu-system-arm portable/
+    for k in "$src"/pc-bios/keymaps/*; do
+        case $(basename "$k") in
+            meson.build) ;;
+            *) cp "$k" "$keymaps/" ;;
+        esac
+    done
+    echo "built $out/portable"
+fi

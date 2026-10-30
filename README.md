@@ -118,9 +118,10 @@ On macOS the Cocoa window and CoreAudio are built in. VNC always is.
 
 ### Prebuilt binaries
 
-CI (`.github/workflows/ci.yml`) builds `qemu-system-arm` with `./build`
-for Linux x86_64 and aarch64 and macOS on Apple silicon, and boots each
-on `tests/smoke/run`. Each commit on main publishes its builds on the
+CI (`.github/workflows/ci.yml`) builds `qemu-system-arm` with
+`./build --portable` for Linux x86_64 and aarch64 and macOS on Apple
+silicon, and boots each on `tests/smoke/run`. Each commit on main
+publishes its builds on the
 [`prebuilt`](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
 prerelease, fetchable without a token:
 
@@ -128,14 +129,39 @@ prerelease, fetchable without a token:
 
 and the same with `.sha256`, where COMMIT is the full commit ID and
 PLATFORM is `linux-x86_64`, `linux-aarch64` or `macos-arm64`. The
-tarball holds `qemu-system-arm`, `COPYING` and `RUNTIME`, which lists
-what the binary needs: on Linux, glibc 2.39 or later (Ubuntu 24.04,
-Debian 13) and glib, pixman, libpng and zlib (`libglib2.0-0t64
-libpixman-1-0 libpng16-16t64 zlib1g`; a stock GitHub Ubuntu runner has
-them); on macOS, the Homebrew packages it names (`glib pixman libpng`
-and others the runner's Homebrew had, such as `gnutls`). The Linux builds have
-no window or sound (VNC and `-display none` only), and the newest 100
-commits' builds are kept.
+tarball holds `qemu-system-arm`, `qemu-bundle/` beside it (the keymaps
+VNC loads, where QEMU looks for them: keep the two together), `COPYING`
+and `RUNTIME`, which says what it was built from and what it links.
+
+They need nothing installed: unpack and run.
+
+| Platform | What it is | What it can't do |
+| --- | --- | --- |
+| `linux-x86_64`, `linux-aarch64` | A static executable, built on Alpine: musl, glib, pixman, libpng and zlib linked in, no dynamic loader and no shared libraries. It runs on any Linux of its architecture, glibc or musl, NixOS included. | No window and no sound (`-display none`, VNC, `-audiodev none` or `wav`). For those, `./build` with your desktop's packages, or Nix. |
+| `macos-arm64` | glib, pixman and libpng linked in; it links only the system's libraries (`/usr/lib`) and frameworks (`/System/Library`), so it needs no Homebrew. macOS 15 or later. Signed ad hoc. | |
+
+Both have VNC (on a unix socket, as Chumby.app reads the screen, or
+TCP), QMP, PNG screendumps, `usb-kbd` and `usb-storage`; the Mac's also
+has the Cocoa window and CoreAudio. Neither has user-mode networking,
+TLS, or any other optional QEMU library. CI checks each with
+`tests/runtime/check` (`readelf` on Linux, `otool -L` on macOS), boots
+the Mac's with `/opt/homebrew` moved away, and boots the Linux ones on
+stock Ubuntu runners and in Alpine and NixOS containers.
+
+On macOS, `curl` and `gh` leave a download unquarantined; if a browser
+downloaded the tarball, `xattr -dr com.apple.quarantine` on what it
+unpacked before running it, or Gatekeeper refuses the ad hoc signature.
+The newest 100 commits' builds are kept.
+
+`./build --portable` makes the same in `build/portable` from a
+checkout. On Linux it
+needs static glib, pcre2, pixman, libpng and zlib (Alpine: `build-base
+python3 ninja pkgconf linux-headers curl xz patch git glib-dev
+glib-static pcre2-dev pcre2-static pixman-dev pixman-static libpng-dev
+libpng-static zlib-dev zlib-static`); on macOS, only the Command Line
+Tools, `ninja`, `pkg-config` and network access: it builds the versions
+of glib, pixman and libpng in `portable-deps` as static libraries, and
+uses nothing else it finds.
 
 ## Images
 

@@ -1,0 +1,9 @@
+glib_version=2.84.4
+glib_url=https://download.gnome.org/sources/glib/2.84/glib-2.84.4.tar.xz
+glib_sha256=8a9ea10943c36fc117e253f80c91e477b673525ae45762942858aef57631bb90
+pixman_version=0.46.4
+pixman_url=https://www.cairographics.org/releases/pixman-0.46.4.tar.gz
+pixman_sha256=d09c44ebc3bd5bee7021c79f922fe8fb2fb57f7320f55e97ff9914d2346a591c
+libpng_version=1.6.50
+libpng_url=https://download.sourceforge.net/libpng/libpng-1.6.50.tar.xz
+libpng_sha256=4df396518620a7aa3651443e87d1b2862e4e88cad135a8b93423e01706232307
