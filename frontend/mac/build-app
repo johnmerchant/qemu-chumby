@@ -1,0 +1,34 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# build-app [DEST]: builds Chumby.app, chumby-emu's native macOS front end,
+# with SwiftPM (the Command Line Tools are enough: no Xcode), into DEST
+# (default: build/ beside this script, where chumby-emu looks for it),
+# and signs it ad hoc. chumby-emu runs it on macOS once it is built.
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+dest=${1:-$here/build}
+app=$dest/Chumby.app
+
+swift build --package-path "$here" -c release --product Chumby
+bin=$(swift build --package-path "$here" -c release --show-bin-path)
+
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$bin/Chumby" "$app/Contents/MacOS/Chumby"
+cp "$here/Info.plist" "$app/Contents/Info.plist"
+# The console's bridge for other terminal apps.
+cp "$here/../chumby-term" "$app/Contents/Resources/chumby-term"
+chmod 755 "$app/Contents/Resources/chumby-term"
+# The icon, drawn by a script with AppKit.
+if command -v iconutil >/dev/null 2>&1; then
+    set=$(mktemp -d)/Chumby.iconset
+    mkdir -p "$set"
+    if swift "$here/make-icon.swift" "$set" >/dev/null 2>&1; then
+        iconutil -c icns "$set" -o "$app/Contents/Resources/Chumby.icns"
+    fi
+    rm -rf "$(dirname "$set")"
+fi
+codesign --force --sign - --timestamp=none "$app"
+echo "$app"
