@@ -1,5 +1,12 @@
 # qemu-chumby
 
+[![CI](https://github.com/johnmerchant/qemu-chumby/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/johnmerchant/qemu-chumby/actions/workflows/ci.yml?query=branch%3Amain)
+[![Licence: GPL-2.0-or-later](https://img.shields.io/badge/licence-GPL--2.0--or--later-blue)](#licence)
+[![QEMU 11.1.2](https://img.shields.io/badge/QEMU-11.1.2-orange)](qemu-release)
+[![Platforms: macOS, Linux](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#prebuilt-binaries)
+[![Prebuilt binaries](https://img.shields.io/badge/prebuilt-binaries-brightgreen)](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
+[![Companion: neochumby](https://img.shields.io/badge/companion-neochumby-purple)](https://github.com/johnmerchant/neochumby)
+
 A QEMU machine for the Chumby Classic: `qemu-system-arm -M chumby-classic`.
 
 The Chumby Classic is a Wi-Fi internet appliance with a 320x240
