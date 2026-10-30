@@ -116,6 +116,26 @@ On macOS the Cocoa window and CoreAudio are built in. VNC always is.
 `tests/linux/run` builds and checks all this on Debian with KDE Plasma
 6, in a container (see [Testing on Linux](#testing-on-linux)).
 
+### Prebuilt binaries
+
+CI (`.github/workflows/ci.yml`) builds `qemu-system-arm` with `./build`
+for Linux x86_64 and aarch64 and macOS on Apple silicon, and boots each
+on `tests/smoke/run`. Each commit on main publishes its builds on the
+[`prebuilt`](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
+prerelease, fetchable without a token:
+
+    https://github.com/johnmerchant/qemu-chumby/releases/download/prebuilt/qemu-chumby-COMMIT-PLATFORM.tar.xz
+
+and the same with `.sha256`, where COMMIT is the full commit ID and
+PLATFORM is `linux-x86_64`, `linux-aarch64` or `macos-arm64`. The
+tarball holds `qemu-system-arm`, `COPYING` and `RUNTIME`, which lists
+what the binary needs: on Linux, glibc 2.39 or later (Ubuntu 24.04,
+Debian 13) and glib, pixman, libpng and zlib (`libglib2.0-0t64
+libpixman-1-0 libpng16-16t64 zlib1g`; a stock GitHub Ubuntu runner has
+them); on macOS, Homebrew's `glib pixman libpng`. The Linux builds have
+no window or sound (VNC and `-display none` only), and the newest 100
+commits' builds are kept.
+
 ## Images
 
 The stock firmware needs two files from your own Chumby's flash backup:
@@ -259,6 +279,11 @@ a KDE Plasma 6 desktop there, with KWin on X11 and as a Wayland
 compositor: QEMU's GTK and SDL windows come up under KWin and show the
 Chumby's screen, sound reaches PulseAudio, and chumby-emu's Qt panel
 drives the machine. The checks run with no network.
+
+`tests/smoke/run [QEMU]` needs no images: it boots the machine on a
+kernel of a few instructions that writes to the console, and checks the
+console, QMP, the screen dump, the button and the accelerometer through
+chumby-machine. CI runs it on each build.
 
 ## Running
 

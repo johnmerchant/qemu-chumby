@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# qemu-system-arm with the chumby-classic machine, built with ./build on
+# each host it's meant for (Linux x86_64 and aarch64, macOS on Apple
+# silicon), booted on tests/smoke/run's kernel of a few instructions (no
+# firmware, no network), and the Linux builds booted again on stock runners
+# that have none of the build's packages.
+#
+# Each commit on main publishes its binaries as assets of one prerelease,
+# `prebuilt`, so that others (neochumby's CI) can fetch the build of the
+# exact commit they pin, without a token:
+#
+#   https://github.com/johnmerchant/qemu-chumby/releases/download/prebuilt/qemu-chumby-COMMIT-PLATFORM.tar.xz
+#   ... and the same with .sha256 (its SHA-256, as sha256sum prints it)
+#
+# COMMIT is the full commit ID; PLATFORM is linux-x86_64, linux-aarch64 or
+# macos-arm64. Each tarball holds qemu-system-arm, RUNTIME (what it needs
+# to run, its shared libraries) and COPYING. The release keeps the newest
+# 100 commits' builds. Pull requests build and test, and publish nothing.
+#
+# Run by hand (workflow_dispatch), it builds COMMIT (default: the branch's
+# head) with this workflow, and with `publish` set, publishes it, but only
+# if COMMIT is on main: a build for a commit that main had before this
+# workflow existed, say.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The commit to build (default the branch's head)
+        required: false
+        default: ''
+      publish:
+        description: Publish it (only a commit on main)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.commit }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The build's own sources come from COMMIT; tests/smoke/run and
+  # chumby_machine.py, which test it, from this workflow's commit (in .ci/).
+  COMMIT: ${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run in a bare Ubuntu 24.04 container, with only
+          # the packages README.md lists (and not libfdt-dev, so that QEMU
+          # links its own copy of dtc): the binary then needs only those
+          # packages' libraries, and glibc 2.39 or later.
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            container: ubuntu:24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            container: ubuntu:24.04
+          - platform: macos-arm64
+            runner: macos-15
+            container: ''
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 90
+    steps:
+      - name: Packages
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+            build-essential python3 python3-venv ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev \
+            curl xz-utils patch ca-certificates git
+      - name: Packages
+        if: runner.os == 'macOS'
+        run: brew install ninja pkg-config glib pixman libpng
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          path: .ci
+
+      - name: Restore the QEMU tarball
+        uses: actions/cache@v4
+        with:
+          path: build/qemu-*.tar.xz
+          key: qemu-tarball-${{ hashFiles('qemu-release') }}
+
+      # The binary, keyed by everything it's built from: a hit skips the
+      # build.
+      - name: Restore the build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: build/obj/qemu-system-arm
+          key: qemu-${{ matrix.platform }}-${{ matrix.container || matrix.runner }}-${{ hashFiles('build', 'qemu-release', 'patches/*.patch') }}
+
+      - name: Build
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: ./build
+
+      - name: Smoke test
+        run: python3 .ci/tests/smoke/run build/obj/qemu-system-arm
+
+      - name: Package
+        id: package
+        run: |
+          name=qemu-chumby-$COMMIT-${{ matrix.platform }}
+          . ./qemu-release
+          mkdir -p "dist/$name"
+          cp build/obj/qemu-system-arm COPYING "dist/$name/"
+          {
+            echo "qemu-system-arm with the chumby-classic machine"
+            echo
+            echo "qemu-chumby commit: $COMMIT"
+            echo "  https://github.com/johnmerchant/qemu-chumby/tree/$COMMIT"
+            echo "QEMU release: $version ($url), with that commit's patches/"
+            echo "Platform: ${{ matrix.platform }}, built on ${{ matrix.container || matrix.runner }}"
+            echo
+            echo "The source is the commit above: ./build there rebuilds this binary."
+            echo "GPL-2.0-or-later (COPYING)."
+            echo
+            if [ "$RUNNER_OS" = Linux ]; then
+              echo "Needs glibc 2.39 or later (Ubuntu 24.04, Debian 13 or newer) and"
+              echo "glib, pixman, libpng and zlib. On Debian and Ubuntu:"
+              echo "  apt-get install libglib2.0-0t64 libpixman-1-0 libpng16-16t64 zlib1g"
+              echo
+              echo "Shared libraries (ldd):"
+              ldd build/obj/qemu-system-arm | sed 's/ (0x[0-9a-f]*)$//'
+            else
+              echo "Needs macOS 15 or later on Apple silicon, and Homebrew's glib,"
+              echo "pixman and libpng:"
+              echo "  brew install glib pixman libpng"
+              echo
+              echo "Shared libraries (otool -L):"
+              otool -L build/obj/qemu-system-arm | tail -n +2
+            fi
+          } > "dist/$name/RUNTIME"
+          cat "dist/$name/RUNTIME"
+          tar -C dist -cJf "dist/$name.tar.xz" "$name"
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.xz" > "$name.tar.xz.sha256"
+          else
+            shasum -a 256 "$name.tar.xz" > "$name.tar.xz.sha256"
+          fi
+          cat "$name.tar.xz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.xz
+            dist/${{ steps.package.outputs.name }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # The Linux tarballs on GitHub's stock runners, as another project's CI
+  # would use them: checked, unpacked and booted with no packages
+  # installed.
+  stock:
+    name: Run on a stock runner (${{ matrix.runner }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: ${{ runner.temp }}/dl
+      - name: Unpack
+        run: |
+          cd "$RUNNER_TEMP/dl"
+          sha256sum -c ./*.sha256
+          tar xJf ./*.tar.xz
+          q=$(echo "$RUNNER_TEMP"/dl/qemu-chumby-*/qemu-system-arm)
+          if ldd "$q" | grep 'not found'; then
+            exit 1
+          fi
+          "$q" -M help | grep '^chumby-classic '
+          echo "QEMU=$q" >> "$GITHUB_ENV"
+      - name: Smoke test
+        run: python3 tests/smoke/run "$QEMU"
+
+  publish:
+    name: Publish
+    needs: [build, stock]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One at a time: each creates the release if it's missing and prunes it.
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: prebuilt
+      KEEP: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Only commits on main
+        run: |
+          git cat-file -e "$COMMIT^{commit}"
+          git merge-base --is-ancestor "$COMMIT" origin/main
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/dl
+          merge-multiple: true
+      - name: Upload
+        run: |
+          cd "$RUNNER_TEMP/dl"
+          ls -l
+          sha256sum -c ./*.sha256
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --prerelease --latest=false --target main \
+              --title 'Prebuilt qemu-system-arm' \
+              --notes "qemu-system-arm with the chumby-classic machine, built by CI for each commit on main: qemu-chumby-COMMIT-PLATFORM.tar.xz (COMMIT the full commit ID; PLATFORM linux-x86_64, linux-aarch64 or macos-arm64) and its .sha256. Each tarball's RUNTIME says what it needs to run. The newest $KEEP commits' builds are kept. The source of each is its commit (./build); GPL-2.0-or-later."
+          fi
+          gh release upload "$TAG" ./*.tar.xz ./*.sha256 --clobber
+      # Assets of all but the newest KEEP commits, by upload time.
+      - name: Prune
+        run: |
+          release=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id)
+          gh api --paginate "repos/$GH_REPO/releases/$release/assets?per_page=100" \
+            --jq '.[] | [.created_at, .id, .name] | @tsv' | sort -r > "$RUNNER_TEMP/assets"
+          keep=$(cut -f3 "$RUNNER_TEMP/assets" | sed -n 's/^qemu-chumby-\([0-9a-f]\{40\}\)-.*/\1/p' | awk '!seen[$0]++' | head -n "$KEEP")
+          while IFS="$(printf '\t')" read -r _ id name; do
+            c=$(echo "$name" | sed -n 's/^qemu-chumby-\([0-9a-f]\{40\}\)-.*/\1/p')
+            if [ -n "$c" ] && ! echo "$keep" | grep -qx "$c"; then
+              echo "deleting $name"
+              gh api -X DELETE "repos/$GH_REPO/releases/assets/$id"
+            fi
+          done < "$RUNNER_TEMP/assets"
