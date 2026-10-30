@@ -5,7 +5,7 @@ web page, one short static page for developers, and its stylesheet.
 
 It says only what a newcomer needs to get running, and links the README
 for the rest. What it takes from README.md and qemu-release (the command,
-the QEMU release, neochumby's link and the README's sections it links)
+the QEMU release and the README's sections it links)
 and what it says in its own words (the summary, the legal sentence, the
 licence) are looked up or checked there. The README is read with a small
 parser for the Markdown it uses, which refuses anything else, and each
@@ -212,17 +212,12 @@ def code_html(text, label):
 def page(readme, commit, qemu_version, dls):
     title = readme.blocks[0].text
 
-    # The README's opening: the command and neochumby's link (a badge).
+    # The README's opening: the command.
     opening = []
     for b in readme.blocks[1:]:
         if b.kind == "heading":
             break
         opening.append(b)
-    badges = next((b.text for b in opening if b.text.startswith("[![")), "")
-    m = re.search(r"\[!\[Companion: neochumby\]\([^)]*\)\]\((https://[^)]+)\)", badges)
-    if not m:
-        raise Error("README.md: no neochumby badge")
-    neochumby = m.group(1)
     summary = next((b.text for b in opening if b.text.startswith("A QEMU machine for the Chumby Classic")), "")
     m = re.search(r"`(qemu-system-arm -M chumby-classic)`", summary)
     if not m:
@@ -318,7 +313,7 @@ distro&rsquo;s own QEMU, with <code>chumby-machine</code> and <code>chumby-ctl</
 <h1>{title}</h1>
 <p class="lead">The Chumby Classic&rsquo;s i.MX21 (ARM926EJ-S) and board devices in QEMU {qemu}:
 <code class="nw">{command}</code>.</p>
-<p class="links"><a href="{repo}">Source on GitHub</a> <a href="{neochumby}">neochumby</a></p>
+<p class="links"><a href="{repo}">Source on GitHub</a></p>
 </header>
 
 <section aria-labelledby="download">
@@ -361,7 +356,7 @@ in Chumby; it contains none of the Chumby&rsquo;s software, so bring your own fi
 </html>
 """.format(
         title=esc(title), command=esc(command), qemu=esc(qemu_version), repo=REPO,
-        neochumby=esc(neochumby), commit=esc(commit), short=esc(short), cards="\n".join(cards),
+        commit=esc(commit), short=esc(short), cards="\n".join(cards),
         linux=linux_html,
         run=code_html(run, "Unpack and boot"),
         more="\n".join('<li><a href="%s">%s</a></li>' % (esc(h), t) for h, t in more),
