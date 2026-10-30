@@ -151,9 +151,11 @@ jobs:
               echo "Shared libraries (ldd):"
               ldd "dist/$name/qemu-system-arm" | sed 's/ (0x[0-9a-f]*)$//'
             else
-              echo "Needs macOS 15 or later on Apple silicon, and Homebrew's glib,"
-              echo "pixman and libpng:"
-              echo "  brew install glib pixman libpng"
+              # Whatever the runner's Homebrew had that QEMU's configure
+              # found, not only what ./build asks for.
+              formulae=$(otool -L "dist/$name/qemu-system-arm" | sed -n 's#^[[:space:]]*/opt/homebrew/opt/\([^/]*\)/.*#\1#p' | sort -u | tr '\n' ' ')
+              echo "Needs macOS 15 or later on Apple silicon, and these Homebrew packages:"
+              echo "  brew install $formulae"
               echo
               echo "Shared libraries (otool -L):"
               otool -L "dist/$name/qemu-system-arm" | tail -n +2

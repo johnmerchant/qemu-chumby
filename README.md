@@ -132,7 +132,8 @@ tarball holds `qemu-system-arm`, `COPYING` and `RUNTIME`, which lists
 what the binary needs: on Linux, glibc 2.39 or later (Ubuntu 24.04,
 Debian 13) and glib, pixman, libpng and zlib (`libglib2.0-0t64
 libpixman-1-0 libpng16-16t64 zlib1g`; a stock GitHub Ubuntu runner has
-them); on macOS, Homebrew's `glib pixman libpng`. The Linux builds have
+them); on macOS, the Homebrew packages it names (`glib pixman libpng`
+and others the runner's Homebrew had, such as `gnutls`). The Linux builds have
 no window or sound (VNC and `-display none` only), and the newest 100
 commits' builds are kept.
 
