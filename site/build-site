@@ -220,11 +220,11 @@ def page(readme, commit, qemu_version, dls):
     cards = []
     for d in dls:
         label, note = PLATFORMS[d["platform"]]
-        size = " (%.1f MiB)" % (d["size"] / 1048576) if d["size"] else ""
+        size = "%.1f MiB" % (d["size"] / 1048576) if d["size"] else ""
         cards.append("""<li class="card">
 <h3>{label}</h3>
 <p class="note">{note}</p>
-<p><a class="button" href="{url}">Download<span class="vh"> for {label}</span> .tar.xz<span class="size">{size}</span></a></p>
+<p class="get"><a class="button" href="{url}">Download<span class="vh"> for {label}</span> .tar.xz</a> <span class="size">{size}</span></p>
 <p class="sha"><a href="{sha_url}">SHA-256<span class="vh"> file for {label}</span></a> <code>{sha}</code></p>
 </li>""".format(label=esc(label), note=esc(note), url=esc(d["url"]), sha_url=esc(d["sha256_url"]),
                 sha=esc(d["sha256"]), size=esc(size)))
