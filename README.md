@@ -224,6 +224,51 @@ in seconds by letting emulated time run ahead, which also makes sound
 play fast and choppy; it is meant for scripts, and a saved state is
 the quick way to start an interactive session.
 
+### The Mac app: Chumby.app
+
+On macOS there is a native app instead of QEMU's window and the Qt
+panel: one window with the Chumby's screen, drawn crisp at a real
+Chumby's size (71 x 53 mm on your display) or any other, keeping its
+shape; an inspector beside it for the top button, tilt and shake, the
+Mac's own motion sensor, headphones and the outputs; the machine's
+commands in the toolbar and menus (pause, reset, screenshot, save and
+restore state); and the serial console in a window of its own, also
+served on a pseudo-terminal for other terminal programs. Sound plays
+through CoreAudio as before. It builds with SwiftPM and the Command
+Line Tools; Xcode is not needed:
+
+    frontend/mac/build-app          # makes frontend/mac/build/Chumby.app
+
+Once it is built, `chumby-emu` on macOS runs it in place of QEMU's window
+and the Qt panel, with the same options (`--display`, `--no-panel` or
+`CHUMBY_EMU_QT=1` keep the old way). The app takes them itself too, and
+with none it opens a start window: an images folder or a kernel (and a
+NAND image) to boot, a state folder, fast boot, extra QEMU arguments,
+and the Chumbys started before:
+
+    open frontend/mac/build/Chumby.app
+    frontend/mac/build/Chumby.app/Contents/MacOS/Chumby --kernel zImage -- -append console=ttymxc0,115200
+
+QEMU runs with `-display none -vnc unix:SOCKET`, in a private directory,
+and the app draws the screen from that socket (raw RFB, which costs
+nothing at 320x240). The mouse on the screen is the pen and keys typed
+while the screen has the focus go to the Chumby, both as QMP
+`input-send-event`s: keys by their place on the keyboard, as QEMU's own
+Cocoa window sends them, so they reach the machine's USB keyboard
+(plugged in on the first key, on machines with the `usb-keyboard`
+option; give older ones `-device usb-kbd`). F12 is the top button.
+Command shortcuts stay the Mac's. QEMU still always runs with
+`-nic none`, and network options among the extra arguments are refused.
+
+`swift test` in `frontend/mac` checks the RFB and QMP clients, the
+console's terminal and the QEMU command line; with `CHUMBY_TEST_QEMU`
+and `CHUMBY_TEST_KERNEL` set (a qemu-system-arm, and a kernel that boots
+to a shell such as a sideload zImage), it also boots the machine and
+checks that the screen over VNC matches `screendump`, that keys typed
+with the Mac's key codes run in the screen's shell, and the top button.
+
+### Testing on Linux
+
 ## Scripts and tests: chumby-machine
 
 `chumby-machine` runs the machine headless and drives it, for test
