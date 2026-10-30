@@ -4,3 +4,4 @@ __pycache__/
 /image/target/
 /frontend/mac/.build/
 /frontend/mac/build/
+/_site/

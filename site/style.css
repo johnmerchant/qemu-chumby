@@ -1,0 +1,176 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* The project's page: system fonts, light and dark. */
+
+:root {
+  --bg: #fbfaf7;
+  --bg-alt: #f2f0ea;
+  --surface: #ffffff;
+  --text: #1d1f22;
+  --muted: #555a61;
+  --line: #dcd8ce;
+  --accent: #0f6f61;
+  --accent-text: #ffffff;
+  --accent-soft: #e2f2ee;
+  --link: #0b5f8a;
+  --code-bg: #efece4;
+  --pre-bg: #1e2326;
+  --pre-text: #e8eae6;
+  --focus: #c25e00;
+  --radius: 10px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121416;
+    --bg-alt: #181b1e;
+    --surface: #1d2124;
+    --text: #e6e7e3;
+    --muted: #a3a8ad;
+    --line: #30363b;
+    --accent: #4fc3ad;
+    --accent-text: #0b1513;
+    --accent-soft: #17302b;
+    --link: #79c3ef;
+    --code-bg: #262b2f;
+    --pre-bg: #0b0d0e;
+    --pre-text: #e3e6e1;
+    --focus: #ffab5e;
+    color-scheme: dark;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { scroll-padding-top: 4.5rem; }
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 1rem/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+.wrap { max-width: 64rem; margin: 0 auto; padding: 0 16px; }
+
+a { color: var(--link); text-underline-offset: 0.15em; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
+
+.skip {
+  position: absolute; left: 8px; top: -100px; z-index: 10;
+  background: var(--surface); color: var(--text); padding: 0.5rem 0.75rem; border-radius: 6px;
+}
+.skip:focus { top: 8px; }
+
+.vh {
+  position: absolute !important; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+
+/* The bar along the top. */
+.top {
+  position: sticky; top: 0; z-index: 5;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--line);
+}
+.bar { display: flex; align-items: center; gap: 1rem; min-height: 3.25rem; flex-wrap: wrap; }
+.name { font-weight: 700; color: var(--text); text-decoration: none; letter-spacing: -0.01em; }
+.top nav { flex: 1; overflow-x: auto; }
+.top nav ul { display: flex; gap: 0.25rem; list-style: none; margin: 0; padding: 0; white-space: nowrap; }
+.top nav a, .gh {
+  display: block; padding: 0.35rem 0.6rem; border-radius: 6px;
+  color: var(--muted); text-decoration: none; font-size: 0.925rem;
+}
+.top nav a:hover, .gh:hover { background: var(--bg-alt); color: var(--text); }
+@media (max-width: 760px) {
+  .top nav { order: 3; flex-basis: 100%; margin: 0 -0.6rem 0.4rem; }
+  .gh { margin-left: auto; }
+}
+
+/* Sections. */
+main > section { padding: 3rem 0; border-bottom: 1px solid var(--line); }
+main > section:nth-of-type(even) { background: var(--bg-alt); }
+
+h1, h2, h3, h4, h5 { line-height: 1.25; letter-spacing: -0.01em; }
+h1 { font-size: clamp(2.2rem, 6vw, 3.4rem); margin: 0 0 0.5rem; letter-spacing: -0.03em; }
+h2 { font-size: 1.75rem; margin: 0 0 1.25rem; }
+h3 { font-size: 1.25rem; margin: 2rem 0 0.75rem; }
+h4 { font-size: 1.1rem; margin: 1.75rem 0 0.5rem; }
+h5 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+p, ul { max-width: 46rem; }
+li + li { margin-top: 0.25rem; }
+
+.hero { padding: 4rem 0 3rem; }
+.tagline { font-size: 1.3rem; margin-top: 0; color: var(--text); }
+.ctas { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1.75rem; }
+
+.button {
+  display: inline-flex; align-items: baseline; gap: 0.5rem;
+  padding: 0.6rem 1.1rem; border-radius: 8px;
+  background: var(--accent); color: var(--accent-text);
+  font-weight: 600; text-decoration: none; border: 2px solid var(--accent);
+}
+.button:hover { filter: brightness(1.08); }
+.button.alt { background: transparent; color: var(--accent); }
+.fmt { font-weight: 400; font-size: 0.85em; opacity: 0.9; }
+
+/* Code. */
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em; background: var(--code-bg); padding: 0.1em 0.3em; border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+pre {
+  background: var(--pre-bg); color: var(--pre-text);
+  padding: 1rem 1.1rem; border-radius: var(--radius); overflow-x: auto;
+  line-height: 1.5; max-width: 100%;
+}
+pre code { background: none; padding: 0; font-size: 0.875rem; overflow-wrap: normal; white-space: pre; }
+
+/* Tables. */
+.table { overflow-x: auto; margin: 1rem 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td { text-align: left; vertical-align: top; padding: 0.6rem 0.85rem; border-bottom: 1px solid var(--line); }
+tbody tr:last-child > * { border-bottom: 0; }
+thead th { background: var(--bg-alt); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+tbody th { font-weight: 600; min-width: 10rem; }
+
+/* Downloads. */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+.card, .qs {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 1.25rem; min-width: 0;
+}
+.card h3, .qs h3 { margin-top: 0; }
+.plat {
+  display: inline-block; font-size: 0.75rem; font-weight: 600; vertical-align: middle;
+  padding: 0.1rem 0.45rem; border-radius: 999px; background: var(--accent-soft); color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.needs { color: var(--accent); font-weight: 700; margin: 0 0 0.5rem; }
+.needs::before { content: "\2713\00a0"; }
+.card p { font-size: 0.95rem; }
+.cant { color: var(--muted); }
+.get { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.sha { font-size: 0.8rem; color: var(--muted); }
+.sha code { word-break: break-all; }
+.k { display: block; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.75rem; }
+
+/* Quick starts. */
+.qss { display: grid; gap: 1rem; margin-top: 1.5rem; }
+.qs .more { margin-bottom: 0; }
+details { margin: 1rem 0; }
+summary { cursor: pointer; font-weight: 600; color: var(--link); }
+
+/* The docs page. */
+.note { color: var(--muted); }
+.rst { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 0.25rem 1.5rem 1rem; }
+@media (max-width: 600px) { .rst { padding: 0.25rem 1rem 1rem; } }
+
+footer { padding: 2rem 0 3rem; color: var(--muted); font-size: 0.9rem; }
