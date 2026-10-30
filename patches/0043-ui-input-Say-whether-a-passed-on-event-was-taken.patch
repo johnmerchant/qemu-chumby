@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 04:42:09 +0000
+Subject: [PATCH 43/44] ui/input: Say whether a passed-on event was taken
+
+qemu_input_event_pass_on() drops an event when no other handler wants
+it. Return whether one took it, so the caller can do something about a
+key nobody takes (plug in a keyboard, say).
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ include/ui/input.h | 4 ++--
+ ui/input.c         | 5 +++--
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/include/ui/input.h b/include/ui/input.h
+index 5a574b5a1..9fbf7d66b 100644
+--- a/include/ui/input.h
++++ b/include/ui/input.h
+@@ -58,9 +58,9 @@ void qemu_input_event_send(QemuConsole *src, QemuInputEvent *evt);
+ void qemu_input_event_send_impl(QemuConsole *src, QemuInputEvent *evt);
+ /*
+  * Hands an event that a handler does not want to the handler that would
+- * get it if that one were not registered.
++ * get it if that one were not registered. Returns false if there is none.
+  */
+-void qemu_input_event_pass_on(QemuInputHandlerState *from,
++bool qemu_input_event_pass_on(QemuInputHandlerState *from,
+                               QemuConsole *src, QemuInputEvent *evt);
+ void qemu_input_event_sync(void);
+ void qemu_input_event_sync_impl(void);
+diff --git a/ui/input.c b/ui/input.c
+index 0e9757132..39504e4f7 100644
+--- a/ui/input.c
++++ b/ui/input.c
+@@ -363,17 +363,18 @@ void qemu_input_event_send_impl(QemuConsole *src, QemuInputEvent *evt)
+     s->events++;
+ }
+ 
+-void qemu_input_event_pass_on(QemuInputHandlerState *from,
++bool qemu_input_event_pass_on(QemuInputHandlerState *from,
+                               QemuConsole *src, QemuInputEvent *evt)
+ {
+     QemuInputHandlerState *s;
+ 
+     s = qemu_input_find_handler_except(1 << evt->type, src, from);
+     if (!s) {
+-        return;
++        return false;
+     }
+     s->handler->event(s->dev, src, evt);
+     s->events++;
++    return true;
+ }
+ 
+ void qemu_input_event_send(QemuConsole *src, QemuInputEvent *evt)
