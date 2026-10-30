@@ -42,6 +42,13 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
         --fast          -icount shift=auto,sleep=off: quick boots, for tests
         --scale N       points per Chumby pixel (default: a real Chumby's size)
         -- ARGS         passed to QEMU as they are
+
+        With no images, a start window offers to open some, and the Chumbys
+        started before. The mouse on the screen is the pen; keys typed there
+        go to the Chumby by their place on the keyboard (plugging in its USB
+        keyboard on the first), F12 is the top button, and Command shortcuts
+        stay the Mac's. QEMU always runs with -nic none, and network options
+        among ARGS are refused.
       """
 
     /// chumby-emu's options (--display and --no-panel are chumby-emu's

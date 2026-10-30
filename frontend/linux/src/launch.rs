@@ -36,6 +36,20 @@ Options:
   --console TTY    join this terminal to the console on TTY (what the
                    Console button runs in your terminal app)
   -- ARGS          passed to QEMU as they are
+
+Keys, with the screen focused (click it): every key goes to the Chumby by
+its place on the keyboard, whatever your layout, except these:
+  F12              the top button (the machine's button-key)
+  Ctrl+Shift+P     pause, resume
+  Ctrl+Shift+S     screenshot
+  Ctrl+Shift+T     the console in your terminal app
+  Ctrl+Shift+B     show or hide the controls
+  Ctrl+Shift+F     full screen
+  Ctrl+Q           quit
+
+Environment: CHUMBY_DESKTOP_TEST=FILE runs FILE's test steps against the
+window (see src/test.rs; headless with QT_QPA_PLATFORM=offscreen), and
+CHUMBY_DESKTOP_DEBUG_KEYS=1 prints each key and the QKeyCode it sends.
 ";
 
 #[derive(Clone, Debug, Default)]
