@@ -80,6 +80,8 @@ The patches:
 | `0034`-`0035` | USB host fixes for Linux 5.9's `imx21-hcd` |
 | `0036`-`0041` | The watchdog's reset source and grace period, `hw/rtc/imx21_rtc.c`, the I2C controller, and the interactive command line |
 | `0042` | The codec clocking steadily when its timer runs late |
+| `0043`-`0045` | A USB keyboard plugged in when a key goes unheard, and a USB host fix |
+| `0046`-`0052` | Saved state: the crypto processor's exchange, the sensor card's chip select, the flash read back after a restore, the keyboard plugged in on demand, USB packets in flight, and checks on loaded indexes |
 
 ## Building
 
@@ -597,6 +599,13 @@ Attach the NAND as a qcow2 overlay of your image for that:
 `qemu-img create -f qcow2 -b nand.img -F raw nand.qcow2`, then
 `-drive if=mtd,file=nand.qcow2,format=qcow2`. A state saved with
 `-icount` loads only with it, and one saved without, only without.
+Start the restoring QEMU with the same machine options and devices. A
+state carries the whole machine: the crypto processor's exchange in
+progress, the sensor card's chip select, and the keyboard the board
+plugged in, which is plugged in again on load; the flash is read back
+from the restored drive. A state saved by a build before patch 0046
+still loads, with the crypto processor idle and the chip select
+deselected, unless that keyboard was plugged in.
 
 **Screen.** QMP `screendump` with an absolute `filename` and `"format":
 "png"` (8-bit RGB) or `"ppm"` (the default): the 320x240 frame as the

@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: John Merchant <john@johnmerchant.dev>
+Date: Fri, 30 Oct 2026 12:43:35 +0000
+Subject: [PATCH 46/52] hw/char/chumby_cp: Save the exchange in progress
+
+The crypto processor is a chardev, not a device, and had no migration
+state: a snapshot taken while the guest's daemon was talking to it lost
+the half-received request and the reply bytes not yet sent, and the
+daemon waited for a reply that never came.
+
+The CP now registers its state when it is opened: the request received
+so far, and the queued reply bytes with the time each is due on the
+wire. A restore re-arms the delivery timer. Lengths and positions are
+checked on load, and the reply's times must not go backwards.
+
+A state saved before this has no section for the CP and still loads;
+the CP then starts idle.
+
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5Fc77Z6fVVe4rWJxPT
+---
+ hw/char/chumby_cp.c         | 56 +++++++++++++++++++++++++++++++++++++
+ include/hw/char/chumby_cp.h |  6 ++--
+ 2 files changed, 59 insertions(+), 3 deletions(-)
+
+diff --git a/hw/char/chumby_cp.c b/hw/char/chumby_cp.c
+index ec99c998f..08cccf8a7 100644
+--- a/hw/char/chumby_cp.c
++++ b/hw/char/chumby_cp.c
+@@ -19,10 +19,15 @@
+  * C40BB1E0-0000-4000-8000-0E4000000001, serial number 0000000000000000.
+  * The board can give it another (chumby_cp_set_identity). It holds no
+  * keys, and refuses key and challenge requests.
++ *
++ * A chardev is not a device, so the CP registers its own migration
++ * state when it is opened: the request half received and the reply bytes
++ * not yet sent, each with the time it is due.
+  */
+ 
+ #include "qemu/osdep.h"
+ #include "hw/char/chumby_cp.h"
++#include "migration/vmstate.h"
+ #include "qemu/bswap.h"
+ #include "qemu/module.h"
+ 
+@@ -175,6 +180,55 @@ static int chumby_cp_write(Chardev *chr, const uint8_t *buf, int len)
+     return len;
+ }
+ 
++static int chumby_cp_post_load(void *opaque, int version_id)
++{
++    ChumbyCPChardev *cp = opaque;
++
++    if (cp->line_len < 0 || cp->line_len >= CHUMBY_CP_LINE_MAX ||
++        cp->out_head < 0 || cp->out_head >= CHUMBY_CP_OUT_MAX ||
++        cp->out_len < 0 || cp->out_len > CHUMBY_CP_OUT_MAX) {
++        return -EINVAL;
++    }
++    /* Each reply byte is due at or after the one before it. */
++    for (int i = 1; i < cp->out_len; i++) {
++        int prev = (cp->out_head + i - 1) % CHUMBY_CP_OUT_MAX;
++        int slot = (cp->out_head + i) % CHUMBY_CP_OUT_MAX;
++
++        if (cp->due[slot] < cp->due[prev]) {
++            return -EINVAL;
++        }
++    }
++    if (cp->out_len) {
++        timer_mod(&cp->timer, cp->due[cp->out_head]);
++    } else {
++        timer_del(&cp->timer);
++    }
++    return 0;
++}
++
++static const VMStateDescription vmstate_chumby_cp = {
++    .name = TYPE_CHARDEV_CHUMBY_CP,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = chumby_cp_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8_ARRAY(line, ChumbyCPChardev, CHUMBY_CP_LINE_MAX),
++        VMSTATE_INT32(line_len, ChumbyCPChardev),
++        VMSTATE_UINT8_ARRAY(out, ChumbyCPChardev, CHUMBY_CP_OUT_MAX),
++        VMSTATE_INT64_ARRAY(due, ChumbyCPChardev, CHUMBY_CP_OUT_MAX),
++        VMSTATE_INT32(out_head, ChumbyCPChardev),
++        VMSTATE_INT32(out_len, ChumbyCPChardev),
++        VMSTATE_END_OF_LIST()
++    },
++};
++
++static bool chumby_cp_open(Chardev *chr, ChardevBackend *backend,
++                           Error **errp)
++{
++    vmstate_register(NULL, 0, &vmstate_chumby_cp, chr);
++    return true;
++}
++
+ static void chumby_cp_init(Object *obj)
+ {
+     ChumbyCPChardev *cp = CHARDEV_CHUMBY_CP(obj);
+@@ -189,6 +243,7 @@ static void chumby_cp_finalize(Object *obj)
+ {
+     ChumbyCPChardev *cp = CHARDEV_CHUMBY_CP(obj);
+ 
++    vmstate_unregister(NULL, &vmstate_chumby_cp, cp);
+     timer_del(&cp->timer);
+ }
+ 
+@@ -196,6 +251,7 @@ static void chumby_cp_class_init(ObjectClass *oc, const void *data)
+ {
+     ChardevClass *cc = CHARDEV_CLASS(oc);
+ 
++    cc->chr_open = chumby_cp_open;
+     cc->chr_write = chumby_cp_write;
+     cc->chr_accept_input = chumby_cp_accept_input;
+ }
+diff --git a/include/hw/char/chumby_cp.h b/include/hw/char/chumby_cp.h
+index 31fbfa9e6..aa3451618 100644
+--- a/include/hw/char/chumby_cp.h
++++ b/include/hw/char/chumby_cp.h
+@@ -37,12 +37,12 @@ struct ChumbyCPChardev {
+     QEMUTimer timer;
+     /* The request being received. */
+     uint8_t line[CHUMBY_CP_LINE_MAX];
+-    int line_len;
++    int32_t line_len;
+     /* Reply bytes, and the time each is due on the wire. */
+     uint8_t out[CHUMBY_CP_OUT_MAX];
+     int64_t due[CHUMBY_CP_OUT_MAX];
+-    int out_head;
+-    int out_len;
++    int32_t out_head;
++    int32_t out_len;
+ };
+ 
+ /*
