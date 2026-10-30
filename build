@@ -15,13 +15,16 @@
 # other optional libraries, VNC (unix sockets too) and PNG screendumps.
 #   Linux: a static binary (-static-pie), linked against static glib,
 #     pixman, libpng and zlib; on Alpine, with build-base python3 ninja
-#     pkgconf linux-headers git and glib, pcre2, pixman, libpng and zlib's -dev and
-#     -static packages. No window, and no sound (-audiodev none or wav).
+#     pkgconf linux-headers git, and glib, pcre2, pixman, libpng and
+#     zlib's -dev and -static packages. No window, and no sound
+#     (-audiodev none or wav).
 #   macOS: glib, pixman and libpng (portable-deps) are built here as
 #     static libraries, so the binary links only the system's libraries
 #     and frameworks. The Cocoa window and CoreAudio are kept. Needs only
 #     the Command Line Tools, ninja, python3 and pkg-config; nothing found
 #     under Homebrew or elsewhere is used.
+# Its result is DIR/portable, which can be copied anywhere: qemu-system-arm
+# and, in qemu-bundle/ beside it where QEMU looks, the keymaps VNC loads.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -174,11 +177,13 @@ EOF
     echo "$dstamp" > "$p/.chumby-deps"
 }
 
-opts="--target-list=arm-softmmu --disable-docs --disable-tools --disable-werror"
+default="--target-list=arm-softmmu --disable-docs --disable-tools --disable-werror"
+opts=$default
+prefix=/usr/local
 if [ -n "$portable" ]; then
     # Every optional feature off, then only what the machine uses back on.
-    opts="$opts --without-default-features --disable-plugins --enable-fdt=internal
-          --enable-pixman --enable-png --enable-vnc"
+    opts="$opts --prefix=$prefix --without-default-features --disable-plugins
+          --enable-fdt=internal --enable-pixman --enable-png --enable-vnc"
     case $(uname -s) in
         Linux) opts="$opts --static" ;;
         Darwin)
@@ -193,8 +198,9 @@ if [ -n "$portable" ]; then
 fi
 opts=$(echo $opts)
 
-# Configured again when the options change.
-if [ "$(cat obj/.chumby-configure 2>/dev/null || true)" != "$opts" ]; then
+# Configured again when the options change (a build from before they were
+# kept had the default ones).
+if [ -d obj ] && [ "$(cat obj/.chumby-configure 2>/dev/null || echo "$default")" != "$opts" ]; then
     rm -rf obj
 fi
 mkdir -p obj
@@ -206,3 +212,18 @@ if [ ! -f build.ninja ]; then
 fi
 ninja qemu-system-arm
 echo "built $out/obj/qemu-system-arm"
+
+if [ -n "$portable" ]; then
+    cd "$out"
+    rm -rf portable
+    keymaps=portable/qemu-bundle$prefix/share/qemu/keymaps
+    mkdir -p "$keymaps"
+    cp obj/qemu-system-arm portable/
+    for k in "$src"/pc-bios/keymaps/*; do
+        case $(basename "$k") in
+            meson.build) ;;
+            *) cp "$k" "$keymaps/" ;;
+        esac
+    done
+    echo "built $out/portable"
+fi

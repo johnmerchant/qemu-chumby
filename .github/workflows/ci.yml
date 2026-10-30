@@ -18,10 +18,10 @@
 #   ... and the same with .sha256 (its SHA-256, as sha256sum prints it)
 #
 # COMMIT is the full commit ID; PLATFORM is linux-x86_64, linux-aarch64 or
-# macos-arm64. Each tarball holds qemu-system-arm, RUNTIME (what it needs
-# to run, which is nothing, and what it links) and COPYING. The release
-# keeps the newest 100 commits' builds. Pull requests build and test, and
-# publish nothing.
+# macos-arm64. Each tarball holds qemu-system-arm, qemu-bundle/ beside it
+# (the keymaps VNC loads), RUNTIME (what it needs to run, which is nothing,
+# and what it links) and COPYING. The release keeps the newest 100 commits'
+# builds. Pull requests build and test, and publish nothing.
 #
 # Run by hand (workflow_dispatch), it builds COMMIT (default: the branch's
 # head) with this workflow, and with `publish` set, publishes it, but only
@@ -101,13 +101,13 @@ jobs:
             out/*.tar.gz
           key: tarballs-${{ hashFiles('qemu-release', 'portable-deps') }}
 
-      # The binary, keyed by everything it's built from: a hit skips the
-      # build.
+      # The binary and its keymaps, keyed by everything they're built from:
+      # a hit skips the build.
       - name: Restore the build
         id: cache
         uses: actions/cache@v4
         with:
-          path: out/obj/qemu-system-arm
+          path: out/portable
           key: qemu-portable-${{ matrix.platform }}-${{ matrix.builder || matrix.runner }}-${{ hashFiles('build', 'qemu-release', 'portable-deps', 'patches/*.patch') }}
 
       # Into out/: ./build's default directory, build/ beside it, is the
@@ -127,10 +127,10 @@ jobs:
         run: ./build --portable out
 
       - name: Needs nothing installed
-        run: .ci/tests/runtime/check out/obj/qemu-system-arm
+        run: .ci/tests/runtime/check out/portable/qemu-system-arm
 
       - name: Smoke test
-        run: python3 .ci/tests/smoke/run out/obj/qemu-system-arm
+        run: python3 .ci/tests/smoke/run out/portable/qemu-system-arm
 
       - name: Package
         id: package
@@ -138,7 +138,8 @@ jobs:
           name=qemu-chumby-$COMMIT-${{ matrix.platform }}
           . ./qemu-release
           mkdir -p "dist/$name"
-          cp out/obj/qemu-system-arm COPYING "dist/$name/"
+          cp -R out/portable/. "dist/$name/"
+          cp COPYING "dist/$name/"
           # On Linux, without its debugging symbols, which are most of it.
           # (On macOS the build signs it, and stripping would undo that.)
           if [ "$RUNNER_OS" = Linux ]; then

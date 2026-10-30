@@ -129,8 +129,9 @@ prerelease, fetchable without a token:
 
 and the same with `.sha256`, where COMMIT is the full commit ID and
 PLATFORM is `linux-x86_64`, `linux-aarch64` or `macos-arm64`. The
-tarball holds `qemu-system-arm`, `COPYING` and `RUNTIME`, which says
-what it was built from and what it links.
+tarball holds `qemu-system-arm`, `qemu-bundle/` beside it (the keymaps
+VNC loads, where QEMU looks for them: keep the two together), `COPYING`
+and `RUNTIME`, which says what it was built from and what it links.
 
 They need nothing installed: unpack and run.
 
@@ -152,7 +153,8 @@ downloaded the tarball, `xattr -dr com.apple.quarantine` on what it
 unpacked before running it, or Gatekeeper refuses the ad hoc signature.
 The newest 100 commits' builds are kept.
 
-`./build --portable` makes the same binary from a checkout. On Linux it
+`./build --portable` makes the same in `build/portable` from a
+checkout. On Linux it
 needs static glib, pcre2, pixman, libpng and zlib (Alpine: `build-base
 python3 ninja pkgconf linux-headers curl xz patch git glib-dev
 glib-static pcre2-dev pcre2-static pixman-dev pixman-static libpng-dev
