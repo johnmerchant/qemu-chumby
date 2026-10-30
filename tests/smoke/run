@@ -54,7 +54,8 @@ def check(what, ok, detail=""):
 
 
 def main():
-    qemu = sys.argv[1] if len(sys.argv) > 1 else None
+    # Absolute: QEMU runs in the machine's directory.
+    qemu = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else None
     with tempfile.TemporaryDirectory(prefix="chumby-smoke-") as tmp:
         zimage = os.path.join(tmp, "smoke.bin")
         with open(zimage, "wb") as f:
