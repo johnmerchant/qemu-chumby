@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Desktop Entry]
+Type=Application
+Name=Chumby Emulator
+GenericName=Chumby Classic emulator
+Comment=Run a Chumby Classic on your desktop, in QEMU
+Exec=chumby-desktop %f
+Icon=io.github.johnmerchant.QemuChumby
+Terminal=false
+Categories=System;Emulator;
+Keywords=Chumby;QEMU;emulator;ARM;
+StartupNotify=true
+StartupWMClass=chumby-desktop
+SingleMainWindow=true

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<!-- A soft little bedside gadget with a screen and a button on top. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f6a85a"/>
+      <stop offset="1" stop-color="#d9762e"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a4f7a"/>
+      <stop offset="1" stop-color="#1c2640"/>
+    </linearGradient>
+  </defs>
+  <!-- the button on top -->
+  <rect x="54" y="10" width="20" height="10" rx="4" fill="#b85f22"/>
+  <!-- the body: a cushion, a little wider at the bottom -->
+  <path d="M30 18 H98 C110 18 116 26 117 38 L120 96 C121 110 112 118 98 118 H30 C16 118 7 110 8 96 L11 38 C12 26 18 18 30 18 Z"
+        fill="url(#body)"/>
+  <!-- the stitched seam -->
+  <path d="M31 25 H97 C106 25 110 31 110.5 40 L113 95 C113.5 105 107 111 97 111 H31 C21 111 14.5 105 15 95 L17.5 40 C18 31 22 25 31 25 Z"
+        fill="none" stroke="#fff3e6" stroke-opacity="0.55" stroke-width="2" stroke-dasharray="5 4"/>
+  <!-- the screen, 4:3 -->
+  <rect x="29" y="38" width="70" height="52.5" rx="5" fill="url(#glass)"/>
+  <!-- a clock on it -->
+  <g fill="#9fe3c1">
+    <rect x="42" y="56" width="5" height="17" rx="2"/>
+    <rect x="52" y="56" width="13" height="5" rx="2"/>
+    <rect x="60" y="56" width="5" height="17" rx="2"/>
+    <circle cx="70" cy="60" r="1.8"/>
+    <circle cx="70" cy="69" r="1.8"/>
+    <rect x="75" y="56" width="12" height="5" rx="2"/>
+    <rect x="75" y="62" width="12" height="5" rx="2"/>
+    <rect x="75" y="68" width="12" height="5" rx="2"/>
+    <rect x="82" y="56" width="5" height="17" rx="2"/>
+  </g>
+  <rect x="33" y="42" width="30" height="5" rx="2.5" fill="#ffffff" fill-opacity="0.12"/>
+</svg>
