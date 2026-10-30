@@ -113,7 +113,7 @@ def main():
             check("the screen over VNC on a unix socket", size == (cm.W, cm.H), size)
 
             with m.qmp() as q:
-                usb = q.cmd("human-monitor-command", **{"command-line": "info usb"})
+                usb = q.hmp("info usb")
             check("a USB keyboard and stick", "QEMU USB Keyboard" in usb and "QEMU USB MSD" in usb,
                   "; ".join(x.strip() for x in usb.splitlines() if x.strip()))
 
