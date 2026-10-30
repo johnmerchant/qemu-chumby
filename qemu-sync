@@ -62,6 +62,7 @@ DOWNLOAD = "https://download.qemu.org"
 # copy. A release signed with any other key fails here.
 FINGERPRINT = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
 KEYFILE = os.path.join(HERE, "qemu-release-key.asc")
+FLATPAK_MANIFEST = "flatpak/io.github.johnmerchant.QemuChumby.yml"
 
 BRANCHES = {"point": "qemu-bump/point", "series": "qemu-bump/series"}
 BOT = "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
@@ -300,14 +301,28 @@ def edit_files(old, new, digest):
         text = text.replace(a, b)
     with open(readme, "w") as f:
         f.write(text)
+    # The Flatpak's manifest builds QEMU from the same tarball.
+    manifest = os.path.join(HERE, FLATPAK_MANIFEST)
+    with open(manifest) as f:
+        text = f.read()
+    for pattern, line in [(r"^ +url: https://download\.qemu\.org/.*$", f"url: {tarball_url(new)}"),
+                          (r"^ +sha256: [0-9a-f]{64}$", f"sha256: {digest}")]:
+        found = re.findall(pattern, text, re.M)
+        if len(found) != 1:
+            sys.exit(f"{FLATPAK_MANIFEST}: expected one line like {pattern!r}")
+        indent = found[0][:len(found[0]) - len(found[0].lstrip())]
+        text = text.replace(found[0], indent + line)
+    with open(manifest, "w") as f:
+        f.write(text)
 
 
 def message(kind, old, new):
     o, n = fmt(old), fmt(new)
     what = ("the newest release of the pinned series," if kind == "point"
             else f"the newest release of a newer series, {new[0]}.{new[1]},")
-    text = (f"QEMU {n}, {what} in place of {o}: qemu-release and the "
-            f"README's mentions of the version. The tarball's signature was "
+    text = (f"QEMU {n}, {what} in place of {o}: qemu-release, the "
+            f"Flatpak manifest's QEMU source and the README's mentions of "
+            f"the version. The tarball's signature was "
             f"checked with QEMU's release key, {FINGERPRINT}, and the SHA-256 "
             f"is that of the verified file.")
     return (f"qemu-release: QEMU {n}\n\n{textwrap.fill(text, 72)}\n\n"
@@ -354,7 +369,7 @@ def bump(kind, old, new, digest, base, dry):
     if have != n:
         run("git", "-C", HERE, "switch", "-q", "-C", branch, base)
         edit_files(old, new, digest)
-        run("git", "-C", HERE, "add", "qemu-release", "README.md")
+        run("git", "-C", HERE, "add", "qemu-release", "README.md", FLATPAK_MANIFEST)
         env = dict(os.environ, TZ="UTC")
         run("git", "-C", HERE, "-c", "user.name=github-actions[bot]",
             "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",

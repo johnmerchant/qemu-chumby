@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# packaging/test-package PACKAGE: installs PACKAGE (a .deb or .rpm from
+# packaging/build-package) with the distro's package manager, as root in a
+# clean container of the distro it was built for, which pulls in the
+# dependencies it declares and nothing else; then checks what it installed
+# and boots it on tests/smoke/run's kernel (no firmware, no network).
+set -eu
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+pkg=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+
+case $pkg in
+    *.deb)
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -q
+        # Recommends too, as apt installs them by default: python3.
+        apt-get install -yq "$pkg"
+        dpkg -s qemu-chumby | grep -E '^(Version|Depends|Recommends):'
+        dpkg -L qemu-chumby
+        ;;
+    *.rpm)
+        # Weak dependencies too, as a Fedora install has them (the
+        # container image turns them off): python3.
+        dnf install -yq --setopt=install_weak_deps=True "$pkg"
+        rpm -q --requires qemu-chumby
+        rpm -ql qemu-chumby
+        ;;
+    *) echo "test-package: a .deb or .rpm, please" >&2; exit 1 ;;
+esac
+
+q=/usr/bin/qemu-chumby-system-arm
+"$q" --version
+"$q" -machine help | grep '^chumby-classic '
+"$q" -display help | tee /tmp/display
+grep -qx gtk /tmp/display
+grep -qx sdl /tmp/display
+"$q" -audiodev help | tee /tmp/audio
+for a in pipewire pa alsa; do
+    grep -qx "$a" /tmp/audio
+done
+# The keymaps VNC loads, where QEMU looks for them.
+test -f /usr/share/qemu-chumby/keymaps/en-us
+
+# The installed chumby-machine finds the installed QEMU by itself.
+chumby-machine --help >/dev/null
+chumby-ctl --help 2>&1 | grep -q "over its QMP socket"
+python3 -c 'import sys; sys.path.insert(0, "/usr/lib/qemu-chumby"); import os, chumby_machine as cm; print(os.path.realpath(cm.find_qemu()))' |
+    grep -qx "$q"
+
+python3 "$here/tests/smoke/run" "$q"

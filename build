@@ -25,16 +25,28 @@
 #     under Homebrew or elsewhere is used.
 # Its result is DIR/portable, which can be copied anywhere: qemu-system-arm
 # and, in qemu-bundle/ beside it where QEMU looks, the keymaps VNC loads.
+#
+# --package builds what the distro packages (packaging/) hold, on the
+# distro itself and linked against its shared libraries: the portable
+# build's features plus the desktop's, the GTK and SDL windows and sound
+# through PipeWire, PulseAudio and ALSA. It installs nothing; its result
+# is DIR/package, the packages' tree, under names that leave the distro's
+# own QEMU alone (packaging/nfpm.yaml says which):
+#   usr/bin/qemu-chumby-system-arm      QEMU, with /usr/share/qemu-chumby
+#                                       as its data directory
+#   usr/share/qemu-chumby/keymaps/      the keymaps VNC loads
+#   usr/lib/qemu-chumby/                chumby-machine and chumby-ctl
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/qemu-release"
 
 portable=
-if [ "${1:-}" = --portable ]; then
-    portable=yes
-    shift
-fi
+package=
+case ${1:-} in
+    --portable) portable=yes; shift ;;
+    --package) package=yes; shift ;;
+esac
 
 out=${1:-$here/build}
 
@@ -238,6 +250,13 @@ if [ -n "$portable" ]; then
         *) echo "--portable: Linux or macOS only" >&2; exit 1 ;;
     esac
 fi
+if [ -n "$package" ]; then
+    [ "$(uname -s)" = Linux ] || { echo "--package: Linux only" >&2; exit 1; }
+    prefix=/usr
+    opts="$opts --prefix=$prefix --with-suffix=qemu-chumby --without-default-features
+          --disable-plugins --enable-fdt=system --enable-pixman --enable-png --enable-vnc
+          --enable-gtk --enable-sdl --enable-pipewire --enable-pa --enable-alsa"
+fi
 opts=$(echo $opts)
 
 # Configured again when the options change (a build from before they were
@@ -268,4 +287,25 @@ if [ -n "$portable" ]; then
         esac
     done
     echo "built $out/portable"
+fi
+
+if [ -n "$package" ]; then
+    cd "$out"
+    rm -rf package
+    t=package/usr
+    install -Dm755 obj/qemu-system-arm "$t/bin/qemu-chumby-system-arm"
+    strip "$t/bin/qemu-chumby-system-arm"
+    mkdir -p "$t/share/qemu-chumby/keymaps"
+    for k in "$src"/pc-bios/keymaps/*; do
+        case $(basename "$k") in
+            meson.build) ;;
+            *) install -m644 "$k" "$t/share/qemu-chumby/keymaps/" ;;
+        esac
+    done
+    for f in chumby-machine chumby-ctl; do
+        install -Dm755 "$here/$f" "$t/lib/qemu-chumby/$f"
+    done
+    install -m644 "$here/chumby_machine.py" "$t/lib/qemu-chumby/"
+    install -Dm644 "$here/README.md" "$t/share/doc/qemu-chumby/README.md"
+    echo "built $out/package"
 fi

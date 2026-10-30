@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: CC0-1.0 -->
+<component type="desktop-application">
+  <id>io.github.johnmerchant.QemuChumby</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-2.0-or-later</project_license>
+  <name>Chumby Emulator</name>
+  <summary>Run a Chumby Classic on your desktop, in QEMU</summary>
+  <developer id="io.github.johnmerchant">
+    <name>John Merchant</name>
+  </developer>
+  <description>
+    <p>
+      The Chumby Classic, emulated by QEMU with qemu-chumby's
+      chumby-classic machine (Freescale i.MX21, ARM926), in one window:
+      its touch screen, drawn sharp at any size, the top button, the
+      accelerometer, headphones, sound, a USB keyboard and stick, and its
+      serial console.
+    </p>
+    <p>
+      It boots your own Chumby's kernel and flash images, which it does
+      not include. The emulated Chumby has no network.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.johnmerchant.QemuChumby.desktop</launchable>
+  <url type="homepage">https://johnmerchant.github.io/qemu-chumby/</url>
+  <url type="bugtracker">https://github.com/johnmerchant/qemu-chumby/issues</url>
+  <url type="vcs-browser">https://github.com/johnmerchant/qemu-chumby</url>
+  <categories>
+    <category>System</category>
+    <category>Emulator</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <releases>
+    <release version="0.1.0" date="2026-10-31">
+      <description>
+        <p>The first Flatpak: chumby-desktop with qemu-chumby's QEMU inside it.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -30,7 +30,21 @@ Then boot your Chumby's kernel and NAND image (see [Images](#images)):
 
 CI publishes each commit on main's builds on the
 [`prebuilt`](https://github.com/johnmerchant/qemu-chumby/releases/tag/prebuilt)
-release. They need nothing installed: unpack and run. Each tarball's
+release, each with its `.sha256` (ARCH is `x86_64` or `aarch64`):
+
+| Download | For | Install |
+| --- | --- | --- |
+| `qemu-chumby-COMMIT-PLATFORM.tar.xz` | Headless QEMU that needs nothing installed (below) | Unpack; run `qemu-system-arm` |
+| `qemu-chumby-COMMIT-ARCH.flatpak` | Flatpak (desktop app with sound): chumby-desktop with its QEMU, sandboxed, no network | `flatpak install --user ./qemu-chumby-*.flatpak`, then `flatpak run io.github.johnmerchant.QemuChumby` |
+| `qemu-chumby-COMMIT-DISTRO-VERSION-ARCH.deb` or `.rpm` | QEMU with a window and sound on the distro's own libraries, as `qemu-chumby-system-arm` beside the distro's QEMU, with `chumby-machine` and `chumby-ctl`; for Debian 13, Ubuntu 26.04 and 26.10, Fedora 44 and 43 | `sudo apt install ./qemu-chumby-*.deb` or `sudo dnf install ./qemu-chumby-*.rpm` |
+
+The packages' version is QEMU's plus the commit's date and ID
+(`11.1.2+chumby.20261030131130.g3673860`), so each commit upgrades the
+one before; their dependencies are what the binary links
+(`dpkg-shlibdeps`, RPM's `elfdeps`). `packaging/build-package` and
+`flatpak/build` build them.
+
+The tarballs need nothing installed: unpack and run. Each tarball's
 `RUNTIME` says what it was built from and what it links.
 
 | Platform | What it is |

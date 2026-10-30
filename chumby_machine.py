@@ -92,15 +92,17 @@ class Error(Exception):
 
 def find_qemu(given=None):
     """qemu-system-arm with the machine: GIVEN, $QEMU, this checkout's
-    build/obj/, else one on PATH that has the machine."""
+    build/obj/, else the distro packages' qemu-chumby-system-arm or a
+    qemu-system-arm on PATH that has the machine."""
     for q in (given, os.environ.get("QEMU"), os.path.join(HERE, "build", "obj", "qemu-system-arm")):
         if q and os.access(q, os.X_OK):
             return q
-    q = shutil.which("qemu-system-arm")
-    if q:
-        r = subprocess.run([q, "-machine", "help"], capture_output=True, text=True)
-        if re.search(rf"^{MACHINE}\s", r.stdout, re.M):
-            return q
+    for name in ("qemu-chumby-system-arm", "qemu-system-arm"):
+        q = shutil.which(name)
+        if q:
+            r = subprocess.run([q, "-machine", "help"], capture_output=True, text=True)
+            if re.search(rf"^{MACHINE}\s", r.stdout, re.M):
+                return q
     raise Error(f"no qemu-system-arm with the {MACHINE} machine (./build, $QEMU or --qemu)")
 
 
