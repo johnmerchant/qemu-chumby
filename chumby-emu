@@ -45,6 +45,8 @@ Options:
                       screen, 71 x 53 mm, on your display); the window
                       can be resized, keeping its shape
   --no-panel          no control panel (the window only)
+  --link SOCK         UART2 to the unix socket SOCK, which a program on
+                      this machine listens on (no network)
   -- ARGS             passed to QEMU as they are
 """
 import argparse
@@ -82,7 +84,7 @@ def exec_mac_app(exe, a, qemu, extra):
     args = [exe]
     if a.images:
         args.append(a.images)
-    for opt in ("kernel", "nand", "audio", "state"):
+    for opt in ("kernel", "nand", "audio", "state", "link"):
         v = getattr(a, opt)
         if v:
             args += ["--" + opt, v]
@@ -298,6 +300,7 @@ def main():
     ap.add_argument("--write", action="store_true")
     ap.add_argument("--fast", action="store_true")
     ap.add_argument("--state")
+    ap.add_argument("--link")
     ap.add_argument("--no-panel", action="store_true")
     ap.add_argument("--scale", type=float)
     ap.add_argument("-h", "--help", action="store_true")
@@ -362,6 +365,12 @@ def main():
             machine += ",audiodev=snd0"
     if a.fast:
         args += ["-icount", "shift=auto,sleep=off"]
+    if a.link:
+        if "," in a.link:
+            sys.exit("chumby-emu: --link: a path without commas")
+        # The second -serial, after the console: UART2.
+        args += ["-chardev", f"socket,id=link,path={os.path.abspath(a.link)},server=off,reconnect-ms=1000",
+                 "-serial", "chardev:link"]
     args = args[:1] + ["-M", machine] + args[1:] + extra
 
     print("chumby-emu:", " ".join(args), flush=True)

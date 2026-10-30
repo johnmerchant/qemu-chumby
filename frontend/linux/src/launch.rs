@@ -33,6 +33,8 @@ Options:
                    comes in bursts: for scripts and tests
   --scale N        the screen's size, in logical pixels per Chumby pixel
                    (default: a real Chumby's screen, 71 x 53 mm)
+  --link SOCK      UART2 to the unix socket SOCK, which a program here
+                   listens on (no network)
   --console TTY    join this terminal to the console on TTY (what the
                    Console button runs in your terminal app)
   -- ARGS          passed to QEMU as they are
@@ -62,6 +64,9 @@ pub struct Options {
     pub state: Option<PathBuf>,
     pub fast: bool,
     pub scale: Option<f64>,
+    /// A unix socket on this machine for UART2, the link: QEMU connects to
+    /// it.
+    pub link: Option<PathBuf>,
     pub extra: Vec<String>,
     /// A test script (see test.rs), from $CHUMBY_DESKTOP_TEST.
     pub test_script: Option<PathBuf>,
@@ -96,6 +101,13 @@ pub fn parse(args: &[String]) -> Result<Mode, String> {
             "--qemu" => o.qemu = Some(val(&mut i)?.into()),
             "--audio" => o.audio = Some(val(&mut i)?),
             "--state" => o.state = Some(val(&mut i)?.into()),
+            "--link" => {
+                let v = val(&mut i)?;
+                if v.contains(',') {
+                    return Err("--link: a path without commas".into());
+                }
+                o.link = Some(v.into())
+            }
             "--scale" => {
                 let v = val(&mut i)?;
                 o.scale = Some(v.parse().map_err(|_| format!("--scale {v}: not a number"))?)
@@ -361,6 +373,15 @@ impl Session {
         if fast {
             args.extend(["-icount".into(), "shift=auto,sleep=off".into()]);
         }
+        if let Some(link) = &o.link {
+            // The second -serial, after the console: UART2.
+            args.extend([
+                "-chardev".into(),
+                format!("socket,id=link,path={},server=off,reconnect-ms=1000", s(link)),
+                "-serial".into(),
+                "chardev:link".into(),
+            ]);
+        }
         let mut command = vec![s(&qemu), "-M".into(), machine];
         command.extend(args);
         command.extend(o.extra.iter().cloned());
@@ -454,6 +475,9 @@ mod tests {
             panic!()
         };
         assert_eq!(o.kernel.unwrap(), PathBuf::from("k"));
+        let Mode::Run(l) = parse(&args(&["--kernel", "k", "--link", "/tmp/l.sock"])).unwrap() else { panic!() };
+        assert_eq!(l.link.unwrap(), PathBuf::from("/tmp/l.sock"));
+        assert!(parse(&args(&["--kernel", "k", "--link", "/tmp/a,b"])).is_err());
         assert!(o.fast);
         assert_eq!(o.scale, Some(2.5));
         assert_eq!(o.extra, args(&["-append", "x"]));

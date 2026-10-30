@@ -26,6 +26,8 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
     public var fast = false
     /// Points per Chumby pixel; nil: a real Chumby's screen size.
     public var scale: Double?
+    /// A unix socket on the Mac for UART2, the link: QEMU connects to it.
+    public var link: String?
     /// Passed to QEMU as they are.
     public var extra: [String] = []
 
@@ -41,6 +43,8 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
         --state DIR     keep flash writes and the saved state in DIR
         --fast          -icount shift=auto,sleep=off: quick boots, for tests
         --scale N       points per Chumby pixel (default: a real Chumby's size)
+        --link SOCK     UART2 to the unix socket SOCK, which a program here
+                        listens on (no network)
         -- ARGS         passed to QEMU as they are
 
         With no images, a start window offers to open some, and the Chumbys
@@ -80,6 +84,7 @@ public struct LaunchOptions: Codable, Hashable, Sendable {
             case "--qemu": o.qemu = try value(a)
             case "--audio": o.audio = try value(a)
             case "--state": o.state = try value(a)
+            case "--link": o.link = try value(a)
             case "--write": o.write = true
             case "--fast": o.fast = true
             case "--scale":
@@ -230,6 +235,12 @@ public struct QemuCommand {
             if features.machineOptions.contains("audiodev") { machine += ",audiodev=snd0" }
         }
         if o.fast { args += ["-icount", "shift=auto,sleep=off"] }
+        if let link = o.link {
+            // The second -serial, after the console: UART2.
+            guard !link.contains(",") else { throw LaunchError("--link: a path without commas") }
+            args += ["-chardev", "socket,id=link,path=\(link),server=off,reconnect-ms=1000",
+                     "-serial", "chardev:link"]
+        }
         return ["-M", machine] + args + o.extra
     }
 }

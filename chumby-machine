@@ -11,6 +11,8 @@ headless, for scripts and tests, and drives it. Python 3 only.
         --initrd FILE, --append TEXT    as QEMU's
         --stick IMG       a disk image as a USB stick (usb-storage),
                           written as the guest writes it
+        --link SOCK       UART2 to the unix socket SOCK, which a program
+                          on the host listens on (no network)
         --fast            -icount shift=auto,sleep=off: emulated time runs
                           ahead while the guest is idle
         --set PROP=VALUE  a machine property (accel-x, guid, ...)
@@ -103,7 +105,7 @@ def run(m, cmd, args):
             props[k] = v
         opts = dict(kernel=take(args, "--kernel"), nand=take(args, "--nand"), psp=take(args, "--psp"),
                     initrd=take(args, "--initrd"), append=take(args, "--append"), stick=take(args, "--stick"),
-                    qemu=take(args, "--qemu"), nand_write=flag(args, "--nand-write"), fast=flag(args, "--fast"))
+                    link=take(args, "--link"), qemu=take(args, "--qemu"), nand_write=flag(args, "--nand-write"), fast=flag(args, "--fast"))
         if args or not opts["kernel"]:
             usage("start --kernel ZIMAGE [OPTIONS] [-- QEMU OPTIONS]")
         pid = m.start(props=props, extra=extra, **opts)

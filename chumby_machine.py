@@ -37,9 +37,14 @@ harness also needs to know:
   (a temporary overlay) or readonly=on (kept in memory).
 - Console: UART1 (the kernel's ttyS0; the baud rate is ignored) is the
   first -serial, here a unix socket with a log. Its receive FIFO holds 32
-  characters and the guest sees overruns beyond that, so `type` sends 16
-  at a time a little apart; lines end with CR. UART2 and UART4 are the
+  characters; `type` sends 16 at a time a little apart, so that a shell
+  echoing them keeps up; lines end with CR. UART2 and UART4 are the
   second and fourth -serial; UART3 is the crypto processor.
+- Link: `link` connects UART2 (2.6.16's ttyS1, Linux 5's ttymxc1) to a
+  unix socket that something on the host listens on: a byte stream to
+  exactly that one program, and no network. QEMU connects again within a
+  second whenever it isn't there, so either end can start first or
+  restart. Nothing a chardev brings is flagged as an overrun.
 - Touch: input-send-event's abs x and y run 0-32767 across the screen,
   mapped linearly onto the ADC's 0-4095 (`axis` gives a pixel's centre);
   with the settings partition's neutral calibration, /psp/ts_settings of
@@ -179,6 +184,16 @@ class QMP:
 
     def qom_get(self, prop, path="/machine"):
         return self.cmd("qom-get", path=path, property=prop)
+
+
+def link_options(path):
+    """QEMU's options for the link: UART2 (the second -serial, after the
+    console) as a client of the unix socket at PATH, connecting again a
+    second after it goes."""
+    path = os.path.abspath(path)
+    if "," in path:
+        raise Error(f"{path}: a link's path can't have a comma (QEMU's options)")
+    return ["-chardev", f"socket,id=link,path={path},server=off,reconnect-ms=1000", "-serial", "chardev:link"]
 
 
 def connect(sock, path):
@@ -339,7 +354,7 @@ class Machine:
         return QMP(self.at(QMP_SOCK), timeout)
 
     def command_line(self, qemu, kernel, nand=None, nand_write=False, initrd=None, append=None,
-                     stick=None, fast=False, props=None, extra=()):
+                     stick=None, fast=False, props=None, extra=(), link=None):
         for a in extra:
             if a.split("=")[0] in NETWORK_OPTIONS and a != "-nic":
                 raise Error(f"{a} isn't allowed: the emulated Chumby has no network")
@@ -365,17 +380,21 @@ class Machine:
                      "-device", "usb-storage,drive=stick"]
         if fast:
             argv += ["-icount", "shift=auto,sleep=off"]
+        if link:
+            argv += link_options(link)
         return argv + list(extra)
 
     def start(self, kernel, nand=None, nand_write=False, psp=None, initrd=None, append=None, stick=None,
-              fast=False, props=None, qemu=None, extra=(), timeout=30):
+              fast=False, props=None, qemu=None, extra=(), timeout=30, link=None):
         """Starts the machine, headless, and returns once its QMP socket
         answers. NAND is attached with snapshot=on (never changed) unless
         NAND_WRITE; with PSP, a directory, the machine boots a copy of
         NAND in this directory whose settings partition is a JFFS2 image of
         PSP. STICK, an image, is a USB stick (usb-storage), written as the
-        guest writes it. PROPS are the machine's properties (accel-x=...,
-        guid=...); EXTRA, more QEMU options."""
+        guest writes it. LINK, a unix socket's path, is UART2's other end:
+        QEMU connects to it, and again whenever it goes. PROPS are the
+        machine's properties (accel-x=..., guid=...); EXTRA, more QEMU
+        options."""
         if self.running():
             raise Error(f"the machine is already running ({self.path})")
         qemu = find_qemu(qemu)
@@ -393,7 +412,7 @@ class Machine:
             copy = self.at("nand.img")
             nand_with(nand, copy, {"PSP": jffs2(psp, PARTITIONS["PSP"][1])})
             nand, nand_write = copy, True
-        argv = self.command_line(qemu, kernel, nand, nand_write, initrd, append, stick, fast, props, extra)
+        argv = self.command_line(qemu, kernel, nand, nand_write, initrd, append, stick, fast, props, extra, link)
         with open(self.at(CONFIG), "w") as f:
             json.dump({"argv": argv, "stick": stick and os.path.abspath(stick), "started": time.time()}, f)
         open(self.at(LOG), "wb").close()

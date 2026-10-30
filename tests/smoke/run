@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """tests/smoke/run [QEMU]: boots the chumby-classic machine on a kernel of
 a few instructions, made here, and checks it through chumby-machine: the
-console shows what the kernel writes to UART1, QMP answers with the board's
+console shows what the kernel writes to UART1, bytes sent over the link
+(UART2, a unix socket) come back as they went, QMP answers with the board's
 lines, the screen can be dumped as a PNG and read over VNC on a unix
 socket, a USB keyboard and stick are plugged in, the top button and the
 accelerometer can be set, and QEMU quits when asked.
@@ -20,6 +21,7 @@ import socket
 import struct
 import sys
 import tempfile
+import time
 
 sys.dont_write_bytecode = True
 here = os.path.dirname(os.path.abspath(__file__))
@@ -29,24 +31,39 @@ import chumby_machine as cm  # noqa: E402
 MESSAGE = b"chumby-classic: smoke kernel up\r\n"
 
 # The kernel, ARM code loaded at 0xC0008000 and entered in SVC mode with the
-# MMU off: it enables UART1 (0x1000A000), writes MESSAGE to its transmit
-# register and waits for interrupts that never come. Assembled with
-# clang --target=armv5te-none-eabi from:
+# MMU off: it enables UART1 (0x1000A000) and UART2, writes MESSAGE to
+# UART1's transmit register, then echoes what comes on UART2, with a '!' in
+# place of any character the UART flags as an error (an overrun, say).
+# Assembled with clang --target=armv5te-none-eabi from:
 CODE = [
-    0xE59F0028,  #     ldr   r0, =0x1000a000     @ UART1
+    0xE59F0050,  #     ldr   r0, =0x1000a000     @ UART1
     0xE3A01001,  #     mov   r1, #1
     0xE5801080,  #     str   r1, [r0, #0x80]     @ UCR1: UARTEN
     0xE3A01007,  #     mov   r1, #7
     0xE5801084,  #     str   r1, [r0, #0x84]     @ UCR2: SRST, RXEN, TXEN
-    0xE28F2018,  #     adr   r2, msg
+    0xE2803A01,  #     add   r3, r0, #0x1000     @ UART2
+    0xE5831084,  #     str   r1, [r3, #0x84]
+    0xE3A01001,  #     mov   r1, #1
+    0xE5831080,  #     str   r1, [r3, #0x80]
+    0xE28F2030,  #     adr   r2, msg
     0xE4D21001,  # 1:  ldrb  r1, [r2], #1
     0xE3510000,  #     cmp   r1, #0
     0x15801040,  #     strne r1, [r0, #0x40]     @ UTXD
     0x1AFFFFFB,  #     bne   1b
-    0xEE070F90,  # 2:  mcr   p15, 0, r0, c7, c0, 4  @ wait for interrupt
-    0xEAFFFFFD,  #     b     2b
+    0xE5931098,  # 2:  ldr   r1, [r3, #0x98]     @ USR2
+    0xE3110001,  #     tst   r1, #1              @ RDR
+    0x0AFFFFFC,  #     beq   2b
+    0xE5931000,  #     ldr   r1, [r3]            @ URXD
+    0xE3110901,  #     tst   r1, #0x4000         @ ERR
+    0x13A01021,  #     movne r1, #'!'
+    0xE5831040,  #     str   r1, [r3, #0x40]     @ UTXD
+    0xEAFFFFF7,  #     b     2b
     0x1000A000,  #     .ltorg
 ]                # msg: .asciz MESSAGE
+
+# What the link test sends: every byte value, in bursts far longer than the
+# UART's 32-character FIFO.
+LINK_BYTES = bytes(range(256)) * 16
 
 
 def kernel():
@@ -75,6 +92,24 @@ def rfb(path):
         return struct.unpack(">HH", f.read(4))
 
 
+def echoed(listener, data, secs=30):
+    """Sends DATA to the guest over the link (QEMU connects to LISTENER)
+    and reads back as many bytes: (what came back, bytes a second)."""
+    listener.settimeout(secs)
+    conn, _ = listener.accept()
+    with conn:
+        conn.settimeout(secs)
+        start = time.monotonic()
+        conn.sendall(data)
+        got = b""
+        while len(got) < len(data):
+            more = conn.recv(65536)
+            if not more:
+                break
+            got += more
+        return got, len(data) / max(time.monotonic() - start, 1e-6)
+
+
 def check(what, ok, detail=""):
     print(f"{'ok' if ok else 'FAIL'}: {what}{': ' + str(detail) if detail else ''}", flush=True)
     if not ok:
@@ -92,13 +127,20 @@ def main():
         with open(stick, "wb") as f:
             f.truncate(1 << 20)
         m = cm.Machine(os.path.join(tmp, "m"))
+        link = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        link_path = os.path.join(tmp, "link.sock")
+        link.bind(link_path)
+        link.listen(1)
         try:
             # The VNC socket in the machine's directory, where QEMU runs.
-            m.start(zimage, qemu=qemu, stick=stick,
+            m.start(zimage, qemu=qemu, stick=stick, link=link_path,
                     extra=("-vnc", "unix:vnc.sock", "-device", "usb-kbd"))
             argv = m.config()["argv"]
             check("QEMU runs with -nic none", "-nic" in argv and argv[argv.index("-nic") + 1] == "none")
             check("the console", m.wait_log(r"smoke kernel up", 30).group(0) == "smoke kernel up")
+            got, rate = echoed(link, LINK_BYTES)
+            check("bytes over the link (UART2) and back, none lost or flagged", got == LINK_BYTES,
+                  f"{len(got)} of {len(LINK_BYTES)}, {rate / 1024:.0f} KiB/s")
 
             s = m.status()
             check("QMP and the board's lines", s.get("running") and "backlight" in s, s)
@@ -131,6 +173,7 @@ def main():
                   got)
         finally:
             m.stop()
+            link.close()
         check("QEMU quits", not m.running())
 
 

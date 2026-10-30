@@ -235,6 +235,11 @@ final class Box<T>: @unchecked Sendable {
         let s = try c.arguments()
         #expect(s.contains("if=mtd,file=/s/nand.qcow2,format=qcow2"))
         #expect(s.contains("chumby-fast") && s.contains("-icount"))
+        c.options.link = "/tmp/link.sock"
+        let l = try c.arguments()
+        #expect(l.contains("socket,id=link,path=/tmp/link.sock,server=off,reconnect-ms=1000"))
+        #expect(l[l.lastIndex(of: "-serial")! + 1] == "chardev:link")
+        #expect(try LaunchOptions.parse(["--kernel", "k", "--link", "/tmp/l"]).link == "/tmp/l")
     }
 
     @Test func tilt() {

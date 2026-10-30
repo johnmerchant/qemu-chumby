@@ -98,6 +98,8 @@ Each prints its options with `--help`. The scripts (`build`,
   and tests, as a command line and a Python module (`chumby_machine.py`,
   whose header describes the control surface a harness relies on).
   `./chumby-machine --dir m start --kernel zImage`.
+- `--link SOCK` (each of the above): UART2 to a unix socket that a
+  program on the host listens on, a byte stream to it and no network.
 - `chumby-ctl`: drives a running machine over its QMP socket.
   `./chumby-ctl qmp.sock tap 160 120`.
 
