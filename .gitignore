@@ -5,3 +5,4 @@ __pycache__/
 /frontend/mac/.build/
 /frontend/mac/build/
 /_site/
+/out/

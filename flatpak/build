@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# flatpak/build BUNDLE: builds the Flatpak with flatpak-builder (with
+# flathub's runtime, SDK and extensions, which it installs if missing:
+# for the user, or system-wide with FLATPAK_INSTALLATION=--system, as in
+# CI's container) and writes it as a single-file bundle, BUNDLE. Its work
+# is in flatpak/.build (kept, for incremental rebuilds and CI's cache).
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+id=io.github.johnmerchant.QemuChumby
+bundle=${1:?usage: flatpak/build BUNDLE}
+mkdir -p "$(dirname "$bundle")"
+bundle=$(cd "$(dirname "$bundle")" && pwd)/$(basename "$bundle")
+inst=${FLATPAK_INSTALLATION:---user}
+work=$here/.build
+
+# The manifest's QEMU is qemu-release's.
+. "$here/../qemu-release"
+grep -qF "url: $url" "$here/$id.yml"
+grep -qF "sha256: $sha256" "$here/$id.yml"
+
+# The runtime, the SDK and its extensions, installed if missing (and not
+# updated, so a container's preinstalled ones are used as they are).
+kde=$(sed -n "s/^runtime-version: '\(.*\)'$/\1/p" "$here/$id.yml")
+flatpak remote-add "$inst" --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+have() { flatpak info "$inst" "$1" >/dev/null 2>&1; }
+need() { have "$1" || flatpak install "$inst" -y --noninteractive flathub "$1"; }
+need "org.kde.Platform//$kde"
+need "org.kde.Sdk//$kde"
+# The extensions' branch: the freedesktop SDK's that KDE's is built on.
+fdo=$(flatpak info "$inst" --show-metadata "org.kde.Sdk//$kde" |
+    sed -n '/^\[Extension org.freedesktop.Sdk.Extension\]/,/^\[/s/^version *= *//p')
+for e in $(sed -n 's/^  - \(org.freedesktop.Sdk.Extension.*\)$/\1/p' "$here/$id.yml"); do
+    need "$e//$fdo"
+done
+
+mkdir -p "$work"
+cd "$work"
+flatpak-builder "$inst" --disable-rofiles-fuse --force-clean --ccache \
+    --repo=repo --state-dir=state app "$here/$id.yml"
+flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+    repo "$bundle" "$id"
+ls -l "$bundle"

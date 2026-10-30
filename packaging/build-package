@@ -1,0 +1,110 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# packaging/build-package [--reuse]: builds the distro package, a .deb on
+# Debian and Ubuntu or an .rpm on Fedora, on the distro it is for, as root
+# in a container of it (CI's packages job), from the checkout it is run in.
+# It installs the build's packages, runs ./build --package out (unless
+# --reuse and out/package is there already, from CI's cache), derives the
+# runtime dependencies from the binary with the distro's own tools
+# (dpkg-shlibdeps; rpm's elfdeps, whose sonames RPM resolves itself) and
+# packs out/package with nfpm (packaging/nfpm.yaml) into out/dist.
+#
+# PKG_VERSION, if set, is the package's version; else it is made from
+# qemu-release and the checkout's HEAD:
+#   QEMU's version + chumby.COMMITDATE.gSHORTSHA
+#   e.g. 11.1.2+chumby.20261030131134.g3673860
+# COMMITDATE is the commit's committer date, UTC, YYYYMMDDHHMMSS, so each
+# commit on main sorts after the one before it, and a new QEMU release
+# sorts after all of them (dpkg and rpm compare these alike).
+set -eu
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+cd "$here"
+. ./qemu-release
+
+reuse=
+[ "${1:-}" = --reuse ] && reuse=yes
+
+. /etc/os-release
+case " $ID ${ID_LIKE:-} " in
+    *" debian "*|*" ubuntu "*) kind=deb ;;
+    *" fedora "*) kind=rpm ;;
+    *) echo "build-package: Debian, Ubuntu or Fedora only, not $ID" >&2; exit 1 ;;
+esac
+
+if [ $kind = deb ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -yq --no-install-recommends \
+        build-essential python3 python3-venv ninja-build pkg-config \
+        libglib2.0-dev libpixman-1-dev libpng-dev zlib1g-dev libfdt-dev \
+        libgtk-3-dev libsdl2-dev libpipewire-0.3-dev libpulse-dev libasound2-dev \
+        curl ca-certificates xz-utils patch dpkg-dev git
+else
+    dnf install -yq gcc make python3 ninja-build pkgconf glib2-devel pixman-devel \
+        libpng-devel zlib-devel libfdt-devel gtk3-devel SDL2-devel pipewire-devel \
+        pulseaudio-libs-devel alsa-lib-devel curl xz patch rpm-build git \
+        findutils diffutils
+fi
+
+if [ -z "$reuse" ] || [ ! -x out/package/usr/bin/qemu-chumby-system-arm ]; then
+    ./build --package out
+fi
+q=out/package/usr/bin/qemu-chumby-system-arm
+"$q" -machine help | grep '^chumby-classic '
+
+if [ -z "${PKG_VERSION:-}" ]; then
+    git config --global --add safe.directory "$here"
+    date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S)
+    PKG_VERSION=$version+chumby.$date.g$(git rev-parse --short=7 HEAD)
+fi
+export PKG_VERSION
+
+# nfpm, its pinned release.
+. packaging/nfpm-release
+case $(uname -m) in
+    x86_64) nfpm_arch=x86_64 nfpm_sha256=$x86_64_sha256 ;;
+    aarch64) nfpm_arch=arm64 nfpm_sha256=$aarch64_sha256 ;;
+    *) echo "build-package: no nfpm for $(uname -m)" >&2; exit 1 ;;
+esac
+tools=out/tools
+mkdir -p "$tools"
+tgz=$tools/nfpm_${nfpm_version}_Linux_$nfpm_arch.tar.gz
+if [ ! -f "$tgz" ]; then
+    curl -fsSL -o "$tgz.part" \
+        "https://github.com/goreleaser/nfpm/releases/download/v$nfpm_version/nfpm_${nfpm_version}_Linux_$nfpm_arch.tar.gz"
+    mv "$tgz.part" "$tgz"
+fi
+echo "$nfpm_sha256  $tgz" | sha256sum -c -
+tar -C "$tools" -xzf "$tgz" nfpm
+
+# The runtime dependencies, from what the binary links.
+config=out/nfpm.yaml
+cp packaging/nfpm.yaml "$config"
+echo "depends:" >> "$config"
+if [ $kind = deb ]; then
+    PKG_ARCH=$(dpkg --print-architecture)
+    PKG_RELEASE=1
+    # dpkg-shlibdeps wants a source package's debian/control.
+    d=$(mktemp -d)
+    mkdir "$d/debian"
+    printf 'Source: qemu-chumby\n\nPackage: qemu-chumby\nArchitecture: any\n' > "$d/debian/control"
+    deps=$(cd "$d" && dpkg-shlibdeps -O "$here/$q" | sed -n 's/^shlibs:Depends=//p')
+    rm -rf "$d"
+    echo "$deps" | tr ',' '\n' | sed 's/^ *//; /^$/d' > out/depends
+else
+    PKG_ARCH=$(uname -m)
+    PKG_RELEASE=1$(rpm --eval '%{?dist}')
+    /usr/lib/rpm/elfdeps --requires "$q" | sort -u > out/depends
+fi
+test -s out/depends
+sed 's/^/  - "/; s/$/"/' out/depends >> "$config"
+export PKG_ARCH PKG_RELEASE
+
+echo "qemu-chumby $PKG_VERSION-$PKG_RELEASE ($PKG_ARCH) depends on:"
+cat out/depends
+rm -rf out/dist
+mkdir -p out/dist
+"$tools/nfpm" package -f "$config" -p "$kind" -t out/dist/
+ls -l out/dist

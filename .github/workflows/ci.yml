@@ -20,8 +20,22 @@
 # COMMIT is the full commit ID; PLATFORM is linux-x86_64, linux-aarch64 or
 # macos-arm64. Each tarball holds qemu-system-arm, qemu-bundle/ beside it
 # (the keymaps VNC loads), RUNTIME (what it needs to run, which is nothing,
-# and what it links) and COPYING. The release keeps the newest 100 commits'
-# builds. Pull requests build and test, and publish nothing.
+# and what it links) and COPYING.
+#
+# For the Linux desktop, beside them on the same release, each with its
+# .sha256:
+#   qemu-chumby-COMMIT-ARCH.flatpak (`flatpak`): chumby-desktop, the app,
+#     with its QEMU and sound (flatpak/), a single-file bundle; installed
+#     in its builder's container and run headless on the smoke kernel.
+#   qemu-chumby-COMMIT-DISTRO-VERSION-ARCH.deb or .rpm (`packages`): QEMU
+#     with its GTK and SDL windows and sound, built on each distro against
+#     its own libraries (packaging/); each installed in a clean container
+#     of its distro and booted on tests/smoke/run.
+# ARCH is x86_64 or aarch64. These build on main, by hand, and on pull
+# requests that change what they're built from (`changes`).
+#
+# The release keeps the newest 100 commits' builds. Pull requests build and
+# test, and publish nothing.
 #
 # The project's page, https://johnmerchant.github.io/qemu-chumby/, is made
 # by site/build-site on every run (`site`) and deployed to GitHub Pages
@@ -282,10 +296,188 @@ jobs:
             grep -q 'chumby-classic: smoke kernel up' "$RUNNER_TEMP/console"
           done
 
+  # Whether to build the Flatpak and the distro packages: on main and by
+  # hand (if COMMIT has packaging/), and on pull requests that change what
+  # they're built from or test with.
+  changes:
+    name: What changed
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.c.outputs.linux }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+          fetch-depth: 0
+      - id: c
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ ! -x packaging/build-package ]; then
+            linux=false
+          elif [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            linux=true
+          elif git diff --name-only "$BASE...HEAD" | tee /dev/stderr | grep -qE \
+              '^(build|qemu-release|patches/|packaging/|flatpak/|frontend/linux/|chumby-machine|chumby-ctl|chumby_machine\.py|tests/|\.github/workflows/ci\.yml$)'; then
+            linux=true
+          else
+            linux=false
+          fi
+          echo "linux=$linux" | tee -a "$GITHUB_OUTPUT"
+
+  # The distro packages: packaging/build-package on each distro, in a
+  # container of it, then packaging/test-package in a clean one.
+  packages:
+    name: Package (${{ matrix.distro }}, ${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.linux == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # The distros, here only: Debian's stable release, Ubuntu's
+        # current LTS and its newest release, and Fedora's newest two.
+        # Bump them as they release (Ubuntu each April and October, Fedora
+        # about then too, Debian every two years or so): the image tag is
+        # all that changes, and each package's name follows from it.
+        distro: ['debian:13', 'ubuntu:26.04', 'ubuntu:26.10', 'fedora:44', 'fedora:43']
+        arch: [x86_64, aarch64]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      - name: Its name
+        id: name
+        run: |
+          d=${{ matrix.distro }}
+          case $d in fedora:*) ext=rpm ;; *) ext=deb ;; esac
+          echo "name=qemu-chumby-$COMMIT-${d%%:*}-${d#*:}-${{ matrix.arch }}.$ext" >> "$GITHUB_OUTPUT"
+          echo "slug=${d%%:*}-${d#*:}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+      - name: Restore the tarball
+        uses: actions/cache@v4
+        with:
+          path: out/*.tar.xz
+          key: qemu-tarball-${{ hashFiles('qemu-release') }}
+      # The built tree, keyed by the distro and what it's built from: a hit
+      # skips the build (the package and its dependencies are still made).
+      - name: Restore the build
+        uses: actions/cache@v4
+        with:
+          path: out/package
+          key: qemu-package-${{ steps.name.outputs.slug }}-${{ hashFiles('build', 'qemu-release', 'patches/*.patch', 'chumby-machine', 'chumby-ctl', 'chumby_machine.py', 'README.md') }}
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w -e HOST_IDS="$(id -u):$(id -g)" \
+            "docker.io/library/${{ matrix.distro }}" sh -ec '
+              trap "chown -R $HOST_IDS out" EXIT
+              packaging/build-package --reuse'
+          mkdir dist
+          cp out/dist/*.* "dist/${{ steps.name.outputs.name }}"
+          cd dist
+          sha256sum ./*.* | sed 's| \./| |' > "${{ steps.name.outputs.name }}.sha256"
+          cat ./*.sha256
+          ls -l
+      - name: Install and test in a clean container
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -w /w "docker.io/library/${{ matrix.distro }}" \
+            packaging/test-package "dist/${{ steps.name.outputs.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ steps.name.outputs.slug }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The Flatpak (flatpak/build), in Flathub's builder image for the KDE
+  # runtime the manifest names, then installed there and run: QEMU's
+  # machine and sound backends, and the app itself, headless (offscreen),
+  # booting the smoke kernel through its test hook.
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.linux == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11
+      options: --privileged
+    env:
+      FLATPAK_INSTALLATION: --system
+      NAME: qemu-chumby-${{ inputs.commit || github.event.pull_request.head.sha || github.sha }}-${{ matrix.arch }}.flatpak
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.COMMIT }}
+      # flatpak-builder's downloads, ccache and built modules: an unchanged
+      # QEMU module is reused.
+      - name: Restore the builder's state
+        uses: actions/cache@v4
+        with:
+          path: flatpak/.build/state
+          key: flatpak-${{ matrix.arch }}-${{ hashFiles('flatpak/build', 'flatpak/*.yml', 'flatpak/*.json', 'flatpak/*.xml', 'patches/*.patch', 'frontend/linux/**') }}
+          restore-keys: flatpak-${{ matrix.arch }}-
+      - name: Build
+        run: |
+          flatpak/build "dist/$NAME"
+          cd dist
+          sha256sum "$NAME" > "$NAME.sha256"
+          cat "$NAME.sha256"
+      - name: Install and run
+        run: |
+          id=io.github.johnmerchant.QemuChumby
+          flatpak install --system -y --noninteractive "dist/$NAME"
+          flatpak info "$id"
+          q() { flatpak run --command=qemu-system-arm "$id" "$@"; }
+          q -machine help | grep '^chumby-classic '
+          q -audiodev help | tee "$RUNNER_TEMP/audio"
+          grep -qx pa "$RUNNER_TEMP/audio"
+          grep -qx pipewire "$RUNNER_TEMP/audio"
+          # The app, headless, on the smoke kernel: its test hook resets
+          # the machine once the app is on its console (the kernel says
+          # its line once, at boot), waits for the line, grabs the window
+          # and quits.
+          t=$RUNNER_TEMP/app
+          mkdir -p "$t"
+          python3 tests/smoke/run --kernel "$t/smoke.bin"
+          printf '%s\n' 'wait 2000' 'call reset' 'waitfor smoke kernel up 60' \
+            "grab $t/window.png" "log $t/console.log" quit > "$t/test"
+          export XDG_RUNTIME_DIR=$t/run
+          mkdir -m 700 "$XDG_RUNTIME_DIR"
+          timeout 180 flatpak run --filesystem="$t" --env=QT_QPA_PLATFORM=offscreen \
+            --env=CHUMBY_DESKTOP_TEST="$t/test" "$id" --kernel "$t/smoke.bin" --audio none \
+            2>&1 | tee "$t/out"
+          grep -q 'test: waitfor "smoke kernel up": seen' "$t/out"
+          grep -q "test: grab $t/window.png: saved" "$t/out"
+          grep -q 'smoke kernel up' "$t/console.log"
+          test -s "$t/window.png"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: |
+            dist/${{ env.NAME }}
+            dist/${{ env.NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish
-    needs: [build, stock]
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [build, stock, packages, flatpak]
+    # The Flatpak and the packages are skipped when COMMIT has no
+    # packaging/ (a build by hand of an older commit).
+    if: >-
+      always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+      && needs.build.result == 'success'
+      && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -319,9 +511,9 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --prerelease --latest=false --target main \
               --title 'Prebuilt qemu-system-arm' \
-              --notes "qemu-system-arm with the chumby-classic machine, built by CI for each commit on main: qemu-chumby-COMMIT-PLATFORM.tar.xz (COMMIT the full commit ID; PLATFORM linux-x86_64, linux-aarch64 or macos-arm64) and its .sha256. Each tarball's RUNTIME says what it needs to run. The newest $KEEP commits' builds are kept. The source of each is its commit (./build); GPL-2.0-or-later."
+              --notes "qemu-system-arm with the chumby-classic machine, built by CI for each commit on main: qemu-chumby-COMMIT-PLATFORM.tar.xz (COMMIT the full commit ID; PLATFORM linux-x86_64, linux-aarch64 or macos-arm64) and its .sha256. Each tarball's RUNTIME says what it needs to run. For the Linux desktop: qemu-chumby-COMMIT-ARCH.flatpak (the chumby-desktop app) and the distro packages qemu-chumby-COMMIT-DISTRO-VERSION-ARCH.deb or .rpm. The newest $KEEP commits' builds are kept. The source of each is its commit (./build); GPL-2.0-or-later."
           fi
-          gh release upload "$TAG" ./*.tar.xz ./*.sha256 --clobber
+          gh release upload "$TAG" $(ls ./*.tar.xz ./*.flatpak ./*.deb ./*.rpm 2>/dev/null) ./*.sha256 --clobber
       # Assets of all but the newest KEEP commits, by upload time.
       - name: Prune
         run: |
@@ -363,7 +555,10 @@ jobs:
   # and uploaded as the Pages artifact that `pages` deploys.
   site:
     name: Site
-    needs: build
+    needs: [build, packages, flatpak]
+    if: >-
+      always() && needs.build.result == 'success'
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

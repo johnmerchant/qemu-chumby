@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# chumby-desktop (frontend/linux) as a Flatpak, with qemu-chumby's QEMU
+# inside it. Built offline, as Flathub builds: QEMU from the tarball
+# qemu-release pins (the url and sha256 below must match it, which CI
+# checks) with patches/ applied, and the app's crates from
+# cargo-sources.json, which flatpak-cargo-generator makes from
+# frontend/linux/Cargo.lock.
+#
+#   flatpak-builder --user --install --force-clean build-dir \
+#       flatpak/io.github.johnmerchant.QemuChumby.yml
+#
+# KDE's runtime: Qt 6 with Qt Quick and Plasma's Qt Quick style, which the
+# app takes on KDE (Fusion elsewhere), and freedesktop's pixman, glib,
+# libpng, PulseAudio and PipeWire, which QEMU needs.
+id: io.github.johnmerchant.QemuChumby
+runtime: org.kde.Platform
+runtime-version: '6.11'
+sdk: org.kde.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm21
+command: chumby-desktop
+finish-args:
+  # The window: Wayland, else X11.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # Qt Quick draws with the GPU.
+  - --device=dri
+  # Sound: PulseAudio's socket, which PipeWire's pipewire-pulse serves too.
+  - --socket=pulseaudio
+  # No --share=network: the emulated Chumby never has a network, and the
+  # app needs none. Images are opened through the file chooser portal.
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/doc
+modules:
+  - name: qemu
+    buildsystem: simple
+    build-commands:
+      - for p in chumby-patches/*.patch; do patch -s -p1 < "$p"; done
+      # Only what the app uses: the machine, VNC (the app reads the screen
+      # from it), PNG screendumps, sound and qemu-img (--state).
+      - >-
+        mkdir obj && cd obj && ../configure --prefix=/app
+        --target-list=arm-softmmu --without-default-features
+        --disable-docs --disable-werror --disable-plugins
+        --enable-tools --enable-fdt=internal --enable-pixman --enable-png
+        --enable-vnc --enable-pa --enable-pipewire --enable-alsa
+      - ninja -C obj qemu-system-arm qemu-img
+      - install -Dm755 -t /app/bin obj/qemu-system-arm obj/qemu-img
+      - mkdir -p /app/share/qemu/keymaps
+      - for k in pc-bios/keymaps/*; do case "$k" in */meson.build) ;; *) install -m644 "$k" /app/share/qemu/keymaps/ ;; esac; done
+    sources:
+      - type: archive
+        url: https://download.qemu.org/qemu-11.1.2.tar.xz
+        sha256: 731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016
+      # libfdt, which the tarball's subprojects/dtc.wrap would fetch at
+      # configure time: the same commit, fetched beforehand.
+      - type: git
+        url: https://gitlab.com/qemu-project/dtc.git
+        commit: b6910bec11614980a21e46fbccc35934b671bd81
+        dest: subprojects/dtc
+      - type: dir
+        path: ../patches
+        dest: chumby-patches
+
+  - name: chumby-desktop
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
+      env:
+        CARGO_HOME: /run/build/chumby-desktop/cargo
+        CARGO_NET_OFFLINE: 'true'
+        # CXX-Qt's static libraries need lld (GNU ld fails).
+        RUSTFLAGS: -C link-arg=-fuse-ld=lld
+    build-commands:
+      - cargo build --release --locked --offline
+      - install -Dm755 target/release/chumby-desktop /app/bin/chumby-desktop
+      - install -Dm644 data/io.github.johnmerchant.QemuChumby.desktop /app/share/applications/io.github.johnmerchant.QemuChumby.desktop
+      - install -Dm644 data/chumby-desktop.svg /app/share/icons/hicolor/scalable/apps/io.github.johnmerchant.QemuChumby.svg
+      - install -Dm644 io.github.johnmerchant.QemuChumby.metainfo.xml /app/share/metainfo/io.github.johnmerchant.QemuChumby.metainfo.xml
+    sources:
+      - type: dir
+        path: ../frontend/linux
+        skip:
+          - target
+      - type: file
+        path: io.github.johnmerchant.QemuChumby.metainfo.xml
+      - cargo-sources.json
