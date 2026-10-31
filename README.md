@@ -65,7 +65,9 @@ and `screendump`.
 
 The patches apply to QEMU 11.1.3 (`qemu-release` pins the tarball and its
 SHA-256). CI's daily `qemu-sync` job (`./qemu-sync`) proposes each newer
-release as a pull request, whose CI says whether they still apply.
+release as a pull request, with the series re-exported for it by
+`./dev-series` (or, if a patch no longer applies, the pull request says
+which), and whose CI says whether they still apply and build.
 
 Each patch is a DEP-3 header (`Description:`, `Author:`, then
 `Upstream-Status: Inappropriate [AI generated code]`, `Signed-off-by:`

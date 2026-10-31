@@ -12,13 +12,24 @@ vMAJOR.MINOR.PATCH only (never -rc). Two bumps can be due:
   series  the newest release of the newest newer series (11.2.x,
           12.0.x...), which will likely need porting.
 
-Each is one commit on a fixed branch, qemu-bump/point or
-qemu-bump/series, made from the current commit (main): qemu-release
-(version, url, sha256) and the README's mentions of the version. Its
-tarball is downloaded from download.qemu.org and checked against the
-.sig beside it, a detached signature by QEMU's release key, which is
-pinned here (FINGERPRINT, and qemu-release-key.asc): nothing else is
-trusted, and the SHA-256 written is that of the verified file.
+Each is a fixed branch, qemu-bump/point or qemu-bump/series, made from
+the current commit (main). Its first commit is qemu-release (version,
+url, sha256), the Flatpak manifest's QEMU source and the README's
+mentions of the version. The tarball is downloaded from
+download.qemu.org and checked against the .sig beside it, a detached
+signature by QEMU's release key, which is pinned here (FINGERPRINT, and
+qemu-release-key.asc): nothing else is trusted, and the SHA-256 written
+is that of the verified file.
+
+Then the patch series is carried over, as CI's round trip checks it:
+./dev-series import applies patches/ to the verified tarball's tree and
+./dev-series export writes it back. If that changes the patches (a hunk
+that moved, or context that changed upstream), a second commit has
+them. Only hunk headers and context lines should change; if anything
+else did, the pull request says so. If a patch doesn't apply, nothing
+of the series is committed: the branch keeps main's patches/, and the
+pull request names the patch and gives git apply's error, for porting
+by hand.
 
 The branch is force-pushed and a pull request opened (or, for a newer
 release than the open one targets, updated) with gh, then CI is run on
@@ -29,16 +40,18 @@ open pull requests, the branch is pushed and the URL to open one by
 hand is printed. Nothing is merged or approved.
 
 --dry-run does everything but commit, push and touch pull requests: it
-finds the releases, downloads and verifies what's due, and prints the
-plan. --self-test checks the verification: the pinned release's tarball
-must pass and match qemu-release's SHA-256, and a copy with one byte
-changed must fail.
+finds the releases, downloads and verifies what's due, carries the
+series over, and prints the plan. --self-test checks the verification:
+the pinned release's tarball must pass and match qemu-release's SHA-256,
+and a copy with one byte changed must fail.
 
-Needs git, gpgv, and for anything but --self-test, gh (GH_TOKEN).
+Needs git, gpgv, tar and xz, and for anything but --self-test, gh
+(GH_TOKEN).
 """
 
 import argparse
 import base64
+import difflib
 import hashlib
 import json
 import os
@@ -63,6 +76,8 @@ DOWNLOAD = "https://download.qemu.org"
 FINGERPRINT = "CEACC9E15534EBABB82D3FA03353C9CEF108B584"
 KEYFILE = os.path.join(HERE, "qemu-release-key.asc")
 FLATPAK_MANIFEST = "flatpak/io.github.johnmerchant.QemuChumby.yml"
+DEV_SERIES = os.path.join(HERE, "dev-series")
+PATCHES = os.path.join(HERE, "patches")
 
 BRANCHES = {"point": "qemu-bump/point", "series": "qemu-bump/series"}
 BOT = "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
@@ -200,9 +215,95 @@ def fetch_verified(v, tmp):
     digest = sha256(path)
     print(f"verified {os.path.basename(url)}: signed by {FINGERPRINT}, "
           f"SHA-256 {digest}")
-    os.unlink(path)
     os.unlink(path + ".sig")
-    return digest
+    return path, digest
+
+
+def skeleton(text):
+    """A patch without its hunk headers and context lines: what carrying
+    it over to another release must leave as it is (its DEP-3 header,
+    the files it touches and every line it adds or removes)."""
+    header, _, diff = text.partition("\n---\n")
+    return header.split("\n") + ["---"] + [
+        l for l in diff.split("\n") if l and not l.startswith(("@@ ", " "))]
+
+
+def carry(tarball, new, tmp):
+    """patches/ applied to the release in tarball (./dev-series import)
+    and written back (./dev-series export), as CI's round trip does.
+
+    A dict: failed, dev-series's error naming the first patch that git
+    apply refused (and nothing else set); or else out, the directory the
+    series was exported to, changed, the patches that differ from
+    patches/, and other, what changed beyond hunk headers and context
+    lines."""
+    src = os.path.join(tmp, f"qemu-{fmt(new)}")
+    out = os.path.join(tmp, f"patches-{fmt(new)}")
+    for d in (src, out):
+        shutil.rmtree(d, ignore_errors=True)
+        os.mkdir(d)
+    run("tar", "-C", src, "--strip-components=1", "-xf", tarball)
+    # Who makes the tree's first commit, the release; each patch's commit
+    # is its Author:'s. Dates are UTC (dev-series sets TZ).
+    name, _, email = BOT.partition(" <")
+    email = email.rstrip(">")
+    env = dict(os.environ, TZ="UTC", GIT_AUTHOR_NAME=name,
+               GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME=name,
+               GIT_COMMITTER_EMAIL=email)
+    r = run(sys.executable, "-I", DEV_SERIES, "import", src, PATCHES,
+            check=False, env=env)
+    if r.returncode != 0:
+        shutil.rmtree(src)
+        return {"failed": r.stderr.strip() or f"dev-series import: exit {r.returncode}"}
+    run(sys.executable, "-I", DEV_SERIES, "export", src, out, env=env)
+    shutil.rmtree(src)
+
+    def names(d):
+        return {f for f in os.listdir(d) if f.endswith(".patch")}
+
+    changed, other = [], []
+    for f in sorted(names(PATCHES) | names(out)):
+        a = os.path.join(PATCHES, f)
+        b = os.path.join(out, f)
+        if not os.path.exists(b):
+            changed.append(f)
+            other.append(f"{f}: not exported")
+            continue
+        if not os.path.exists(a):
+            changed.append(f)
+            other.append(f"{f}: exported, but not in patches/")
+            continue
+        with open(a) as fa, open(b) as fb:
+            ta, tb = fa.read(), fb.read()
+        if ta == tb:
+            continue
+        changed.append(f)
+        sa, sb = skeleton(ta), skeleton(tb)
+        if sa != sb:
+            # Without difflib's own @@ lines, whose numbers are of the
+            # skeletons, not of the patch.
+            d = [l for l in difflib.unified_diff(sa, sb, f"a/{f}", f"b/{f}",
+                                                 n=1, lineterm="")
+                 if not l.startswith("@@ ")]
+            other.append(f"{f}: more than hunk headers and context lines:\n"
+                         + "\n".join(d[:40]) + ("\n..." if len(d) > 40 else ""))
+    return {"failed": None, "out": out, "changed": changed, "other": other}
+
+
+def describe(c, new):
+    """carry()'s result in a line, for the log."""
+    n = fmt(new)
+    if c["failed"]:
+        lines = c["failed"].splitlines()
+        s = f"the series does not apply to {n}: {lines[0].rstrip(':')}"
+        return s + (f" ({lines[1]})" if len(lines) > 1 else "")
+    if not c["changed"]:
+        return f"the series applies to {n} and re-exports unchanged"
+    s = (f"the series applies to {n}; re-exporting it changes "
+         f"{', '.join(c['changed'])}")
+    if c["other"]:
+        s += " (more than hunk headers and context: see the pull request)"
+    return s
 
 
 def pinned():
@@ -329,7 +430,48 @@ def message(kind, old, new):
             f"Made by CI's qemu-sync job (./qemu-sync).\n")
 
 
-def body(kind, old, new, digest):
+def series_section(c, new):
+    """The pull request's section on the patch series."""
+    n = fmt(new)
+    s = "## The patch series\n\n"
+    if c["failed"]:
+        patch = c["failed"].split(" ", 1)[0]
+        return s + (
+            f"**`{patch}` does not apply to QEMU {n}.** Nothing of the "
+            f"series was carried over: `patches/` here is main's, and this "
+            f"pull request's builds will fail until it is ported. "
+            f"`./dev-series import` stopped at it; `git apply` said:\n\n"
+            f"````\n{c['failed']}\n````\n\n"
+            f"To port it: `./dev-series import DIR PATCHES` the patches "
+            f"before it into a QEMU {n} tree (PATCHES a directory of just "
+            f"those), apply `{patch}` by hand and commit it, then the "
+            f"rest; `./dev-series export DIR` writes `patches/` back, to "
+            f"commit here.\n")
+    s += (f"Carried over to {n} as CI's round trip checks it: "
+          f"`./dev-series import` applied `patches/` to the verified "
+          f"tarball's tree, and `./dev-series export` wrote it back. ")
+    if not c["changed"]:
+        return s + "That changed nothing: the patches are main's.\n"
+    k = len(c["changed"])
+    s += (f"That changed {k} patch{'es' if k != 1 else ''}, in this pull "
+          f"request's second commit:\n\n"
+          + "".join(f"- `{f}`\n" for f in c["changed"]) + "\n")
+    if not c["other"]:
+        return s + ("Only hunk headers and context lines changed: each "
+                    "patch's DEP-3 header, the files it touches and the "
+                    "lines it adds and removes are as they were.\n")
+    # Fenced with four backticks, since a patch may hold three; and only
+    # the first ten, to keep within a pull request body's size.
+    shown = "".join(f"````diff\n{o}\n````\n\n" for o in c["other"][:10])
+    if len(c["other"]) > 10:
+        shown += f"... and {len(c['other']) - 10} more: see the second commit.\n"
+    return s + (
+        "**More than hunk headers and context lines changed**, which "
+        "carrying the series over shouldn't do. Check these before "
+        "merging:\n\n" + shown)
+
+
+def body(kind, old, new, digest, c):
     o, n = fmt(old), fmt(new)
     if kind == "point":
         expect = ("A point release of the pinned series: the patches should "
@@ -341,6 +483,7 @@ def body(kind, old, new, digest):
             f"**This pull request's CI says whether the patch series still "
             f"applies to {n} and builds:** `./build` applies `patches/*.patch` "
             f"to the new tarball, and the builds boot the smoke test.\n\n"
+            f"{series_section(c, new)}\n"
             f"## Upstream\n\n{changes(old, new)}\n"
             f"## The tarball\n\n{tarball_url(new)}, verified against its "
             f"`.sig` with QEMU's release key `{FINGERPRINT}` "
@@ -349,7 +492,38 @@ def body(kind, old, new, digest):
             f"when a newer release comes out. It is never merged automatically.\n")
 
 
-def bump(kind, old, new, digest, base, dry):
+def series_message(new, c):
+    n = fmt(new)
+    nums = ", ".join(f.split("-", 1)[0] for f in c["changed"])
+    text = (f"The series as it applies to QEMU {n}: ./dev-series import of "
+            f"patches/ into {n}'s tree, and ./dev-series export of it, as "
+            f"CI's round trip does. It changes {nums}.")
+    text += (" Only hunk headers and context lines changed." if not c["other"]
+             else " More than hunk headers and context lines changed: see "
+                  "the pull request.")
+    return (f"patches: the series re-exported for QEMU {n}\n\n"
+            f"{textwrap.fill(text, 72)}\n\n"
+            f"Made by CI's qemu-sync job (./qemu-sync).\n")
+
+
+def commit(msg):
+    env = dict(os.environ, TZ="UTC")
+    run("git", "-C", HERE, "-c", "user.name=github-actions[bot]",
+        "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+        "commit", "-q", "--author", BOT, "-F", "-", input=msg, env=env)
+
+
+def warn(text):
+    """A warning in the log, and on the run's summary."""
+    print(f"::warning::{text}" if os.environ.get("GITHUB_ACTIONS")
+          else f"warning: {text}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(f"{text}\n\n")
+
+
+def bump(kind, old, new, digest, tarball, base, dry, tmp):
     branch = BRANCHES[kind]
     n = fmt(new)
     r = repo()
@@ -360,26 +534,42 @@ def bump(kind, old, new, digest, base, dry):
     if prs and have == n:
         print(f"{kind}: {prs[0]['url']} already targets {n}; nothing to do")
         return
+    c = carry(tarball, new, tmp)
+    print(f"{kind}: {describe(c, new)}", flush=True)
+    if c["failed"]:
+        print(textwrap.indent(c["failed"], "  "), flush=True)
+    two = not c["failed"] and c["changed"]
     if dry:
         verb = f"update {prs[0]['url']}" if prs else "open a pull request"
-        push = "" if have == n and not prs else f"force-push {branch} (main + one commit), "
-        print(f"{kind}: would {push}{verb}: {title!r}")
+        print(f"{kind}: would force-push {branch} (main + "
+              f"{'two commits' if two else 'one commit'}), {verb}: {title!r}")
         return
+    if c["failed"]:
+        warn(f"{kind}: {describe(c, new)}. The pull request keeps main's "
+             f"patches/ and names the patch to port.")
+    elif c["other"]:
+        warn(f"{kind}: {describe(c, new)}")
 
-    if have != n:
+    # Made again whenever there's no pull request yet, so that the branch
+    # is what the body says.
+    if have != n or not prs:
         run("git", "-C", HERE, "switch", "-q", "-C", branch, base)
         edit_files(old, new, digest)
         run("git", "-C", HERE, "add", "qemu-release", "README.md", FLATPAK_MANIFEST)
-        env = dict(os.environ, TZ="UTC")
-        run("git", "-C", HERE, "-c", "user.name=github-actions[bot]",
-            "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-            "commit", "-q", "--author", BOT, "-F", "-",
-            input=message(kind, old, new), env=env)
+        commit(message(kind, old, new))
+        if two:
+            for f in os.listdir(PATCHES):
+                if f.endswith(".patch"):
+                    os.remove(os.path.join(PATCHES, f))
+            for f in os.listdir(c["out"]):
+                shutil.copyfile(os.path.join(c["out"], f), os.path.join(PATCHES, f))
+            run("git", "-C", HERE, "add", "-A", "patches")
+            commit(series_message(new, c))
         run("git", "-C", HERE, "push", "-q", "--force", "origin", f"HEAD:refs/heads/{branch}")
         run("git", "-C", HERE, "switch", "-q", "--detach", base)
         print(f"{kind}: pushed {branch} with {n}")
 
-    text = body(kind, old, new, digest)
+    text = body(kind, old, new, digest, c)
     if prs:
         run("gh", "pr", "edit", prs[0]["url"], "--title", title, "--body", text)
         print(f"{kind}: updated {prs[0]['url']}")
@@ -431,8 +621,9 @@ def main():
                       f"signature isn't on {DOWNLOAD} yet; later")
                 continue
             print(f"{kind}: {fmt(current)} -> {fmt(new)}")
-            digest = fetch_verified(new, tmp)
-            bump(kind, current, new, digest, base, a.dry_run)
+            tarball, digest = fetch_verified(new, tmp)
+            bump(kind, current, new, digest, tarball, base, a.dry_run, tmp)
+            os.unlink(tarball)
 
 
 if __name__ == "__main__":

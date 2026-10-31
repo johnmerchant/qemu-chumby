@@ -46,7 +46,11 @@
 # pinned QEMU release in step with upstream's (./qemu-sync): a newer point
 # release of the series, or a newer series, is proposed as a pull request
 # on qemu-bump/point or qemu-bump/series, whose CI says whether the
-# patches still apply and build. On schedule, only it runs. Pull requests
+# patches still apply and build. It carries the series over as `patches`
+# checks it (./dev-series import into the new release, then export), and
+# commits the re-exported patches/ on the branch; if a patch doesn't
+# apply, the branch keeps main's and the pull request names the patch.
+# On schedule, only it runs. Pull requests
 # run its dry run (`qemu-sync-plan`), which checks the tarball signature
 # verification and prints what it would do.
 #
