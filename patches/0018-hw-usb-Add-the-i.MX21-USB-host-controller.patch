@@ -1093,7 +1093,7 @@ diff --git a/hw/usb/meson.build b/hw/usb/meson.build
 diff --git a/hw/usb/trace-events b/hw/usb/trace-events
 --- a/hw/usb/trace-events
 +++ b/hw/usb/trace-events
-@@ -377,3 +377,12 @@ canokey_handle_data_out(uint8_t ep_out, uint32_t out_len) "ep %d len %d"
+@@ -379,3 +379,12 @@ canokey_handle_data_out(uint8_t ep_out, uint32_t out_len) "ep %d len %d"
  canokey_handle_data_in(uint8_t ep_in, uint32_t in_len) "ep %d len %d"
  canokey_realize(void)
  canokey_unrealize(void)
