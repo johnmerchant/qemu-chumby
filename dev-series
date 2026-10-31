@@ -7,7 +7,8 @@ import: DIR is a QEMU source tree at the pinned release (a git checkout,
 or an extracted tarball, which becomes one). Each patch in PATCHES
 (default: this checkout's patches/) is applied and committed: the author
 from its Author: field, the message from Description: and the trailers
-after it, the date the time of the import, in UTC.
+after it, the date the time of the import, in UTC. The first that git
+apply refuses stops it, with its name and git's error.
 
 export: writes the commits on DIR's current branch since REV (default:
 the tag chumby-base, which import sets) to PATCHES as NNNN-slug.patch,
@@ -81,7 +82,10 @@ def import_(tree, patches):
     for p in sorted(f for f in os.listdir(patches) if f.endswith(".patch")):
         with open(os.path.join(patches, p)) as f:
             name, email, msg, diff = parse(f.read(), p)
-        git(tree, "apply", "--index", "-", inp=diff)
+        try:
+            git(tree, "apply", "--index", "-", inp=diff)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"{p} does not apply:\n{e.stderr.rstrip()}")
         who = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
                "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
         git(tree, "commit", "-q", "--cleanup=verbatim", "-F", "-",
