@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""tests/handoff-irq/run [--kernel ZIMAGE --initrd INITRD] [QEMU]: a pen held
+through a handoff from stock asserts the GPIO ports' shared interrupt line.
+
+Stock leaves PE19 (the pen) unmasked, and all six GPIO ports share one line.
+A kernel of a few instructions, made here, watches the line in the interrupt
+controller (INTSRCL bit 8): with handoff=on and pen-down=on it must go high,
+and clearing port E's status must drop it. Without either option it must
+stay low.
+
+With --kernel, it also boots that kernel with both options and checks for a
+soft lockup in mxc_gpio_probe, as a kernel that doesn't mask the GPIOs before
+hooking the shared line gets. A kernel that does should boot: pass
+--expect-boot for that. No firmware, no network, no display.
+"""
+import argparse
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+LITERALS = [0x1000A000, 0x10040000, 0x10015400, 0x00800000, 0x00080000]
+LIT = 25
+
+
+def ldr(rd, lit, at):
+    return 0xE59F0000 | rd << 12 | ((LIT + lit) * 4 - (at * 4 + 8))
+
+
+CODE = [
+    ldr(0, 0, 0),  # r0 = UART1
+    0xE3A01001,    # mov   r1, #1
+    0xE5801080,    # str   r1, [r0, #0x80]  @ UCR1: UARTEN
+    0xE3A01005,    # mov   r1, #5
+    0xE5801084,    # str   r1, [r0, #0x84]  @ UCR2: SRST, TXEN
+    ldr(2, 1, 5),  # r2 = AITC
+    ldr(3, 2, 6),  # r3 = GPIO port E
+    ldr(4, 3, 7),  # r4 = how long to watch
+    0xE592104C,    # 1: ldr r1, [r2, #0x4c] @ INTSRCL
+    0xE3110C01,    # tst   r1, #0x100       @ the GPIO line
+    0x1A000003,    # bne   2f
+    0xE2544001,    # subs  r4, r4, #1
+    0x1AFFFFFA,    # bne   1b
+    0xE3A0104E,    # mov   r1, #'N'         @ never asserted
+    0xEA000007,    # b     3f
+    0xE3A01050,    # 2: mov r1, #'P'        @ pending
+    0xE5801040,    # str   r1, [r0, #0x40]
+    ldr(1, 4, 17),  # r1 = PE19
+    0xE5831034,    # str   r1, [r3, #0x34]  @ ISR: write 1 to clear
+    0xE592104C,    # ldr   r1, [r2, #0x4c]
+    0xE3110C01,    # tst   r1, #0x100
+    0x13A0104C,    # movne r1, #'L'         @ still asserted
+    0x03A01043,    # moveq r1, #'C'         @ cleared
+    0xE5801040,    # 3: str r1, [r0, #0x40]
+    0xEAFFFFFE,    # b     .
+] + LITERALS
+assert len(CODE) == LIT + len(LITERALS)
+
+
+def standin(qemu, kernel, opts, want):
+    machine = "chumby-classic" + opts
+    p = subprocess.run(["timeout", "30", qemu, "-M", machine, "-kernel", kernel,
+                        "-nic", "none", "-display", "none", "-monitor", "none",
+                        "-serial", "stdio"], capture_output=True)
+    got = p.stdout.decode(errors="replace").strip()
+    ok = got == want
+    print(f"{'ok' if ok else 'FAIL'}: {machine}: line {got!r}, want {want!r}")
+    return ok
+
+
+def qmp(path, *cmds):
+    with socket.socket(socket.AF_UNIX) as c:
+        c.settimeout(30)
+        c.connect(path)
+        f = c.makefile("rwb")
+        f.readline()
+        for cmd in ("qmp_capabilities",) + cmds:
+            what = cmd if isinstance(cmd, dict) else {"execute": cmd}
+            f.write(json.dumps(what).encode() + b"\n")
+            f.flush()
+            while True:
+                r = json.loads(f.readline())
+                if "return" in r or "error" in r:
+                    break
+
+
+def real(qemu, kernel, initrd, expect_boot):
+    """The kernel hangs before its console is up, so its log is read from
+    RAM: the ring buffer keeps each record's text in one piece."""
+    a = "console=ttymxc0,115200 rdinit=/init neochumby.sideloaded=1"
+    with tempfile.TemporaryDirectory() as d:
+        sock = os.path.join(d, "qmp")
+        dump = os.path.join(d, "ram")
+        p = subprocess.Popen([qemu, "-M", "chumby-classic,handoff=on,pen-down=on",
+                              "-kernel", kernel, "-initrd", initrd, "-append", a,
+                              "-qmp", f"unix:{sock},server=on,wait=off",
+                              "-display", "none", "-serial", "stdio",
+                              "-nic", "none", "-monitor", "none"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        os.set_blocking(p.stdout.fileno(), False)
+        log = b""
+        ram = b""
+        locked = booted = False
+        for _ in range(12):
+            time.sleep(10)
+            log += p.stdout.read() or b""
+            booted = b"starting shells" in log
+            if booted:
+                break
+            qmp(sock, {"execute": "pmemsave",
+                       "arguments": {"val": 0xc0000000, "size": 0x4000000,
+                                     "filename": dump}})
+            with open(dump, "rb") as f:
+                ram = f.read()
+            locked = (b"soft lockup - CPU" in ram and
+                      re.search(rb"mxc_gpio_probe( from |\+0x)", ram) is not None)
+            if locked:
+                break
+        p.kill()
+        p.wait()
+    want = (rb"[ -~]*(?:soft lockup - CPU|PC is at|PC at |"
+            rb"__irq_put_desc_unlock|irq_set_chained_handler|"
+            rb"mxc_update_irq_chained|mxc_gpio_probe)[ -~]*")
+    seen = []
+    for m in re.finditer(want, ram):
+        line = m.group().decode()
+        if line not in seen:
+            seen.append(line)
+    for line in seen[:12]:
+        print("   ", line[:100])
+    ok = booted if expect_boot else locked
+    what = "boots" if booted else "soft lockup in mxc_gpio_probe" if locked else "neither"
+    print(f"{'ok' if ok else 'FAIL'}: real kernel, pen held through handoff: {what}")
+    return ok
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--kernel")
+    ap.add_argument("--initrd")
+    ap.add_argument("--expect-boot", action="store_true")
+    ap.add_argument("qemu", nargs="?")
+    args = ap.parse_args()
+    qemu = (args.qemu or os.environ.get("QEMU") or
+            os.path.join(here, "..", "..", "build", "obj", "qemu-system-arm"))
+    good = True
+    with tempfile.NamedTemporaryFile(suffix=".kernel") as f:
+        f.write(struct.pack(f"<{len(CODE)}I", *CODE))
+        f.flush()
+        for opts, want in ((",handoff=on,pen-down=on", "PC"),
+                           (",handoff=on", "N"),
+                           (",pen-down=on", "N"),
+                           ("", "N")):
+            good &= standin(qemu, f.name, opts, want)
+    if args.kernel:
+        good &= real(qemu, args.kernel, args.initrd, args.expect_boot)
+    sys.exit(0 if good else 1)
+
+
+if __name__ == "__main__":
+    main()

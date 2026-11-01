@@ -73,7 +73,7 @@ which), and whose CI says whether they still apply and build.
 
 Some bugs in kernels passed here and failed on a real Chumby, so the
 machine now holds a guest to more of what the hardware needs (`0028` to
-`0034`). Register values come from a running stock Chumby (hardware 3.8),
+`0035`). Register values come from a running stock Chumby (hardware 3.8),
 the rest from Chumby's published kernel source and TI's TSC2100 data sheet.
 The i.MX21 reference manual was not consulted, so what is marked inferred
 below has not been checked against it.
@@ -103,6 +103,10 @@ do to a transfer, for lack of a source; settle times, caches, and DMA left
 running by a previous kernel. A failure seen on a device, a jump from stock
 that froze the screen until the watchdog reset it, doesn't reproduce here.
 `tests/watchdog/run` checks that a hung kernel is reset every 64 s.
+`tests/handoff-irq/run` checks that a pen held through a handoff
+(`handoff=on,pen-down=on`) asserts the line the GPIO ports share, stock
+having left PE19 unmasked; with `--kernel` it checks a real kernel's soft
+lockup in `mxc_gpio_probe`, as on a device.
 
 Each patch is a DEP-3 header (`Description:`, `Author:`, then
 `Upstream-Status: Inappropriate [AI generated code]`, `Signed-off-by:`
