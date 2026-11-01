@@ -11,7 +11,9 @@ stay low.
 
 With --kernel, it also boots that kernel with both options and checks for a
 soft lockup in mxc_gpio_probe, as a kernel that doesn't mask the GPIOs before
-hooking the shared line gets. A kernel that does should boot: pass
+hooking the shared line gets. A kernel built without the soft lockup
+detector can only be seen to hang, silently, before its console: that passes
+too, and says it proves less. A kernel that masks them should boot: pass
 --expect-boot for that. No firmware, no network, no display.
 """
 import argparse
@@ -135,8 +137,12 @@ def real(qemu, kernel, initrd, expect_boot):
             seen.append(line)
     for line in seen[:12]:
         print("   ", line[:100])
-    ok = booted if expect_boot else locked
-    what = "boots" if booted else "soft lockup in mxc_gpio_probe" if locked else "neither"
+    # Without the detector its message isn't in the kernel at all.
+    silent = not booted and not locked and b"soft lockup - CPU#%d" not in ram and not log
+    ok = booted if expect_boot else locked or silent
+    what = ("boots" if booted else "soft lockup in mxc_gpio_probe" if locked else
+            "silent hang, no console; this kernel has no soft lockup detector, "
+            "so where it hangs isn't shown" if silent else "neither")
     print(f"{'ok' if ok else 'FAIL'}: real kernel, pen held through handoff: {what}")
     return ok
 
