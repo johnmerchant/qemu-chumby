@@ -1,0 +1,159 @@
+Description: hw/misc/imx21_crm: Start with a real Chumby's clocks, from a 16 MHz oscillator
+ The clock module started with values made up to fit a 26 MHz oscillator,
+ and with SP_SEL clear, so a kernel's clock tree computed a USB clock of
+ 31 MHz from them. Use the values read from a running Chumby (hardware
+ 3.8). The board's oscillator is 16 MHz: that is what SPCTL0 (MFI 9) and
+ USB_DIV 5 need to make USB's 48 MHz, and the stock audio driver names it.
+ That is derived, not documented; the i.MX21 reference manual was not to
+ hand. It gives MPLL 350 MHz, SPLL 288 MHz and PERCLK1 15.9 MHz.
+ .
+ Add what the registers make the USB clock and PERCLK1 run at, whatever
+ rate a guest believes it has set, for the blocks that depend on them.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/hw/misc/imx21_crm.c b/hw/misc/imx21_crm.c
+--- a/hw/misc/imx21_crm.c
++++ b/hw/misc/imx21_crm.c
+@@ -6,15 +6,22 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  *
+  * The CRM at 0x10027000 and the system control block beside it at
+- * 0x10027800. The PLLs are always locked, and the registers start as a
+- * boot loader leaves them: MPLL 266 MHz from the 26 MHz oscillator, HCLK
+- * 133 MHz, PERCLK1-4 44.3 MHz, SPLL 288 MHz. Other registers read back
+- * what was written.
++ * 0x10027800. The PLLs are always locked, and the registers start with
++ * the values read from a running Chumby (hardware 3.8). With the board's
++ * 16 MHz oscillator they mean MPLL 350 MHz and SPLL 288 MHz, so a USB clock
++ * of 48 MHz, PERCLK1 15.9 MHz. The 16 MHz is what SPCTL0 and USB_DIV need
++ * to make that 48 MHz, and the stock audio driver names it; the i.MX21's
++ * usual 26 MHz would give 78 MHz. Other registers read back what was
++ * written.
++ *
++ * What the registers make the clocks run at is available to the blocks
++ * that depend on it, whatever rates a guest believes it has set.
+  */
+ 
+ #include "qemu/osdep.h"
+ #include "hw/misc/imx21_crm.h"
+ #include "migration/vmstate.h"
++#include "qemu/bitops.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ 
+@@ -31,6 +38,17 @@
+ 
+ #define PLL_LOCKED  (1 << 15)
+ 
++#define CSCR_MPEN               (1 << 0)
++#define CSCR_SPEN               (1 << 1)
++#define CSCR_OSC_DIV1P5         (1 << 4)
++#define CSCR_MCU_SEL            (1 << 16)
++#define CSCR_SP_SEL             (1 << 17)
++#define PCCR0_USBOTG_EN         (1 << 14)
++#define PCCR0_HCLK_USBOTG_EN    (1 << 24)
++
++#define CKIH_HZ     16000000ULL
++#define FPM_HZ      (32768ULL * 512)
++
+ #define SYS_OFFSET  0x800
+ #define SIDR        0x04
+ #define FMCR        0x14
+@@ -75,6 +93,48 @@ static void imx21_crm_write(void *opaque, hwaddr offset, uint64_t val,
+     s->crm[i] = val;
+ }
+ 
++static uint64_t imx21_crm_pll_hz(IMX21CRMState *s, uint32_t pctl, bool osc)
++{
++    uint32_t cscr = s->crm[CSCR / 4];
++    uint64_t ref = FPM_HZ;
++    uint64_t mfi = MAX(extract32(pctl, 10, 4), 5);
++    uint64_t mfn = extract32(pctl, 0, 10);
++    uint64_t mfd = extract32(pctl, 16, 10);
++    uint64_t pd = extract32(pctl, 26, 4);
++
++    if (osc) {
++        ref = (cscr & CSCR_OSC_DIV1P5) ? CKIH_HZ * 2 / 3 : CKIH_HZ;
++    }
++    return 2 * ref * (mfi * (mfd + 1) + mfn) / ((mfd + 1) * (pd + 1));
++}
++
++uint32_t imx21_crm_usb_clock_hz(IMX21CRMState *s)
++{
++    uint32_t cscr = s->crm[CSCR / 4];
++
++    if (!(cscr & CSCR_SPEN) || !(s->crm[PCCR0 / 4] & PCCR0_USBOTG_EN)) {
++        return 0;
++    }
++    return imx21_crm_pll_hz(s, s->crm[SPCTL0 / 4], cscr & CSCR_SP_SEL) /
++           (extract32(cscr, 26, 3) + 1);
++}
++
++uint32_t imx21_crm_perclk1_hz(IMX21CRMState *s)
++{
++    uint32_t cscr = s->crm[CSCR / 4];
++
++    if (!(cscr & CSCR_MPEN)) {
++        return 0;
++    }
++    return imx21_crm_pll_hz(s, s->crm[MPCTL0 / 4], cscr & CSCR_MCU_SEL) /
++           (extract32(s->crm[PCDR1 / 4], 0, 6) + 1);
++}
++
++bool imx21_crm_usb_hclk_on(IMX21CRMState *s)
++{
++    return s->crm[PCCR0 / 4] & PCCR0_HCLK_USBOTG_EN;
++}
++
+ static const MemoryRegionOps imx21_crm_ops = {
+     .read = imx21_crm_read,
+     .write = imx21_crm_write,
+@@ -91,17 +151,17 @@ static void imx21_crm_reset(DeviceState *dev)
+ 
+     memset(s->crm, 0, sizeof(s->crm));
+     memset(s->sys, 0, sizeof(s->sys));
+-    /* USB_DIV 5, MCU_SEL oscillator, BCLKDIV 1, IPDIV 1, PLLs on */
+-    s->crm[CSCR / 4] = 0x14010607;
+-    s->crm[MPCTL0 / 4] = 0x00191403;     /* 266 MHz */
+-    s->crm[MPCTL1 / 4] = PLL_LOCKED;
+-    s->crm[SPCTL0 / 4] = 0x000c1407;     /* 288 MHz */
+-    s->crm[SPCTL1 / 4] = PLL_LOCKED;
+-    s->crm[OSC26MCTL / 4] = 0x3f00;
+-    s->crm[PCDR0 / 4] = 0;
+-    s->crm[PCDR1 / 4] = 0x05050505;      /* PERCLKn = MPLL / 6 */
+-    s->crm[PCCR0 / 4] = 0xffffffff;      /* every clock on */
+-    s->crm[PCCR1 / 4] = 0xffffffff;
++    /* USB_DIV 5, MCU_SEL and SP_SEL oscillator, BCLKDIV 2, IPDIV 1, PLLs on */
++    s->crm[CSCR / 4] = 0x171b0a07;
++    s->crm[MPCTL0 / 4] = 0x803f283c;     /* 350 MHz */
++    s->crm[MPCTL1 / 4] = 0x00008040;
++    s->crm[SPCTL0 / 4] = 0x80002400;     /* 288 MHz */
++    s->crm[SPCTL1 / 4] = 0x00008040;
++    s->crm[OSC26MCTL / 4] = 0x00013f00;
++    s->crm[PCDR0 / 4] = 0x5c16c007;
++    s->crm[PCDR1 / 4] = 0x04070a15;      /* PERCLK1 = MPLL / 22 */
++    s->crm[PCCR0 / 4] = 0x750768f5;
++    s->crm[PCCR1 / 4] = 0x7f800000;
+     s->sys[SIDR / 4] = 0x101d101d;       /* an i.MX21 silicon ID */
+     s->sys[FMCR / 4] = 0xffffffcb;
+ }
+diff --git a/include/hw/misc/imx21_crm.h b/include/hw/misc/imx21_crm.h
+--- a/include/hw/misc/imx21_crm.h
++++ b/include/hw/misc/imx21_crm.h
+@@ -25,4 +25,13 @@ struct IMX21CRMState {
+     uint32_t sys[IMX21_CRM_NUM_REGS];
+ };
+ 
++/* The USB block's 48 MHz clock as it now runs, in Hz; 0 if it is off. */
++uint32_t imx21_crm_usb_clock_hz(IMX21CRMState *s);
++
++/* PERCLK1 as it now runs, in Hz. */
++uint32_t imx21_crm_perclk1_hz(IMX21CRMState *s);
++
++/* Whether the USB block's bus clock (HCLK) is on. */
++bool imx21_crm_usb_hclk_on(IMX21CRMState *s);
++
+ #endif /* IMX21_CRM_H */

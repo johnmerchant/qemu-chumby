@@ -1,0 +1,113 @@
+Description: hw/gpio/imx21_gpio: Let other blocks see the pin muxing, and add a handoff state
+ Add imx21_gpio_peek(), for blocks whose pins the ports multiplex, and a
+ "handoff" property starting ports B, D and E as read from a running
+ Chumby's stock firmware, which is what a kernel started from it inherits.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/hw/gpio/imx21_gpio.c b/hw/gpio/imx21_gpio.c
+--- a/hw/gpio/imx21_gpio.c
++++ b/hw/gpio/imx21_gpio.c
+@@ -10,16 +10,24 @@
+  * i.MX31 one. Pins configured as inputs read the level driven on the
+  * device's GPIO inputs, idling high (pulled up). The GPIO outputs, one per
+  * pin and numbered like the inputs, follow each pin's level.
++ *
++ * With "handoff", ports B, D and E start as read from a running Chumby's
++ * stock firmware, which is what a kernel started from it inherits.
+  */
+ 
+ #include "qemu/osdep.h"
+ #include "hw/gpio/imx21_gpio.h"
+ #include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ 
+ #define DDIR    0x00
++#define OCR2    0x08
++#define GIUS    0x20
++#define GPR     0x38
++#define PUEN    0x40
+ #define DR      0x1c
+ #define SSR     0x24
+ #define ICR1    0x28
+@@ -192,6 +200,11 @@ static const MemoryRegionOps imx21_gpio_ops = {
+     },
+ };
+ 
++uint32_t imx21_gpio_peek(IMX21GPIOState *s, int port, hwaddr offset)
++{
++    return s->regs[port][offset / 4];
++}
++
+ static void imx21_gpio_reset(DeviceState *dev)
+ {
+     IMX21GPIOState *s = IMX21_GPIO(dev);
+@@ -207,6 +220,29 @@ static void imx21_gpio_reset(DeviceState *dev)
+         s->pins[port] = 0xffffffff;
+     }
+     s->pmask = 0x3f;
++    if (s->handoff) {
++        static const struct {
++            uint8_t port;
++            uint8_t reg;
++            uint32_t val;
++        } stock[] = {
++            { 1, DDIR, 0x3e000000 }, { 1, GIUS, 0x013ffff0 },
++            { 1, PUEN, 0xfbffffff },
++            { 3, DDIR, 0xb9e00000 }, { 3, OCR2, 0x03fc0000 },
++            { 3, DR, 0x18000000 }, { 3, GIUS, 0x1ffe0000 },
++            { 4, DDIR, 0x00e05520 }, { 4, OCR2, 0x000000c0 },
++            { 4, DR, 0x00000020 }, { 4, GIUS, 0x00180000 },
++            { 4, ICR2, 0x00000040 }, { 4, IMR, 0x00080000 },
++            { 4, GPR, 0x00e40000 }, { 4, PUEN, 0xff1b0fdf },
++        };
++        int i;
++
++        for (i = 0; i < ARRAY_SIZE(stock); i++) {
++            s->regs[stock[i].port][stock[i].reg / 4] = stock[i].val;
++        }
++        s->isr[3] = 0xf8000000;
++        s->isr[4] = 0x00e41020;
++    }
+     imx21_gpio_update(s);
+     for (port = 0; port < IMX21_GPIO_NUM_PORTS; port++) {
+         imx21_gpio_set_outputs(s, port, old[port]);
+@@ -240,11 +276,16 @@ static const VMStateDescription vmstate_imx21_gpio = {
+     },
+ };
+ 
++static const Property imx21_gpio_properties[] = {
++    DEFINE_PROP_BOOL("handoff", IMX21GPIOState, handoff, false),
++};
++
+ static void imx21_gpio_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     dc->vmsd = &vmstate_imx21_gpio;
++    device_class_set_props(dc, imx21_gpio_properties);
+     device_class_set_legacy_reset(dc, imx21_gpio_reset);
+     dc->desc = "i.MX21 GPIO";
+ }
+diff --git a/include/hw/gpio/imx21_gpio.h b/include/hw/gpio/imx21_gpio.h
+--- a/include/hw/gpio/imx21_gpio.h
++++ b/include/hw/gpio/imx21_gpio.h
+@@ -32,6 +32,13 @@ struct IMX21GPIOState {
+     /* Levels driven on the pins from outside; inputs idle high. */
+     uint32_t pins[IMX21_GPIO_NUM_PORTS];
+     uint32_t pmask;
++    bool handoff;
+ };
+ 
++/*
++ * The register at @offset (below 0x44) of @port, for a block whose pins are
++ * shared with the port to see how they are multiplexed.
++ */
++uint32_t imx21_gpio_peek(IMX21GPIOState *s, int port, hwaddr offset);
++
+ #endif /* IMX21_GPIO_H */
