@@ -1,0 +1,294 @@
+Description: hw/arm/chumby_classic: Add the board's USB hub and a handoff option
+ The Chumby's hub is on host 1, root hub port 2; add it ("internal-hub",
+ on by default), so that port's requirements are what a guest meets.
+ .
+ "handoff" starts the machine as a kernel started from the running stock
+ firmware does: the LCD's graphic window on and opaque with the panel
+ registers read from a running Chumby, the pins as stock set them, and
+ noise in RAM. The window's address is a stand-in: stock allocates it at
+ run time. A window at address 0 now also blends rather than being skipped.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -93,6 +93,23 @@ can also be driven from QMP with ``input-send-event`` (``abs`` events on
+ the ``x`` and ``y`` axes, 0 to 32767 across the screen, and the ``left``
+ button). ``screendump`` captures the screen.
+ 
++The board's USB hub is on root hub port 2 (``internal-hub``, on by
++default), and devices given no port attach behind it, as on a Chumby.
++Transfers only reach a device if the guest has set the block up as
++hardware needs: its clocks on, the USB clock really 48 MHz, the port's
++pins multiplexed, and for port 2 USBCTRL's HOST1_TXEN_OE set and PB25-PB29
++outputs. Otherwise they end with "device not responding" (Linux's -110);
++``-d guest_errors`` says why.
++
++The clock module starts with the values of a running Chumby, whose
++oscillator is 16 MHz: a kernel whose clock tree assumes the i.MX21's usual
++26 MHz believes every rate is 1.625 times what it is, and its timers run
++slow by that much, as on a real one.
++
++``-M chumby-classic,handoff=on`` starts the machine as a kernel started
++from the running stock firmware does: the LCD's graphic window on and
++opaque, the pins of ports B, D and E as stock set them, and noise in RAM.
++
+ USB devices attach to the host controller's root hub, for example a
+ disk image as a USB stick and a keyboard::
+ 
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -61,6 +61,7 @@
+ #include "system/address-spaces.h"
+ #include "qemu/error-report.h"
+ #include "qom/object.h"
++#include "hw/usb/hcd-imx21.h"
+ #include "system/blockdev.h"
+ #include "system/qtest.h"
+ 
+@@ -116,6 +117,9 @@
+ #define CHUMBY_DCID_TAG_HDR     6
+ #define CHUMBY_DCID_TAG_PARENT  0x80
+ 
++/* The board's USB hub is on the i.MX21's host 1 port: root hub port 2. */
++#define CHUMBY_HUB_ROOT_PORT    2
++
+ #define TYPE_CHUMBY_CLASSIC_MACHINE MACHINE_TYPE_NAME("chumby-classic")
+ OBJECT_DECLARE_SIMPLE_TYPE(ChumbyClassicState, CHUMBY_CLASSIC_MACHINE)
+ 
+@@ -124,6 +128,8 @@ struct ChumbyClassicState {
+ 
+     FslIMX21State soc;
+     ChumbyIOState io;
++    bool internal_hub;
++    bool handoff;
+     /* The device identity */
+     char *guid;
+     char *serial;
+@@ -428,6 +434,21 @@ static void chumby_classic_init_sensors(ChumbyClassicState *s)
+     vmstate_register(NULL, 0, &vmstate_chumby_classic, s);
+ }
+ 
++/* What a kernel started from a running system finds in RAM it doesn't own. */
++static void chumby_classic_fill_noise(void *ram, uint64_t size)
++{
++    uint32_t *p = ram;
++    uint32_t x = 0x2545f491;
++    uint64_t i;
++
++    for (i = 0; i < size / 4; i++) {
++        x ^= x << 13;
++        x ^= x >> 17;
++        x ^= x << 5;
++        p[i] = x;
++    }
++}
++
+ static void chumby_classic_init(MachineState *machine)
+ {
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(machine);
+@@ -460,10 +481,17 @@ static void chumby_classic_init(MachineState *machine)
+     /* The sensor card's parts take bytes. */
+     qdev_prop_set_bit(DEVICE(&s->soc.cspi[0]), "bytewise", true);
+ 
++    qdev_prop_set_bit(DEVICE(&s->soc.lcdc), "handoff", s->handoff);
++    qdev_prop_set_bit(DEVICE(&s->soc.gpio), "handoff", s->handoff);
++
+     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
+ 
+     memory_region_add_subregion(get_system_memory(), FSL_IMX21_SDRAM0_ADDR,
+                                 machine->ram);
++    if (s->handoff) {
++        chumby_classic_fill_noise(memory_region_get_ram_ptr(machine->ram),
++                                  machine->ram_size);
++    }
+ 
+     /* The touchscreen controller on CSPI3's first chip select */
+     spi = (SSIBus *)qdev_get_child_bus(DEVICE(&s->soc.cspi[2]), "spi");
+@@ -484,6 +512,12 @@ static void chumby_classic_init(MachineState *machine)
+ 
+     chumby_classic_init_sensors(s);
+ 
++    if (s->internal_hub &&
++        !imx21_usbotg_add_board_hub(s->soc.usbotg, CHUMBY_HUB_ROOT_PORT,
++                                    &error_fatal)) {
++        return;
++    }
++
+     if (!machine->kernel_cmdline || !*machine->kernel_cmdline) {
+         g_free(machine->kernel_cmdline);
+         machine->kernel_cmdline = g_strconcat(CHUMBY_DEFAULT_CMDLINE,
+@@ -499,6 +533,27 @@ static void chumby_classic_init(MachineState *machine)
+     }
+ }
+ 
++static bool chumby_classic_get_internal_hub(Object *obj, Error **errp)
++{
++    return CHUMBY_CLASSIC_MACHINE(obj)->internal_hub;
++}
++
++static void chumby_classic_set_internal_hub(Object *obj, bool value,
++                                            Error **errp)
++{
++    CHUMBY_CLASSIC_MACHINE(obj)->internal_hub = value;
++}
++
++static bool chumby_classic_get_handoff(Object *obj, Error **errp)
++{
++    return CHUMBY_CLASSIC_MACHINE(obj)->handoff;
++}
++
++static void chumby_classic_set_handoff(Object *obj, bool value, Error **errp)
++{
++    CHUMBY_CLASSIC_MACHINE(obj)->handoff = value;
++}
++
+ static void chumby_classic_instance_init(Object *obj)
+ {
+     ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
+@@ -513,6 +568,8 @@ static void chumby_classic_instance_init(Object *obj)
+                                   io_props[i]);
+     }
+ 
++    s->internal_hub = true;
++
+     /* Standing upright and still */
+     s->accel_mg[KXP74_X] = CHUMBY_ACCEL_UPRIGHT_X;
+     s->accel_mg[KXP74_Y] = CHUMBY_ACCEL_UPRIGHT_Y;
+@@ -540,6 +597,18 @@ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+ 
+     machine_add_audiodev_property(mc);
+ 
++    object_class_property_add_bool(oc, "internal-hub",
++                                   chumby_classic_get_internal_hub,
++                                   chumby_classic_set_internal_hub);
++    object_class_property_set_description(oc, "internal-hub",
++        "The board's USB hub, on root hub port 2 (default on)");
++    object_class_property_add_bool(oc, "handoff", chumby_classic_get_handoff,
++                                   chumby_classic_set_handoff);
++    object_class_property_set_description(oc, "handoff",
++        "Start as a kernel started from the running stock firmware does: "
++        "the LCD's graphic window on, the pins as stock set them, and "
++        "noise in RAM (default off)");
++
+     for (i = 0; i < KXP74_AXES; i++) {
+         static const char *const names[KXP74_AXES] = {
+             "accel-x", "accel-y", "accel-z"
+diff --git a/hw/display/imx21_lcdc.c b/hw/display/imx21_lcdc.c
+--- a/hw/display/imx21_lcdc.c
++++ b/hw/display/imx21_lcdc.c
+@@ -13,11 +13,21 @@
+  * The board sets how bright the panel is (its backlight, or whether it is
+  * powered at all) through the "brightness" GPIO input, and the displayed
+  * frame is dimmed in proportion: 0 is black.
++ *
++ * The window is off out of reset, as a boot loader leaves it. With the
++ * "handoff" property it is on instead, as a kernel started from the stock
++ * firmware's running system inherits it: that firmware's userspace enables
++ * the window, and only its own kernel knows to clear LGWCR. Its memory is
++ * then whatever RAM holds. The alpha of 0xff and the panel's registers are
++ * as read from a running Chumby; the window's address isn't known (the stock
++ * driver allocates it at run time), so one that is noise (with the machine's
++ * handoff option, RAM starts as noise) stands in for it.
+  */
+ 
+ #include "qemu/osdep.h"
+ #include "hw/display/imx21_lcdc.h"
+ #include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
+ #include "migration/vmstate.h"
+ #include "qemu/log.h"
+ #include "qemu/bswap.h"
+@@ -29,6 +39,10 @@
+ #define LSR         0x04
+ #define LVPWR       0x08
+ #define LPCR        0x18
++#define LHCR        0x1c
++#define LVCR        0x20
++#define LPCCR       0x2c
++#define LDCR        0x30
+ #define LISR        0x40
+ #define LGWSAR      0x50
+ #define LGWSR       0x54
+@@ -42,6 +56,7 @@
+ #define LPCR_BPIX_16    5
+ #define LGWCR_GWE       (1 << 22)
+ #define LGWCR_GWCKE     (1 << 23)
++#define LGWCR_ALPHA_SHIFT 24
+ 
+ /* LISR: end of frame, and the graphic window's end of frame */
+ #define LISR_EOF        (1 << 0)
+@@ -51,6 +66,11 @@
+ #define DEFAULT_WIDTH   320
+ #define DEFAULT_HEIGHT  240
+ 
++#define HANDOFF_GW_ALPHA    0xff
++#define HANDOFF_GW_ADDR     0xc1000000
++#define HANDOFF_GW_SIZE     ((DEFAULT_WIDTH / 16) << 20 | DEFAULT_HEIGHT)
++#define HANDOFF_GW_VPW      (DEFAULT_WIDTH * 2 / 4)
++
+ #define REG(s, r)       ((s)->regs[(r) / 4])
+ 
+ static uint64_t imx21_lcdc_read(void *opaque, hwaddr offset, unsigned size)
+@@ -147,7 +167,7 @@ static void imx21_lcdc_render(IMX21LCDCState *s, uint32_t *dest, int w, int h)
+         }
+     }
+ 
+-    if ((gwcr & LGWCR_GWE) && REG(s, LGWSAR)) {
++    if (gwcr & LGWCR_GWE) {
+         unsigned alpha = extract32(gwcr, 24, 8);
+         /* The colour key has 6 bits per channel. */
+         uint32_t key = (extract32(gwcr, 12, 6) << 18) |
+@@ -257,6 +277,18 @@ static void imx21_lcdc_reset(DeviceState *dev)
+ 
+     memset(s->regs, 0, sizeof(s->regs));
+     memset(s->palette, 0, sizeof(s->palette));
++    if (s->handoff) {
++        REG(s, LPCR) = 0xcad80084;
++        REG(s, LHCR) = 0x0800133e;
++        REG(s, LVCR) = 0x10001204;
++        REG(s, LPCCR) = 0x00a903c0;
++        REG(s, LDCR) = 0x00030008;
++        REG(s, LGWSAR) = HANDOFF_GW_ADDR;
++        REG(s, LGWSR) = HANDOFF_GW_SIZE;
++        REG(s, LGWVPWR) = HANDOFF_GW_VPW;
++        REG(s, LGWCR) = LGWCR_GWE |
++                        ((uint32_t)HANDOFF_GW_ALPHA << LGWCR_ALPHA_SHIFT);
++    }
+ }
+ 
+ static void imx21_lcdc_realize(DeviceState *dev, Error **errp)
+@@ -275,6 +307,10 @@ static void imx21_lcdc_realize(DeviceState *dev, Error **errp)
+     qemu_console_resize(s->con, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+ }
+ 
++static const Property imx21_lcdc_properties[] = {
++    DEFINE_PROP_BOOL("handoff", IMX21LCDCState, handoff, false),
++};
++
+ static const VMStateDescription vmstate_imx21_lcdc = {
+     .name = TYPE_IMX21_LCDC,
+     .version_id = 2,
+@@ -294,6 +330,7 @@ static void imx21_lcdc_class_init(ObjectClass *klass, const void *data)
+     dc->realize = imx21_lcdc_realize;
+     dc->vmsd = &vmstate_imx21_lcdc;
+     device_class_set_legacy_reset(dc, imx21_lcdc_reset);
++    device_class_set_props(dc, imx21_lcdc_properties);
+     dc->desc = "i.MX21 LCD controller";
+ }
+ 
+diff --git a/include/hw/display/imx21_lcdc.h b/include/hw/display/imx21_lcdc.h
+--- a/include/hw/display/imx21_lcdc.h
++++ b/include/hw/display/imx21_lcdc.h
+@@ -35,6 +35,7 @@ struct IMX21LCDCState {
+     uint32_t regs[IMX21_LCDC_NUM_REGS];
+     uint32_t palette[256];
+     uint32_t brightness;
++    bool handoff;
+ };
+ 
+ #endif /* IMX21_LCDC_H */

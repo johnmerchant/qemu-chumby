@@ -1,0 +1,165 @@
+Description: hw/input/tsc2100: Drive PINTDAV as the data sheet's Table 2 has it
+ STATUS 15:14 was read backwards: 00 was treated as both pen and data and
+ 10 as the pen alone. By the data sheet (SLAS378), 00 is the pen alone, 01
+ data available alone, and 10 or 11, the reset value, both: a touch takes
+ PINTDAV low and it stays low until a conversion completes, even once the
+ pen has lifted. A driver that sets 10 believing it means the pen alone
+ gets no second falling edge, as on a real Chumby, and passed here.
+ .
+ That the pin goes low again while the pen stays down is inferred from the
+ stock driver, which acknowledges it with a conversion once the pen is up.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -10,7 +10,15 @@
+  * advancing with each. Page 0 holds the conversion results, page 1 the
+  * touch controls and page 2 the audio controls.
+  *
+- * Conversions finish at once. The pen is QEMU's absolute pointer: its
++ * Conversions finish at once. PINTDAV is as the data sheet's Table 2
++ * has it: STATUS 15:14 of 00 is the pen alone, 01 data available alone,
++ * and 10 or 11, the reset value, both: a touch takes it low and it stays
++ * low, even once the pen has lifted, until a conversion completes. While
++ * the pen stays down it goes low again after a moment (that is inferred
++ * from the stock driver, which acknowledges the pin with a conversion once
++ * the pen is up; PEN_RESENSE_NS stands for the precharge and sense times).
++ *
++ * The pen is QEMU's absolute pointer: its
+  * position maps onto the ADC's full range (X left to right, Y bottom to
+  * top) and the left button presses it.
+  *
+@@ -77,6 +85,8 @@
+ #define STATUS_DAVAIL   (1 << 11)
+ 
+ #define RESET_MAGIC     0xbb00
++#define STATUS_RESET    0x8000
++#define PEN_RESENSE_NS  (100 * 1000)
+ #define ADC_MAX         0xfff
+ 
+ /* The result registers each scan mode (ADC bits 13:10) converts. */
+@@ -121,21 +131,21 @@ static uint16_t tsc2100_ready_bits(uint16_t mask)
+     return bits;
+ }
+ 
+-/* PINTDAV, active low: pen down, data available, or either (STATUS 15:14) */
++/* PINTDAV, active low: pen down, data available, or both (STATUS 15:14) */
+ static void tsc2100_update_pintdav(TSC2100State *s)
+ {
+     bool active;
+ 
+     switch (s->regs[REG_STATUS] >> 14) {
+     case 0:
+-        active = s->down || s->dav;
+-        break;
+-    case 2:
+         active = s->down;
+         break;
+-    default:
++    case 1:
+         active = s->dav;
+         break;
++    default:
++        active = s->pen_latch;
++        break;
+     }
+     qemu_set_irq(s->pintdav, !active);
+ }
+@@ -424,6 +434,11 @@ static void tsc2100_reset_regs(TSC2100State *s)
+     s->dav = false;
+     /* ADC: host-controlled, no scan; REF: internal reference. */
+     s->regs[REG_ADC] = 0x4000;
++    s->regs[REG_STATUS] = STATUS_RESET;
++    s->pen_latch = s->down;
++    if (s->pen_timer) {
++        timer_del(s->pen_timer);
++    }
+     s->regs[REG_REF] = 0x0002;
+     /* The codec starts powered down. */
+     s->regs[REG_POWERCON] = POWERCON_PWDNC;
+@@ -450,6 +465,11 @@ static void tsc2100_write_reg(TSC2100State *s, int reg, uint16_t val)
+         if (mask) {
+             s->ready |= tsc2100_ready_bits(mask);
+             s->dav = true;
++            s->pen_latch = false;
++            if (s->down) {
++                timer_mod(s->pen_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                          PEN_RESENSE_NS);
++            }
+         }
+     }
+ }
+@@ -523,9 +543,22 @@ static void tsc2100_input_sync(DeviceState *dev)
+                                  INPUT_EVENT_ABS_MAX, 0, ADC_MAX);
+     s->y = ADC_MAX - qemu_input_scale_axis(s->abs_y, INPUT_EVENT_ABS_MIN,
+                                            INPUT_EVENT_ABS_MAX, 0, ADC_MAX);
++    if (s->down) {
++        s->pen_latch = true;
++    }
+     tsc2100_update_pintdav(s);
+ }
+ 
++static void tsc2100_pen_tick(void *opaque)
++{
++    TSC2100State *s = opaque;
++
++    if (s->down) {
++        s->pen_latch = true;
++        tsc2100_update_pintdav(s);
++    }
++}
++
+ static const QemuInputHandler tsc2100_input_handler = {
+     .name  = "TSC2100 touchscreen",
+     .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
+@@ -544,6 +577,7 @@ static void tsc2100_realize(SSIPeripheral *dev, Error **errp)
+     s->input = qemu_input_handler_register(DEVICE(dev),
+                                            &tsc2100_input_handler);
+     s->audio_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tsc2100_audio_tick, s);
++    s->pen_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tsc2100_pen_tick, s);
+ }
+ 
+ static void tsc2100_reset(DeviceState *dev)
+@@ -573,8 +607,8 @@ static int tsc2100_post_load(void *opaque, int version_id)
+ 
+ static const VMStateDescription vmstate_tsc2100 = {
+     .name = TYPE_TSC2100,
+-    .version_id = 1,
+-    .minimum_version_id = 1,
++    .version_id = 2,
++    .minimum_version_id = 2,
+     .post_load = tsc2100_post_load,
+     .fields = (const VMStateField[]) {
+         VMSTATE_SSI_PERIPHERAL(parent_obj, TSC2100State),
+@@ -585,6 +619,7 @@ static const VMStateDescription vmstate_tsc2100 = {
+         VMSTATE_UINT16(ready, TSC2100State),
+         VMSTATE_BOOL(dav, TSC2100State),
+         VMSTATE_BOOL(down, TSC2100State),
++        VMSTATE_BOOL(pen_latch, TSC2100State),
+         VMSTATE_UINT16(x, TSC2100State),
+         VMSTATE_UINT16(y, TSC2100State),
+         VMSTATE_END_OF_LIST()
+diff --git a/include/hw/input/tsc2100.h b/include/hw/input/tsc2100.h
+--- a/include/hw/input/tsc2100.h
++++ b/include/hw/input/tsc2100.h
+@@ -52,6 +52,8 @@ struct TSC2100State {
+ 
+     /* The pen, in raw ADC units. */
+     bool down;
++    /* PINTDAV low from a touch, until a conversion completes */
++    bool pen_latch;
+     uint16_t x, y;
+     /* The pointer as the input layer last reported it. */
+     int abs_x, abs_y;
+@@ -61,6 +63,7 @@ struct TSC2100State {
+     SWVoiceOut *dac_voice;
+     SWVoiceIn *adc_voice;
+     QEMUTimer *audio_timer;
++    QEMUTimer *pen_timer;
+     TSC2100AudioFn *dac_fn;
+     TSC2100AudioFn *adc_fn;
+     void *link_opaque;

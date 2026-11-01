@@ -69,6 +69,41 @@ release as a pull request, with the series re-exported for it by
 `./dev-series` (or, if a patch no longer applies, the pull request says
 which), and whose CI says whether they still apply and build.
 
+### Modelled from real hardware
+
+Some bugs in kernels passed here and failed on a real Chumby, so the
+machine now holds a guest to more of what the hardware needs (`0028` to
+`0034`). Register values come from a running stock Chumby (hardware 3.8),
+the rest from Chumby's published kernel source and TI's TSC2100 data sheet.
+The i.MX21 reference manual was not consulted, so what is marked inferred
+below has not been checked against it.
+
+| What | Evidence |
+| --- | --- |
+| The clock module starts with a real Chumby's values | Read from a running Chumby |
+| The oscillator is 16 MHz, so MPLL 350 MHz, SPLL 288 MHz, PERCLK1 15.9 MHz; GPTs and PWM count at that PERCLK1, and a kernel assuming 26 MHz keeps time 1.6 times slow | Inferred from SPCTL0 and USB_DIV having to make USB's 48 MHz and the stock audio driver's 16 MHz; a device's timing agrees |
+| TSC2100 PINTDAV modes, with the pin latched low in modes 10 and 11 | The data sheet, Table 2 |
+| PINTDAV goes low again while the pen stays down, after 100 µs | Inferred from the stock driver; the delay is a stand-in |
+| USB does nothing with its clocks off | The stock board file enables them; the effect is inferred |
+| USB devices answer only with a 48 MHz clock, the root port's pins multiplexed to it, and on port 2 PB25-PB29 outputs and USBCTRL's HOST1_TXEN_OE set | What the stock board file and driver do, and read values; that hardware requires each is inferred. Without them transfers end "device not responding" (-110 in Linux), as a real Chumby's did |
+| USBCTRL resets to 0x000f1000; HWMODE's top half and ROOTHUBA as read | Read values; that USBCTRL's is a reset value is inferred |
+| `handoff=on`: LCD window on and opaque, ports B, D and E and LCD registers as read, noise in RAM | Read values; the window's address is a stand-in |
+
+This changes the machine in ways a user will see:
+
+- The board's USB hub is on root hub port 2 by default (`internal-hub=off`
+  removes it), and devices given no port, `chumby-machine --stick` included,
+  attach behind it. A kernel that can't drive port 2 loses them too.
+- A kernel with the wrong oscillator in its clock tree now keeps the wrong
+  time here.
+- Saved states from before this won't load.
+
+Not modelled: what USBCTRL's other bits, SKPRTRY and the transceiver modes
+do to a transfer, for lack of a source; settle times, caches, and DMA left
+running by a previous kernel. A failure seen on a device, a jump from stock
+that froze the screen until the watchdog reset it, doesn't reproduce here.
+`tests/watchdog/run` checks that a hung kernel is reset every 64 s.
+
 Each patch is a DEP-3 header (`Description:`, `Author:`, then
 `Upstream-Status: Inappropriate [AI generated code]`, `Signed-off-by:`
 and `Claude-Session:`), a line `---` and the diff; new patches carry the

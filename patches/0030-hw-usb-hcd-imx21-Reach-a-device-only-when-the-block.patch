@@ -1,0 +1,566 @@
+Description: hw/usb/hcd-imx21: Reach a device only when the block is set up as hardware needs
+ The model completed transfers however the guest had set the block up, so
+ a kernel that enumerated here got -110 from every control transfer on a
+ real Chumby, with connects still seen. Now, as sources support:
+ .
+ - With CLK_CTRL's HST and MAIN or PCCR0's USBOTG gates off, nothing runs
+   (the stock board file enables each before use).
+ - A device is out of reach, its ETDs ending "device not responding",
+   unless the USB clock is within USB's 0.25% of 48 MHz, the root port's
+   pins are multiplexed to it as the stock board file does, PB25-PB29 are
+   outputs as it sets them, and for host 1 USBCTRL's HOST1_TXEN_OE is set,
+   as the stock driver does before each transfer. That these are all
+   needed, and what the wire does without them, is inferred from those
+   sources: the reference manual was not to hand.
+ .
+ USBCTRL now resets to 0x000f1000 and survives a block reset, as a stock
+ driver that only sets TXEN_OE and a running Chumby's 0x000f1002 imply;
+ HWMODE's top half reads 0x2020 and ROOTHUBA 0x01000103 as on a Chumby.
+ Nothing is required of USBCTRL's other bits, MISCCONTROL or HWMODE's
+ transceiver modes: no source says what they do to a transfer.
+ .
+ A kernel's GPTs and the PWM now count at PERCLK1 as the clock module
+ makes it, so a kernel whose clock tree assumes another oscillator keeps
+ the wrong time, as on the device. The board's hub can be plugged into a
+ root port, with devices given no port going behind it.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/hw/arm/fsl-imx21.c b/hw/arm/fsl-imx21.c
+--- a/hw/arm/fsl-imx21.c
++++ b/hw/arm/fsl-imx21.c
+@@ -19,6 +19,7 @@
+ #include "hw/core/qdev-properties.h"
+ #include "hw/core/qdev-properties-system.h"
+ #include "hw/core/sysbus.h"
++#include "hw/usb/hcd-imx21.h"
+ #include "chardev/char.h"
+ #include "system/address-spaces.h"
+ #include "system/system.h"
+@@ -110,7 +111,9 @@ static void fsl_imx21_realize(DeviceState *dev, Error **errp)
+                        qdev_get_gpio_in(DEVICE(&s->cpu), ARM_CPU_FIQ));
+ 
+     for (i = 0; i < FSL_IMX21_NUM_GPTS; i++) {
+-        if (!fsl_imx21_map(aitc, SYS_BUS_DEVICE(&s->gpt[i]), gpts[i].addr,
++        if (!object_property_set_link(OBJECT(&s->gpt[i]), "crm",
++                                      OBJECT(&s->crm), errp) ||
++            !fsl_imx21_map(aitc, SYS_BUS_DEVICE(&s->gpt[i]), gpts[i].addr,
+                            gpts[i].irq, errp)) {
+             return;
+         }
+@@ -223,10 +226,26 @@ static void fsl_imx21_realize(DeviceState *dev, Error **errp)
+         return;
+     }
+ 
+-    s->pwm = sysbus_create_simple("imx21.pwm", FSL_IMX21_PWM_ADDR, NULL);
+-    s->usbotg = sysbus_create_simple("imx21.usbotg", FSL_IMX21_USBOTG_ADDR,
+-                                     qdev_get_gpio_in(aitc,
+-                                                      FSL_IMX21_USBHOST_IRQ));
++    s->pwm = qdev_new("imx21.pwm");
++    object_property_add_child(OBJECT(dev), "pwm", OBJECT(s->pwm));
++    if (!object_property_set_link(OBJECT(s->pwm), "crm", OBJECT(&s->crm),
++                                  errp) ||
++        !sysbus_realize_and_unref(SYS_BUS_DEVICE(s->pwm), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(s->pwm), 0, FSL_IMX21_PWM_ADDR);
++    s->usbotg = qdev_new(TYPE_IMX21_USBOTG);
++    object_property_add_child(OBJECT(dev), "usbotg", OBJECT(s->usbotg));
++    if (!object_property_set_link(OBJECT(s->usbotg), "crm", OBJECT(&s->crm),
++                                  errp) ||
++        !object_property_set_link(OBJECT(s->usbotg), "gpio", OBJECT(&s->gpio),
++                                  errp) ||
++        !sysbus_realize_and_unref(SYS_BUS_DEVICE(s->usbotg), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(s->usbotg), 0, FSL_IMX21_USBOTG_ADDR);
++    sysbus_connect_irq(SYS_BUS_DEVICE(s->usbotg), 0,
++                       qdev_get_gpio_in(aitc, FSL_IMX21_USBHOST_IRQ));
+ 
+     /* Everything else in the peripheral and memory controller spaces. */
+     if (!memory_region_init_ram(&s->aipi_regs, OBJECT(dev), "imx21.aipi",
+diff --git a/hw/misc/imx21_pwm.c b/hw/misc/imx21_pwm.c
+--- a/hw/misc/imx21_pwm.c
++++ b/hw/misc/imx21_pwm.c
+@@ -74,7 +74,8 @@ static uint64_t imx21_pwm_cycle_ns(IMX21PWMState *s)
+     div = (2 << (s->pwmc & PWMC_CLKSEL)) *
+           (extract32(s->pwmc, PWMC_PRESCALER_SHIFT, 7) + 1);
+     return MAX(muldiv64(div, NANOSECONDS_PER_SECOND,
+-                        MAX(s->perclk_freq, 1)), 1);
++                        MAX(s->crm ? imx21_crm_perclk1_hz(s->crm) :
++                            s->perclk_freq, 1)), 1);
+ }
+ 
+ static uint64_t imx21_pwm_period_ns(IMX21PWMState *s)
+@@ -296,8 +297,10 @@ static void imx21_pwm_init(Object *obj)
+ }
+ 
+ static const Property imx21_pwm_properties[] = {
+-    /* PERCLK1: 266 MHz MPLL / 6, as the boot loader leaves it. */
+-    DEFINE_PROP_UINT32("perclk-freq", IMX21PWMState, perclk_freq, 44333333),
++    /* PERCLK1, from the clock module; else this rate. */
++    DEFINE_PROP_LINK("crm", IMX21PWMState, crm, TYPE_IMX21_CRM,
++                     IMX21CRMState *),
++    DEFINE_PROP_UINT32("perclk-freq", IMX21PWMState, perclk_freq, 15909090),
+ };
+ 
+ static int imx21_pwm_post_load(void *opaque, int version_id)
+diff --git a/hw/timer/imx21_gpt.c b/hw/timer/imx21_gpt.c
+--- a/hw/timer/imx21_gpt.c
++++ b/hw/timer/imx21_gpt.c
+@@ -39,6 +39,11 @@
+ 
+ #define CLK32K_FREQ     32768
+ 
++static uint32_t imx21_gpt_perclk(IMX21GPTState *s)
++{
++    return s->crm ? imx21_crm_perclk1_hz(s->crm) : s->perclk_freq;
++}
++
+ /* The counting rate in Hz, or 0 when the timer is stopped. */
+ static uint32_t imx21_gpt_freq(IMX21GPTState *s)
+ {
+@@ -49,10 +54,10 @@ static uint32_t imx21_gpt_freq(IMX21GPTState *s)
+     }
+     switch ((s->tctl & TCTL_CLKSOURCE) >> 1) {
+     case 1:
+-        in = s->perclk_freq;
++        in = imx21_gpt_perclk(s);
+         break;
+     case 2:
+-        in = s->perclk_freq / 4;
++        in = imx21_gpt_perclk(s) / 4;
+         break;
+     case 4 ... 7:
+         in = CLK32K_FREQ;
+@@ -302,8 +307,10 @@ static void imx21_gpt_init(Object *obj)
+ }
+ 
+ static const Property imx21_gpt_properties[] = {
+-    /* PERCLK1: 266 MHz MPLL / 6, as the boot loader leaves it. */
+-    DEFINE_PROP_UINT32("perclk-freq", IMX21GPTState, perclk_freq, 44333333),
++    /* PERCLK1, from the clock module; else this rate. */
++    DEFINE_PROP_LINK("crm", IMX21GPTState, crm, TYPE_IMX21_CRM,
++                     IMX21CRMState *),
++    DEFINE_PROP_UINT32("perclk-freq", IMX21GPTState, perclk_freq, 15909090),
+ };
+ 
+ static const VMStateDescription vmstate_imx21_gpt = {
+diff --git a/hw/usb/hcd-imx21.c b/hw/usb/hcd-imx21.c
+--- a/hw/usb/hcd-imx21.c
++++ b/hw/usb/hcd-imx21.c
+@@ -26,15 +26,36 @@
+  * either by the DMA or through DMEM. Frames are 1 ms of virtual time.
+  * Transceiver, HNP, the OTG block's own I2C master and the function
+  * (device) side are not modelled.
++ *
++ * The block only reaches a device when it is set up as hardware needs it,
++ * and a guest that does not is told what a real one is:
++ *
++ * - With the block's clocks off (PCCR0's USBOTG gates, or CLK_CTRL's HST
++ *   and MAIN), nothing runs: an enabled ETD just stays enabled.
++ * - A device is out of reach, whose ETDs end with "device not responding",
++ *   unless the USB clock is 48 MHz, the root port's pins are multiplexed
++ *   to it, and for host 1 (root port 2) USBCTRL's HOST1_TXEN_OE drives its
++ *   output enable pin: without it the transceiver never transmits, while
++ *   it still receives, so a connect is seen and nothing gets an answer.
++ *
++ * Which of the pins and clocks each port needs comes from the Chumby's
++ * stock 2.6.16 board file, and its imx21-hcd driver sets HOST1_TXEN_OE
++ * before each transfer. What a real block does on the wire in these cases
++ * (retries, and how long they take) is inferred, not documented.
+  */
+ 
+ #include "qemu/osdep.h"
+ #include "hw/core/sysbus.h"
+ #include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/gpio/imx21_gpio.h"
++#include "hw/misc/imx21_crm.h"
++#include "hw/usb/hcd-imx21.h"
+ #include "hw/usb/usb.h"
+ #include "migration/vmstate.h"
+ #include "system/dma.h"
+ #include "system/address-spaces.h"
++#include "qapi/error.h"
+ #include "qemu/log.h"
+ #include "qemu/main-loop.h"
+ #include "qemu/module.h"
+@@ -42,7 +63,6 @@
+ #include "qom/object.h"
+ #include "trace.h"
+ 
+-#define TYPE_IMX21_USBOTG "imx21.usbotg"
+ OBJECT_DECLARE_SIMPLE_TYPE(IMX21USBOTGState, IMX21_USBOTG)
+ 
+ #define USBOTG_SIZE     0x2000
+@@ -55,9 +75,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMX21USBOTGState, IMX21_USBOTG)
+ #define NUM_ETD         32
+ 
+ /* OTG control */
++#define HWMODE          0x00
++/* Read-only: a running Chumby reads 0x20200001, revision 0x20. */
++#define  HWMODE_ID      0x20200000
+ #define CINT_STAT       0x04
+ #define CINT_STEN       0x08
+ #define  CINT_HCINT     (1 << 0)
++#define CLK_CTRL        0x0c
++#define  CLK_CTRL_HST   (1 << 1)
++#define  CLK_CTRL_MAIN  (1 << 0)
+ #define RST_CTRL        0x10
+ #define  RST_RSTHC      (1 << 0)
+ #define  RST_RSTCTRL    (1 << 5)
+@@ -101,6 +127,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMX21USBOTGState, IMX21_USBOTG)
+ #define ETD_BASE        0x200
+ #define ETD_END         (ETD_BASE + NUM_ETD * 16)
+ 
++#define USBCTRL         0x600
++#define  USBCTRL_HOST1_TXEN_OE (1 << 1)
++/*
++ * Stock's driver only ever sets TXEN_OE, and a running Chumby reads
++ * 0x000f1002, so the rest is the reset value (or a boot loader's).
++ */
++#define  USBCTRL_RESET  0x000f1000
++
+ /* DMA */
+ #define ETDDMAEN        0x820
+ #define ETDDMACHANLCLR  0x848
+@@ -124,6 +158,25 @@ OBJECT_DECLARE_SIMPLE_TYPE(IMX21USBOTGState, IMX21_USBOTG)
+ 
+ #define FRAME_NS        (1000 * 1000)
+ 
++/* Full-speed USB's bit rate is good to 0.25%. */
++#define USB_CLOCK_HZ    48000000
++#define USB_CLOCK_TOL   (USB_CLOCK_HZ / 400)
++
++/* Root ports */
++#define ROOT_PORT_OTG   0
++#define ROOT_PORT_HOST1 1
++#define ROOT_PORT_HOST2 2
++
++/* GPIO ports and registers, for the pins the root ports use */
++#define GPIO_PORTB      1
++#define GPIO_PORTC      2
++#define GPIO_PORTD      3
++#define GPIO_DDIR       0x00
++#define GPIO_OCR2       0x08
++#define GPIO_ICONFA2    0x10
++#define GPIO_GIUS       0x20
++#define GPIO_GPR        0x38
++
+ typedef struct IMX21USBOTGState IMX21USBOTGState;
+ 
+ typedef struct IMX21ETD {
+@@ -153,6 +206,11 @@ struct IMX21USBOTGState {
+     QEMUBH *bh;
+     int64_t frame_base;
+     uint32_t mig_frame;
++
++    IMX21CRMState *crm;
++    IMX21GPIOState *gpio;
++    /* What has been reported of each root port */
++    const char *fault[NUM_PORTS];
+ };
+ 
+ #define R(off) (s->regs[(off) / 4])
+@@ -215,7 +273,72 @@ static void imx21_usb_arm(IMX21USBOTGState *s)
+     timer_mod(s->frame_timer, s->frame_base + (int64_t)next * FRAME_NS);
+ }
+ 
+-static USBDevice *imx21_usb_find_device(IMX21USBOTGState *s, uint8_t addr)
++/* Whether the block's clocks are running, so that anything happens at all. */
++static bool imx21_usb_clocks_on(IMX21USBOTGState *s)
++{
++    uint32_t need = CLK_CTRL_HST | CLK_CTRL_MAIN;
++
++    return (R(CLK_CTRL) & need) == need && imx21_crm_usb_hclk_on(s->crm) &&
++           imx21_crm_usb_clock_hz(s->crm) != 0;
++}
++
++/* Whether pins of @port are all primary functions. */
++static bool imx21_usb_pins_primary(IMX21USBOTGState *s, int port, uint32_t mask)
++{
++    return !((imx21_gpio_peek(s->gpio, port, GPIO_GIUS) |
++              imx21_gpio_peek(s->gpio, port, GPIO_GPR)) & mask);
++}
++
++static bool imx21_usb_pins_ok(IMX21USBOTGState *s, int i)
++{
++    /* PD19-PD20 are A outputs of the GPIO; PD21-PD24 its A inputs. */
++    const uint32_t d_all = 0x01f80000, d_in = 0x00180000, d_out = 0x01e00000;
++
++    switch (i) {
++    case ROOT_PORT_OTG:
++        /* PC8-PC13 */
++        return imx21_usb_pins_primary(s, GPIO_PORTC, 0x00003f00);
++    case ROOT_PORT_HOST1:
++        /*
++         * PB26-PB31, and PB25-PB29 as outputs (USBH_ON, FS, OE, TXDM, TXDP):
++         * so the stock board file sets them, and a running Chumby reads
++         * DDIR 0x3e000000. That a pad's direction applies to a primary
++         * function is inferred from that file's pin tables.
++         */
++        return imx21_usb_pins_primary(s, GPIO_PORTB, 0xfc000000) &&
++               (imx21_gpio_peek(s->gpio, GPIO_PORTB, GPIO_DDIR) &
++                0x3e000000) == 0x3e000000;
++    default:
++        return (imx21_gpio_peek(s->gpio, GPIO_PORTD, GPIO_GIUS) & d_all) ==
++                   d_all &&
++               !(imx21_gpio_peek(s->gpio, GPIO_PORTD, GPIO_DDIR) & d_in) &&
++               (imx21_gpio_peek(s->gpio, GPIO_PORTD, GPIO_DDIR) & d_out) ==
++                   d_out &&
++               !(imx21_gpio_peek(s->gpio, GPIO_PORTD, GPIO_OCR2) & 0x0003fc00) &&
++               !(imx21_gpio_peek(s->gpio, GPIO_PORTD, GPIO_ICONFA2) & 0x000003c0);
++    }
++}
++
++/* Why a transfer on root port @i can't reach its device, if so. */
++static const char *imx21_usb_port_fault(IMX21USBOTGState *s, int i)
++{
++    uint32_t hz = imx21_crm_usb_clock_hz(s->crm);
++
++    if (hz < USB_CLOCK_HZ - USB_CLOCK_TOL ||
++        hz > USB_CLOCK_HZ + USB_CLOCK_TOL) {
++        return "the USB clock is not 48 MHz";
++    }
++    if (!imx21_usb_pins_ok(s, i)) {
++        return "its pins are not multiplexed to it";
++    }
++    if (i == ROOT_PORT_HOST1 && !(R(USBCTRL) & USBCTRL_HOST1_TXEN_OE)) {
++        return "USBCTRL's HOST1_TXEN_OE is clear";
++    }
++    return NULL;
++}
++
++static USBDevice *imx21_usb_find_device(IMX21USBOTGState *s, uint8_t addr,
++                                        int *root)
+ {
+     int i;
+ 
+@@ -226,6 +349,7 @@ static USBDevice *imx21_usb_find_device(IMX21USBOTGState *s, uint8_t addr)
+         }
+         dev = usb_find_device(&s->ports[i], addr);
+         if (dev) {
++            *root = i;
+             return dev;
+         }
+     }
+@@ -371,8 +495,9 @@ static void imx21_usb_run_etd(IMX21USBOTGState *s, int n)
+     uint32_t xbuf = w[1] & 0xffff;
+     USBDevice *dev;
+     USBEndpoint *ep;
++    const char *fault;
+     uint32_t len;
+-    int pid;
++    int pid, root = 0;
+ 
+     if (fmt == ETD_FMT_ISO) {
+         len = w[3] & 0x3ff;
+@@ -401,13 +526,27 @@ static void imx21_usb_run_etd(IMX21USBOTGState *s, int n)
+ 
+     trace_imx21_usb_etd_run(n, addr, epnum, pid, fmt, len);
+ 
+-    dev = imx21_usb_find_device(s, addr);
++    dev = imx21_usb_find_device(s, addr, &root);
+     ep = dev ? usb_ep_get(dev, pid, epnum) : NULL;
+     if (!ep) {
+         imx21_usb_etd_done(s, n, CC_DEVNOTRESP, 0);
+         return;
+     }
+ 
++    fault = imx21_usb_port_fault(s, root);
++    if (fault != s->fault[root]) {
++        s->fault[root] = fault;
++        if (fault) {
++            qemu_log_mask(LOG_GUEST_ERROR, "imx21-usb: root port %d can't "
++                          "reach its device: %s\n", root + 1, fault);
++        }
++    }
++    if (fault) {
++        trace_imx21_usb_port_fault(root, fault);
++        imx21_usb_etd_done(s, n, CC_DEVNOTRESP, 0);
++        return;
++    }
++
+     g_free(e->buf);
+     e->buf = g_malloc0(MAX(len, 1));
+     e->len = len;
+@@ -459,6 +598,12 @@ static void imx21_usb_process(IMX21USBOTGState *s)
+     uint32_t frame = imx21_usb_frame(s);
+     uint32_t tried = 0;
+ 
++    if (!imx21_usb_clocks_on(s)) {
++        /* Nothing runs; the frame timer looks again next frame. */
++        imx21_usb_arm(s);
++        return;
++    }
++
+     /*
+      * Run the due ETDs oldest first, so that an endpoint's isochronous
+      * ETDs go out in frame order even when several are late.
+@@ -671,6 +816,7 @@ static USBBusOps imx21_usb_bus_ops = {
+ /* Reset the host controller, keeping what is plugged into the ports. */
+ static void imx21_usb_host_reset(IMX21USBOTGState *s)
+ {
++    uint32_t usbctrl = R(USBCTRL);
+     int i;
+ 
+     for (i = 0; i < NUM_ETD; i++) {
+@@ -682,8 +828,9 @@ static void imx21_usb_host_reset(IMX21USBOTGState *s)
+         s->regs[i] = 0;
+     }
+     memset(s->dmem, 0, sizeof(s->dmem));
+-    /* Three downstream ports, no power switching. */
+-    R(ROOTHUBA) = 0x00000103;
++    R(USBCTRL) = usbctrl;
++    /* Three downstream ports, no power switching, as a running Chumby's. */
++    R(ROOTHUBA) = 0x01000103;
+     for (i = 0; i < NUM_PORTS; i++) {
+         USBDevice *dev = s->ports[i].dev;
+         if (dev && dev->attached) {
+@@ -730,6 +877,9 @@ static void imx21_usbotg_write(void *opaque, hwaddr offset, uint64_t val,
+     trace_imx21_usb_write(offset, val);
+ 
+     switch (offset) {
++    case HWMODE:
++        *r = HWMODE_ID | (val & 0xffff);
++        break;
+     case CINT_STAT:
+         break;
+     case CINT_STEN:
+@@ -859,6 +1009,8 @@ static void imx21_usbotg_reset(DeviceState *dev)
+     IMX21USBOTGState *s = IMX21_USBOTG(dev);
+ 
+     memset(s->regs, 0, sizeof(s->regs));
++    R(HWMODE) = HWMODE_ID;
++    R(USBCTRL) = USBCTRL_RESET;
+     imx21_usb_host_reset(s);
+ }
+ 
+@@ -882,6 +1034,10 @@ static void imx21_usbotg_realize(DeviceState *dev, Error **errp)
+     IMX21USBOTGState *s = IMX21_USBOTG(dev);
+     int i;
+ 
++    if (!s->crm || !s->gpio) {
++        error_setg(errp, "imx21.usbotg needs its crm and gpio links");
++        return;
++    }
+     usb_bus_new(&s->bus, sizeof(s->bus), &imx21_usb_bus_ops, dev);
+     for (i = 0; i < NUM_PORTS; i++) {
+         usb_register_port(&s->bus, &s->ports[i], s, i, &imx21_usb_port_ops,
+@@ -896,6 +1052,34 @@ static void imx21_usbotg_realize(DeviceState *dev, Error **errp)
+                                 &dev->mem_reentrancy_guard);
+ }
+ 
++bool imx21_usbotg_add_board_hub(DeviceState *dev, int port, Error **errp)
++{
++    IMX21USBOTGState *s = IMX21_USBOTG(dev);
++    g_autofree char *path = g_strdup_printf("%d", port);
++    USBDevice *hub = USB_DEVICE(qdev_new("usb-hub"));
++    int i;
++
++    qdev_prop_set_string(DEVICE(hub), "port", path);
++    if (!usb_realize_and_unref(hub, &s->bus, errp)) {
++        return false;
++    }
++    /* The free list is what a device given no port takes the first of. */
++    for (i = 0; i < NUM_PORTS; i++) {
++        if (!s->ports[i].dev) {
++            QTAILQ_REMOVE(&s->bus.free, &s->ports[i], next);
++            QTAILQ_INSERT_TAIL(&s->bus.free, &s->ports[i], next);
++        }
++    }
++    return true;
++}
++
++static const Property imx21_usbotg_properties[] = {
++    DEFINE_PROP_LINK("crm", IMX21USBOTGState, crm, TYPE_IMX21_CRM,
++                     IMX21CRMState *),
++    DEFINE_PROP_LINK("gpio", IMX21USBOTGState, gpio, TYPE_IMX21_GPIO,
++                     IMX21GPIOState *),
++};
++
+ static int imx21_usbotg_pre_save(void *opaque)
+ {
+     IMX21USBOTGState *s = opaque;
+@@ -965,6 +1149,7 @@ static void imx21_usbotg_class_init(ObjectClass *klass, const void *data)
+     dc->realize = imx21_usbotg_realize;
+     dc->vmsd = &vmstate_imx21_usbotg;
+     device_class_set_legacy_reset(dc, imx21_usbotg_reset);
++    device_class_set_props(dc, imx21_usbotg_properties);
+     dc->desc = "i.MX21 USB OTG (host controller)";
+     set_bit(DEVICE_CATEGORY_USB, dc->categories);
+ }
+diff --git a/hw/usb/trace-events b/hw/usb/trace-events
+--- a/hw/usb/trace-events
++++ b/hw/usb/trace-events
+@@ -388,3 +388,4 @@ imx21_usb_etd_done(int etd, int cc, uint32_t actual) "ETD %d cc 0x%x actual %u"
+ imx21_usb_port_write(int port, uint32_t val, uint32_t old, uint32_t new) "port %d write 0x%08x: 0x%08x -> 0x%08x"
+ imx21_usb_port_attach(int port) "port %d"
+ imx21_usb_port_detach(int port) "port %d"
++imx21_usb_port_fault(int port, const char *why) "port %d: %s"
+diff --git a/include/hw/misc/imx21_pwm.h b/include/hw/misc/imx21_pwm.h
+--- a/include/hw/misc/imx21_pwm.h
++++ b/include/hw/misc/imx21_pwm.h
+@@ -10,6 +10,7 @@
+ #define IMX21_PWM_H
+ 
+ #include "hw/core/sysbus.h"
++#include "hw/misc/imx21_crm.h"
+ #include "qemu/timer.h"
+ #include "qom/object.h"
+ 
+@@ -31,6 +32,7 @@ struct IMX21PWMState {
+     MemoryRegion iomem;
+     QEMUTimer timer;
+     qemu_irq out;
++    IMX21CRMState *crm;
+     uint32_t perclk_freq;
+ 
+     uint32_t pwmc;
+diff --git a/include/hw/timer/imx21_gpt.h b/include/hw/timer/imx21_gpt.h
+--- a/include/hw/timer/imx21_gpt.h
++++ b/include/hw/timer/imx21_gpt.h
+@@ -10,6 +10,7 @@
+ #define IMX21_GPT_H
+ 
+ #include "hw/core/sysbus.h"
++#include "hw/misc/imx21_crm.h"
+ #include "qemu/timer.h"
+ #include "qom/object.h"
+ 
+@@ -37,6 +38,7 @@ struct IMX21GPTState {
+     /* A late compare event: TCN holds at TCMP until it is acknowledged. */
+     bool hold;
+ 
++    IMX21CRMState *crm;
+     uint32_t perclk_freq;
+ };
+ 
+diff --git a/include/hw/usb/hcd-imx21.h b/include/hw/usb/hcd-imx21.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/usb/hcd-imx21.h
+@@ -0,0 +1,20 @@
++/*
++ * i.MX21 USB OTG block: host controller
++ *
++ * Copyright (c) 2026 John Merchant <john@johnmerchant.dev>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#ifndef HW_USB_HCD_IMX21_H
++#define HW_USB_HCD_IMX21_H
++
++#define TYPE_IMX21_USBOTG "imx21.usbotg"
++
++/*
++ * Plugs a hub into root port @port (1-3) as a board's soldered-on hub:
++ * devices given no port go behind it, ahead of the other root ports.
++ */
++bool imx21_usbotg_add_board_hub(DeviceState *dev, int port, Error **errp);
++
++#endif /* HW_USB_HCD_IMX21_H */

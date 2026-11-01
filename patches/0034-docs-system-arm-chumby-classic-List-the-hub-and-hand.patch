@@ -1,0 +1,21 @@
+Description: docs/system/arm/chumby-classic: List the hub and handoff properties
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -245,6 +245,11 @@ the identity can also be read and set at any time with ``qom-get`` and
+ - ``guid``, ``serial``, ``hwversion`` (string): the identity,
+   ``XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX``, 16 letters or digits and
+   ``MAJOR.MINOR``; fixed once the machine is created
++- ``internal-hub`` (bool): the board's USB hub on root hub port 2, behind
++  which devices given no port attach; on by default; fixed once the
++  machine is created
++- ``handoff`` (bool): start as a kernel started from the running stock
++  firmware does; off by default; fixed once the machine is created
+ 
+ ``query-chumby-state`` returns the button, headphones, acceleration and
+ identity together with the board's outputs, so that a frontend can
