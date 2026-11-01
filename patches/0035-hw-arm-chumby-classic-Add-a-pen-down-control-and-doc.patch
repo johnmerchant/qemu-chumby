@@ -1,0 +1,162 @@
+Description: hw/arm/chumby_classic: Add a pen-down control, and document the handoff's interrupts
+ With pen-down=on the pen is held down from just after each reset, so a test
+ can hold it through a boot without racing it. With handoff=on, that is a
+ falling edge on PE19, which stock leaves unmasked, on the interrupt line all
+ six GPIO ports share: it stays asserted until port E's status is cleared.
+Author: John Merchant <john@johnmerchant.dev>
+Upstream-Status: Inappropriate [AI generated code]
+Signed-off-by: John Merchant <john@johnmerchant.dev>
+Claude-Session: https://claude.ai/code/session_01B1fN5HecVTggWQg4Zt8Srt
+---
+diff --git a/docs/system/arm/chumby-classic.rst b/docs/system/arm/chumby-classic.rst
+--- a/docs/system/arm/chumby-classic.rst
++++ b/docs/system/arm/chumby-classic.rst
+@@ -109,6 +109,10 @@ slow by that much, as on a real one.
+ ``-M chumby-classic,handoff=on`` starts the machine as a kernel started
+ from the running stock firmware does: the LCD's graphic window on and
+ opaque, the pins of ports B, D and E as stock set them, and noise in RAM.
++That includes stock's interrupt state: PE19 unmasked (the pen), with other
++interrupts pending but masked. All six GPIO ports share one interrupt line,
++level-style, so with ``pen-down=on`` a pen held through the start asserts it
++until something clears port E's status, however the kernel handles it.
+ 
+ USB devices attach to the host controller's root hub, for example a
+ disk image as a USB stick and a keyboard::
+@@ -248,6 +252,8 @@ the identity can also be read and set at any time with ``qom-get`` and
+ - ``internal-hub`` (bool): the board's USB hub on root hub port 2, behind
+   which devices given no port attach; on by default; fixed once the
+   machine is created
++- ``pen-down`` (bool): the pen held down on the touchscreen, whatever the
++  pointer does; given at the start, from just after each reset
+ - ``handoff`` (bool): start as a kernel started from the running stock
+   firmware does; off by default; fixed once the machine is created
+ 
+diff --git a/hw/arm/chumby_classic.c b/hw/arm/chumby_classic.c
+--- a/hw/arm/chumby_classic.c
++++ b/hw/arm/chumby_classic.c
+@@ -130,6 +130,8 @@ struct ChumbyClassicState {
+     ChumbyIOState io;
+     bool internal_hub;
+     bool handoff;
++    bool pen_down;
++    TSC2100State *tsc;
+     /* The device identity */
+     char *guid;
+     char *serial;
+@@ -499,7 +501,9 @@ static void chumby_classic_init(MachineState *machine)
+     if (machine->audiodev) {
+         qdev_prop_set_string(tsc, "audiodev", machine->audiodev);
+     }
++    qdev_prop_set_bit(tsc, "pen-held", s->pen_down);
+     ssi_realize_and_unref(tsc, spi, &error_fatal);
++    s->tsc = TSC2100(tsc);
+     tsc2100_set_audio_link(TSC2100(tsc), chumby_classic_codec_dac,
+                            chumby_classic_codec_adc, &s->soc.audmux);
+     sysbus_connect_irq(SYS_BUS_DEVICE(&s->soc.cspi[2]), 1,
+@@ -544,6 +548,21 @@ static void chumby_classic_set_internal_hub(Object *obj, bool value,
+     CHUMBY_CLASSIC_MACHINE(obj)->internal_hub = value;
+ }
+ 
++static bool chumby_classic_get_pen_down(Object *obj, Error **errp)
++{
++    return CHUMBY_CLASSIC_MACHINE(obj)->pen_down;
++}
++
++static void chumby_classic_set_pen_down(Object *obj, bool value, Error **errp)
++{
++    ChumbyClassicState *s = CHUMBY_CLASSIC_MACHINE(obj);
++
++    s->pen_down = value;
++    if (s->tsc) {
++        tsc2100_hold_pen(s->tsc, value);
++    }
++}
++
+ static bool chumby_classic_get_handoff(Object *obj, Error **errp)
+ {
+     return CHUMBY_CLASSIC_MACHINE(obj)->handoff;
+@@ -602,6 +621,12 @@ static void chumby_classic_class_init(ObjectClass *oc, const void *data)
+                                    chumby_classic_set_internal_hub);
+     object_class_property_set_description(oc, "internal-hub",
+         "The board's USB hub, on root hub port 2 (default on)");
++    object_class_property_add_bool(oc, "pen-down",
++                                   chumby_classic_get_pen_down,
++                                   chumby_classic_set_pen_down);
++    object_class_property_set_description(oc, "pen-down",
++        "The pen held down on the touchscreen, from just after each reset "
++        "when given at the start (default off)");
+     object_class_property_add_bool(oc, "handoff", chumby_classic_get_handoff,
+                                    chumby_classic_set_handoff);
+     object_class_property_set_description(oc, "handoff",
+diff --git a/hw/input/tsc2100.c b/hw/input/tsc2100.c
+--- a/hw/input/tsc2100.c
++++ b/hw/input/tsc2100.c
+@@ -87,6 +87,7 @@
+ #define RESET_MAGIC     0xbb00
+ #define STATUS_RESET    0x8000
+ #define PEN_RESENSE_NS  (100 * 1000)
++#define PEN_HELD_DELAY_NS (1000 * 1000)
+ #define ADC_MAX         0xfff
+ 
+ /* The result registers each scan mode (ADC bits 13:10) converts. */
+@@ -553,6 +554,9 @@ static void tsc2100_pen_tick(void *opaque)
+ {
+     TSC2100State *s = opaque;
+ 
++    if (s->pen_held) {
++        s->down = true;
++    }
+     if (s->down) {
+         s->pen_latch = true;
+         tsc2100_update_pintdav(s);
+@@ -589,6 +593,21 @@ static void tsc2100_reset(DeviceState *dev)
+     s->word = 0;
+     s->down = false;
+     tsc2100_update_pintdav(s);
++    if (s->pen_held) {
++        /* After everything's reset, so the pin's edge reaches the GPIO. */
++        timer_mod(s->pen_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                  PEN_HELD_DELAY_NS);
++    }
++}
++
++void tsc2100_hold_pen(TSC2100State *s, bool held)
++{
++    s->pen_held = held;
++    s->down = held;
++    if (held) {
++        s->pen_latch = true;
++    }
++    tsc2100_update_pintdav(s);
+ }
+ 
+ static int tsc2100_post_load(void *opaque, int version_id)
+@@ -628,6 +647,8 @@ static const VMStateDescription vmstate_tsc2100 = {
+ 
+ static const Property tsc2100_properties[] = {
+     DEFINE_AUDIO_PROPERTIES(TSC2100State, audio_be),
++    /* The pen held down from just after each reset */
++    DEFINE_PROP_BOOL("pen-held", TSC2100State, pen_held, false),
+     /* The codec's master clock: the Chumby's 16 MHz oscillator */
+     DEFINE_PROP_UINT32("mclk", TSC2100State, mclk, 16000000),
+ };
+diff --git a/include/hw/input/tsc2100.h b/include/hw/input/tsc2100.h
+--- a/include/hw/input/tsc2100.h
++++ b/include/hw/input/tsc2100.h
+@@ -54,6 +54,8 @@ struct TSC2100State {
+     bool down;
+     /* PINTDAV low from a touch, until a conversion completes */
+     bool pen_latch;
++    /* The pen held down from outside, whatever the pointer does */
++    bool pen_held;
+     uint16_t x, y;
+     /* The pointer as the input layer last reported it. */
+     int abs_x, abs_y;
+@@ -83,4 +85,7 @@ struct TSC2100State {
+ void tsc2100_set_audio_link(TSC2100State *s, TSC2100AudioFn *dac,
+                             TSC2100AudioFn *adc, void *opaque);
+ 
++/* Holds the pen down, or lets it up. */
++void tsc2100_hold_pen(TSC2100State *s, bool held);
++
+ #endif /* HW_INPUT_TSC2100_H */
