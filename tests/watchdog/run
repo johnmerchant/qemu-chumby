@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""tests/watchdog/run [QEMU]: a kernel that hangs before any watchdog driver
+is reset by the watchdog, at the rate of its own clock.
+
+The kernel, a few instructions made here, writes "S" to UART1, arms the
+watchdog as a sideloader does just before jumping to a new kernel (WCR
+0x7F34, then the service sequence), and hangs. WT 0x7F is 128 half seconds:
+each boot should follow the last by 64 s. The rate comes from the 32 kHz
+clock, so it is checked on the machine as it starts and with handoff=on.
+
+Takes about 2 minutes 15 s. No firmware, no network, no display.
+"""
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+here = os.path.dirname(os.path.abspath(__file__))
+PERIOD = 64.0
+SLACK = 2.0
+RESETS = 2
+
+LITERALS = [0x1000A000, 0x10002000, 0x7F34, 0x5555, 0xAAAA]
+
+
+def ldr(rd, lit, at):
+    return 0xE59F0000 | rd << 12 | ((15 + lit) * 4 - (at * 4 + 8))
+
+
+CODE = [
+    ldr(0, 0, 0),  # r0 = UART1
+    0xE3A01001,    # mov  r1, #1
+    0xE5801080,    # str  r1, [r0, #0x80]   @ UCR1: UARTEN
+    0xE3A01005,    # mov  r1, #5
+    0xE5801084,    # str  r1, [r0, #0x84]   @ UCR2: SRST, TXEN
+    0xE3A01053,    # mov  r1, #'S'
+    0xE5801040,    # str  r1, [r0, #0x40]   @ UTXD
+    ldr(0, 1, 7),  # r0 = WDOG
+    ldr(1, 2, 8),  # r1 = 0x7F34
+    0xE1C010B0,    # strh r1, [r0]          @ WCR
+    ldr(1, 3, 10),  # r1 = 0x5555
+    0xE1C010B2,    # strh r1, [r0, #2]      @ WSR
+    ldr(1, 4, 12),  # r1 = 0xAAAA
+    0xE1C010B2,    # strh r1, [r0, #2]
+    0xEAFFFFFE,    # b    .
+] + LITERALS
+
+
+def run(qemu, kernel, machine, out):
+    p = subprocess.Popen([qemu, "-M", machine, "-kernel", kernel, "-nic", "none",
+                          "-display", "none", "-monitor", "none",
+                          "-serial", "stdio"],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    times = []
+    try:
+        while len(times) <= RESETS:
+            c = p.stdout.read(1)
+            if not c:
+                break
+            if c == b"S":
+                times.append(time.monotonic())
+    finally:
+        p.kill()
+        p.wait()
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    out[machine] = gaps
+
+
+def main():
+    qemu = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("QEMU") or
+            os.path.join(here, "..", "..", "build", "obj", "qemu-system-arm"))
+    with tempfile.NamedTemporaryFile(suffix=".kernel") as f:
+        f.write(struct.pack(f"<{len(CODE)}I", *CODE))
+        f.flush()
+        out = {}
+        ts = [threading.Thread(target=run, args=(qemu, f.name, m, out))
+              for m in ("chumby-classic", "chumby-classic,handoff=on")]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(PERIOD * (RESETS + 1) + 30)
+    bad = 0
+    for m, gaps in sorted(out.items()):
+        ok = (len(gaps) == RESETS and
+              all(abs(g - PERIOD) <= SLACK for g in gaps))
+        print(f"{'ok' if ok else 'FAIL'}: {m}: resets after "
+              + ", ".join(f"{g:.1f} s" for g in gaps))
+        bad += not ok
+    sys.exit(1 if bad or len(out) != 2 else 0)
+
+
+if __name__ == "__main__":
+    main()
